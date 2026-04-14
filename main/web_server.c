@@ -1,0 +1,972 @@
+/**
+ * @file web_server.c
+ * @brief Web服务器模块实现
+ * @note 提供网页控制界面和RESTful API
+ */
+
+#include "web_server.h"
+#include "water_purifier_fsm.h"
+#include "tds_sensor.h"
+#include "gpio_driver.h"
+#include "wifi_manager.h"
+#include "config_manager.h"
+#include "history_logger.h"
+#include "esp_log.h"
+#include "esp_http_server.h"
+#include "esp_timer.h"
+#include "cJSON.h"
+#include <string.h>
+#include <time.h>
+
+static const char *TAG = "WEB";
+
+// 系统启动时间（微秒），在编译时记录
+static uint64_t g_boot_time = 0;
+
+// 获取系统运行时间（秒）
+static uint32_t get_uptime_sec(void)
+{
+    if (g_boot_time == 0) {
+        g_boot_time = esp_timer_get_time();
+    }
+    return (uint32_t)((esp_timer_get_time() - g_boot_time) / 1000000);
+}
+
+// ==================== 私有变量 ====================
+
+static struct {
+    bool initialized;
+    bool running;
+    web_server_config_t config;
+    httpd_handle_t server;
+} ctx = {
+    .initialized = false,
+    .running = false,
+    .config = { .port = 80, .enable_auth = false },
+    .server = NULL,
+};
+
+// ==================== HTML页面 ====================
+
+// 首页 - 只读显示
+static const char html_page[] =
+"<!DOCTYPE html><html><head>"
+"<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>净水器状态</title>"
+"<style>"
+"*{box-sizing:border-box}"
+"body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh}"
+".container{max-width:600px;margin:0 auto}"
+".card{background:rgba(255,255,255,0.95);padding:20px;margin:15px 0;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}"
+"h1{color:#fff;text-align:center;margin-bottom:20px;text-shadow:0 2px 4px rgba(0,0,0,0.2)}"
+"h3{color:#333;margin:0 0 15px 0;padding-bottom:10px;border-bottom:2px solid #eee}"
+".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:10px}"
+".stat{background:#f8f9fa;padding:12px;border-radius:12px;text-align:center}"
+".stat-label{color:#666;font-size:11px;margin-bottom:4px}"
+".stat-value{color:#333;font-size:20px;font-weight:600}"
+".stat-value.good{color:#28a745}.stat-value.warn{color:#ffc107}.stat-value.error{color:#dc3545}"
+".btn{padding:14px 24px;margin:10px;border:none;border-radius:12px;cursor:pointer;color:#fff;font-size:16px;font-weight:500;transition:all .2s;width:100%}"
+".btn:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.2)}"
+".btn-primary{background:linear-gradient(135deg,#667eea,#764ba2)}"
+".filter-bar{height:8px;background:#e0e0e0;border-radius:4px;margin:8px 0;overflow:hidden}"
+".filter-bar-fill{height:100%;border-radius:4px;transition:width .3s}"
+".filter-bar-fill.good{background:linear-gradient(90deg,#28a745,#20c997)}"
+".filter-bar-fill.warn{background:linear-gradient(90deg,#ffc107,#fd7e14)}"
+".filter-bar-fill.error{background:linear-gradient(90deg,#dc3545,#c82333)}"
+"</style></head><body>"
+"<div class='container'>"
+"<h1>净水器</h1>"
+
+"<div class='card'><h3>系统状态</h3>"
+"<div class='grid'>"
+"<div class='stat'><div class='stat-label'>运行状态</div><div id='state' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>进水TDS</div><div id='tds_in' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>出水TDS</div><div id='tds_out' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>去除率</div><div id='rate' class='stat-value good'>-</div></div>"
+"<div class='stat'><div class='stat-label'>漏水检测</div><div id='leak' class='stat-value good'>正常</div></div>"
+"</div>"
+"<hr style='border:none;border-top:1px solid #eee;margin:12px 0'>"
+"<div style='text-align:right;font-size:13px;color:#999'>"
+"<span id='sntpTime'>-</span>"
+"</div>"
+"</div>"
+
+"<div class='card'><h3>滤芯寿命</h3>"
+"<div id='filters'>"
+"<div style='margin:10px 0'><div style='display:flex;justify-content:space-between;font-size:13px'><span>PP棉</span><span id='f0'>-</span></div><div class='filter-bar'><div id='b0' class='filter-bar-fill good' style='width:100%'></div></div></div>"
+"<div style='margin:10px 0'><div style='display:flex;justify-content:space-between;font-size:13px'><span>颗粒活性炭</span><span id='f1'>-</span></div><div class='filter-bar'><div id='b1' class='filter-bar-fill good' style='width:100%'></div></div></div>"
+"<div style='margin:10px 0'><div style='display:flex;justify-content:space-between;font-size:13px'><span>压缩活性炭</span><span id='f2'>-</span></div><div class='filter-bar'><div id='b2' class='filter-bar-fill good' style='width:100%'></div></div></div>"
+"<div style='margin:10px 0'><div style='display:flex;justify-content:space-between;font-size:13px'><span>RO膜</span><span id='f3'>-</span></div><div class='filter-bar'><div id='b3' class='filter-bar-fill good' style='width:100%'></div></div></div>"
+"<div style='margin:10px 0'><div style='display:flex;justify-content:space-between;font-size:13px'><span>后置活性炭</span><span id='f4'>-</span></div><div class='filter-bar'><div id='b4' class='filter-bar-fill good' style='width:100%'></div></div></div>"
+"</div>"
+"<div style='text-align:center;color:#666;font-size:12px;margin-top:10px'>总用水量: <span id='totalWater'>0</span> 升</div>"
+"</div>"
+
+"<div class='card'><h3>运行统计</h3>"
+"<div class='grid'>"
+"<div class='stat'><div class='stat-label'>运行时间</div><div id='uptime' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>制水周期</div><div id='cycles' class='stat-value'>0</div></div>"
+"<div class='stat'><div class='stat-label'>冲洗周期</div><div id='flushCycles' class='stat-value'>0</div></div>"
+"<div class='stat'><div class='stat-label'>总制水时间</div><div id='prodTime' class='stat-value'>0h</div></div>"
+"<div class='stat'><div class='stat-label'>今日制水</div><div id='todayProd' class='stat-value'>0min</div></div>"
+"</div></div>"
+
+"<div class='card'><h3>网络信息</h3>"
+"<div class='grid'>"
+"<div class='stat'><div class='stat-label'>WiFi状态</div><div id='wifiState' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>IP地址</div><div id='wifiIP' class='stat-value'>-</div></div>"
+"</div></div>"
+
+"<button class='btn btn-primary' onclick=\"location.href='/admin'\">管理设置</button>"
+
+"</div>"
+"<script>"
+"function $(id){return document.getElementById(id)}"
+"function update(){fetch('/api/status').then(r=>r.json()).then(d=>{"
+"$('state').textContent=d.state;"
+"$('state').className='stat-value '+(d.state==='制水'?'good':d.state==='停止'?'error':d.state==='缺水'?'warn':'');"
+"$('tds_in').textContent=d.tds_in?d.tds_in.toFixed(1)+' ppm':'-';"
+"$('tds_out').textContent=d.tds_out?d.tds_out.toFixed(1)+' ppm':'-';"
+"$('rate').textContent=d.rate?d.rate.toFixed(1)+'%':'-';"
+"$('rate').className='stat-value '+(d.rate>90?'good':d.rate>70?'warn':'error');"
+"$('leak').textContent=d.leak?'⚠ 报警':'✓ 正常';"
+"$('leak').className='stat-value '+(d.leak?'error':'good');"
+"$('sntpTime').textContent=d.sntpTime||'未同步';"
+"$('sntpTime').style.color=d.sntpTime?'#28a745':'#ffc107';"
+"if(d.filters){for(let i=0;i<5;i++){const f=d.filters[i];if(f){$('f'+i).textContent=f.effPct+'%';$('b'+i).style.width=f.effPct+'%';$('b'+i).className='filter-bar-fill '+(f.effPct>50?'good':f.effPct>20?'warn':'error');}}}"
+"$('totalWater').textContent=d.totalWater||0;"
+"$('cycles').textContent=d.cycles||0;"
+"$('flushCycles').textContent=d.flushes||0;"
+"$('prodTime').textContent=d.prodTime?(d.prodTime/3600).toFixed(1)+'h':'0h';"
+"$('todayProd').textContent=d.todayProd?d.todayProd+'min':'0min';"
+"var u=d.uptime||0,h=Math.floor(u/3600),m=Math.floor((u%3600)/60);if(h>=24){$('uptime').textContent=Math.floor(h/24)+'天'+(h%24)+'时';}else if(h>0){$('uptime').textContent=h+'时'+m+'分';}else{$('uptime').textContent=m+'分';}"
+"$('wifiState').textContent=d.wifiState;"
+"$('wifiIP').textContent=d.ip||'-';"
+"})}"
+"setInterval(update,3000);update();"
+"</script></body></html>";
+
+// 管理页面 - 配置和控制
+static const char html_admin_page[] =
+"<!DOCTYPE html><html><head>"
+"<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>净水器管理</title>"
+"<style>"
+"*{box-sizing:border-box}"
+"body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh}"
+".container{max-width:600px;margin:0 auto}"
+".card{background:rgba(255,255,255,0.95);padding:20px;margin:15px 0;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}"
+"h1{color:#fff;text-align:center;margin-bottom:20px;text-shadow:0 2px 4px rgba(0,0,0,0.2)}"
+"h3{color:#333;margin:0 0 15px 0;padding-bottom:10px;border-bottom:2px solid #eee}"
+".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}"
+".stat{background:#f8f9fa;padding:15px;border-radius:12px;text-align:center}"
+".stat-label{color:#666;font-size:12px;margin-bottom:5px}"
+".stat-value{color:#333;font-size:20px;font-weight:600}"
+".btn{padding:12px 20px;margin:5px;border:none;border-radius:10px;cursor:pointer;color:#fff;font-size:14px;font-weight:500;transition:all .2s}"
+".btn:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.2)}"
+".btn-primary{background:linear-gradient(135deg,#667eea,#764ba2)}"
+".btn-success{background:linear-gradient(135deg,#28a745,#20c997)}"
+".btn-danger{background:linear-gradient(135deg,#dc3545,#c82333)}"
+".btn-warning{background:linear-gradient(135deg,#ffc107,#fd7e14)}"
+".btn-info{background:linear-gradient(135deg,#17a2b8,#20c997)}"
+".btn-group{display:flex;flex-wrap:wrap;gap:8px}"
+"input,select{padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:14px;transition:border-color .2s;width:100%}"
+"input:focus,select:focus{outline:none;border-color:#667eea}"
+".form-row{margin:10px 0}"
+".form-row label{display:block;color:#555;margin-bottom:5px;font-size:13px}"
+".form-row small{color:#999;font-size:11px}"
+".wifi-item{background:#f0f0f0;padding:10px;margin:5px 0;border-radius:8px;cursor:pointer;transition:background .2s}"
+".wifi-item:hover{background:#e0e0e0}"
+".back-btn{background:rgba(255,255,255,0.2);color:#fff;padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:10px}"
+".back-btn:hover{background:rgba(255,255,255,0.3)}"
+".filter-stat{text-align:center;padding:10px 5px}"
+".filter-name{font-size:12px;color:#666;margin-bottom:4px}"
+".filter-pct{font-size:18px;font-weight:600;margin-bottom:2px}"
+".filter-sub{font-size:10px;color:#999}"
+".filter-bar{height:8px;background:#e0e0e0;border-radius:4px;margin:4px 0;overflow:hidden}"
+".filter-bar-fill{height:100%;border-radius:4px;transition:width .3s}"
+".filter-bar-fill.good{background:linear-gradient(90deg,#28a745,#20c997)}"
+".filter-bar-fill.warn{background:linear-gradient(90deg,#ffc107,#fd7e14)}"
+".filter-bar-fill.error{background:linear-gradient(90deg,#dc3545,#c82333)}"
+".dim-label{font-size:10px;color:#999}"
+"</style></head><body>"
+"<div class='container'>"
+"<button class='back-btn' onclick=\"location.href='/'\">← 返回首页</button>"
+"<h1>管理页面</h1>"
+
+"<div class='card'><h3>控制面板</h3>"
+"<div class='btn-group'>"
+"<button class='btn btn-success' onclick='startProduction()'>制水</button>"
+"<button class='btn btn-primary' onclick='normalFlush()'>冲洗</button>"
+"<button class='btn btn-info' onclick='pureFlush()'>反冲洗</button>"
+"<button class='btn btn-warning' onclick='resetStop()'>复位</button>"
+"<button class='btn btn-primary' onclick='goStandby()'>待机</button>"
+"<button class='btn btn-danger' onclick='shutdown()'>停止</button>"
+"</div></div>"
+
+"<div class='card'><h3>滤芯管理</h3>"
+"<div class='grid'>"
+"<div class='stat filter-stat'><div class='filter-name'>PP棉</div><div id='f0' class='filter-pct'>-</div><div class='dim-label'>水量 <span id='fw0'>-</span> 时间 <span id='ft0'>-</span></div><div class='filter-bar'><div id='bw0' class='filter-bar-fill good' style='width:100%'></div></div><div class='filter-bar'><div id='bt0' class='filter-bar-fill good' style='width:100%'></div></div><button class='btn btn-primary' style='font-size:11px;padding:4px 8px;margin-top:5px' onclick=\"resetFilter(0)\">重置</button></div>"
+"<div class='stat filter-stat'><div class='filter-name'>颗粒炭</div><div id='f1' class='filter-pct'>-</div><div class='dim-label'>水量 <span id='fw1'>-</span> 时间 <span id='ft1'>-</span></div><div class='filter-bar'><div id='bw1' class='filter-bar-fill good' style='width:100%'></div></div><div class='filter-bar'><div id='bt1' class='filter-bar-fill good' style='width:100%'></div></div><button class='btn btn-primary' style='font-size:11px;padding:4px 8px;margin-top:5px' onclick=\"resetFilter(1)\">重置</button></div>"
+"<div class='stat filter-stat'><div class='filter-name'>压缩炭</div><div id='f2' class='filter-pct'>-</div><div class='dim-label'>水量 <span id='fw2'>-</span> 时间 <span id='ft2'>-</span></div><div class='filter-bar'><div id='bw2' class='filter-bar-fill good' style='width:100%'></div></div><div class='filter-bar'><div id='bt2' class='filter-bar-fill good' style='width:100%'></div></div><button class='btn btn-primary' style='font-size:11px;padding:4px 8px;margin-top:5px' onclick=\"resetFilter(2)\">重置</button></div>"
+"<div class='stat filter-stat'><div class='filter-name'>RO膜</div><div id='f3' class='filter-pct'>-</div><div class='dim-label'>水量 <span id='fw3'>-</span> 时间 <span id='ft3'>-</span></div><div class='filter-bar'><div id='bw3' class='filter-bar-fill good' style='width:100%'></div></div><div class='filter-bar'><div id='bt3' class='filter-bar-fill good' style='width:100%'></div></div><button class='btn btn-primary' style='font-size:11px;padding:4px 8px;margin-top:5px' onclick=\"resetFilter(3)\">重置</button></div>"
+"<div class='stat filter-stat'><div class='filter-name'>后置炭</div><div id='f4' class='filter-pct'>-</div><div class='dim-label'>水量 <span id='fw4'>-</span> 时间 <span id='ft4'>-</span></div><div class='filter-bar'><div id='bw4' class='filter-bar-fill good' style='width:100%'></div></div><div class='filter-bar'><div id='bt4' class='filter-bar-fill good' style='width:100%'></div></div><button class='btn btn-primary' style='font-size:11px;padding:4px 8px;margin-top:5px' onclick=\"resetFilter(4)\">重置</button></div>"
+"</div>"
+"<p style='font-size:13px;color:#666;margin-top:15px'>滤芯容量设置 (升):</p>"
+"<div class='grid'>"
+"<div class='form-row'><label>PP棉</label><input type='number' id='cap0' value='3000'></div>"
+"<div class='form-row'><label>颗粒炭</label><input type='number' id='cap1' value='4000'></div>"
+"<div class='form-row'><label>压缩炭</label><input type='number' id='cap2' value='4000'></div>"
+"<div class='form-row'><label>RO膜</label><input type='number' id='cap3' value='8000'></div>"
+"<div class='form-row'><label>后置炭</label><input type='number' id='cap4' value='4000'></div>"
+"</div>"
+"<div class='btn-group'><button class='btn btn-success' onclick='saveFilterCaps()'>保存滤芯容量</button></div>"
+"</div>"
+
+"<div class='card'><h3>硬件配置</h3>"
+"<div class='form-row'><label>RO膜通量</label><select id='roMem'><option value='0'>汇通50G (7.8L/h)</option><option value='1'>汇通75G (12.0L/h)</option><option value='2'>汇通100G (15.6L/h)</option><option value='3'>汇通200G (31.2L/h)</option><option value='4'>汇通400G (62.4L/h)</option></select></div>"
+"<div class='form-row'><label>增压泵</label><select id='pumpType'><option value='0'>三角洲50G 70psi 0.55L/min</option><option value='1'>三角洲75G 70psi 0.85L/min</option><option value='2'>三角洲100G 70psi 1.1L/min</option><option value='3'>三角洲200G 70psi 1.6L/min</option><option value='4'>三角洲300G 70psi 2.0L/min</option><option value='5'>三角洲400G 70psi 2.5L/min</option></select></div>"
+"<div class='form-row'><label>压力桶大小</label><select id='tankSize'><option value='0'>3G (11.4L)</option><option value='1'>3.2G (12.1L)</option><option value='2'>4G (15.1L)</option><option value='3'>6G (22.7L)</option><option value='4'>10G (37.9L)</option></select></div>"
+"<div class='btn-group'><button class='btn btn-success' onclick='saveHardware()'>保存硬件配置</button></div>"
+"</div>"
+
+"<div class='card'><h3>系统配置</h3>"
+"<div class='form-row'><label>常规冲洗时间 (秒)</label><input type='number' id='normalFlushDur' value='30'></div>"
+"<div class='form-row'><label>纯水洗膜时间 (秒)</label><input type='number' id='pureFlushDur' value='20'></div>"
+"<div class='form-row'><label>制水超时 (分钟)</label><input type='number' id='prodTimeout' value='180'></div>"
+"<div class='form-row'><label>漏水确认 (秒)</label><input type='number' id='leakConfirm' value='5'></div>"
+"<div class='form-row'><label>Flash保存周期</label><select id='saveInterval'><option value='10'>10分钟</option><option value='60'>1小时</option><option value='120'>2小时 (推荐)</option><option value='360'>6小时</option><option value='720'>12小时</option><option value='1440'>24小时</option></select></div>"
+"<div class='form-row'><label>继电器触发电平</label><select id='relayLevel'><option value='0'>低电平触发</option><option value='1'>高电平触发</option></select></div>"
+"<div class='form-row'><label>TDS进水阈值 (ppm)</label><input type='number' id='tdsInTh' value='500'></div>"
+"<div class='form-row'><label>TDS出水阈值 (ppm)</label><input type='number' id='tdsOutTh' value='50'></div>"
+"<div class='btn-group'><button class='btn btn-primary' onclick='saveConfig()'>保存系统配置</button></div>"
+"</div>"
+
+"<div class='card'><h3>水锤效应控制</h3>"
+"<p style='color:#888;font-size:12px'>调节阀门和泵的开关顺序延时，减少水锤对管路和RO膜的冲击</p>"
+"<div style='background:#f0f7ff;border:1px solid #d0e3ff;padding:12px;border-radius:8px;margin:12px 0;font-size:12px;line-height:1.9'>"
+"<b style='color:#667eea'>▶ 制水启动</b><br>"
+"&nbsp;&nbsp;&nbsp;&nbsp;开进水阀 → <b>开阀延时</b> → 开增压泵（废水阀关闭）<br>"
+"<b style='color:#667eea'>▶ 冲洗启动</b><br>"
+"&nbsp;&nbsp;&nbsp;&nbsp;开进水阀 → <b>开阀延时</b> → 开废水阀+增压泵<br>"
+"<b style='color:#e67e22'>■ 冲洗→反冲洗过渡</b><br>"
+"&nbsp;&nbsp;&nbsp;&nbsp;停泵 → <b>停泵延时</b> → 关进水阀 → <b>关阀延时</b> → 开回水阀+废水阀<br>"
+"</div>"
+"<div class='form-row'><label>▶ 开阀延时 (毫秒)</label><input type='number' id='whValveOpen' value='1000'><small style='display:block;color:#888;margin-top:2px'>开进水阀后等待，制水时再开泵，冲洗时再开废水阀+泵</small></div>"
+"<div class='form-row'><label>■ 停泵延时 (毫秒)</label><input type='number' id='whPumpStop' value='1000'><small style='display:block;color:#888;margin-top:2px'>停泵后等待，再关进水阀，防止水流回流</small></div>"
+"<div class='form-row'><label>■ 关阀延时 (毫秒)</label><input type='number' id='whValveClose' value='500'><small style='display:block;color:#888;margin-top:2px'>关进水阀后等待，再开回水阀+废水阀</small></div>"
+"<div class='btn-group'><button class='btn btn-primary' onclick='saveWaterHammer()'>保存水锤配置</button></div>"
+"</div>"
+
+"<div class='card'><h3>TDS校准</h3>"
+"<p style='color:#888;font-size:12px'>将传感器放入标准液或同一杯水中，输入标准值进行校准</p>"
+"<div class='form-row'><label>进水TDS标准值 (ppm)</label><input type='number' id='tdsInCal' placeholder='输入标准值'></div>"
+"<div class='form-row'><label>出水TDS标准值 (ppm)</label><input type='number' id='tdsOutCal' placeholder='输入标准值'></div>"
+"<div class='btn-group'><button class='btn btn-warning' onclick='calibrateTDS(0)'>校准进水TDS</button><button class='btn btn-warning' onclick='calibrateTDS(1)'>校准出水TDS</button></div>"
+"</div>"
+
+"<div class='card'><h3>WiFi配置</h3>"
+"<div class='grid'>"
+"<div class='stat'><div class='stat-label'>状态</div><div id='wifiState' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>SSID</div><div id='wifiSSID' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>IP地址</div><div id='wifiIP' class='stat-value'>-</div></div>"
+"</div>"
+"<div class='btn-group'><button class='btn btn-info' onclick='scanWiFi()'>扫描网络</button></div>"
+"<div id='wifiList'></div>"
+"<div class='form-row' style='display:flex;gap:10px;flex-wrap:wrap'>"
+"<input id='ssid' placeholder='WiFi名称' style='flex:1;min-width:100px'>"
+"<input id='pass' type='password' placeholder='密码' style='flex:1;min-width:100px'>"
+"</div>"
+"<div class='btn-group'><button class='btn btn-success' onclick='saveWiFi()'>连接WiFi</button></div>"
+"</div>"
+
+"<div class='card'><h3>MQTT配置</h3>"
+"<div class='form-row'><label>启用MQTT</label><select id='mqttEn'><option value='0'>禁用</option><option value='1'>启用</option></select></div>"
+"<div class='form-row'><label>Broker地址</label><input type='text' id='mqttBroker' placeholder='mqtt://homeassistant.local:1883'></div>"
+"<div class='form-row'><label>用户名</label><input type='text' id='mqttUser' placeholder='留空表示无认证'></div>"
+"<div class='form-row'><label>密码</label><input type='password' id='mqttPass' placeholder='留空表示无认证'></div>"
+"<div class='form-row'><label>主题前缀</label><input type='text' id='mqttPrefix' value='water-purifier'></div>"
+"<div class='btn-group'><button class='btn btn-primary' onclick='saveMQTT()'>保存MQTT配置</button></div>"
+"</div>"
+
+"</div>"
+"<script>"
+"function $(id){return document.getElementById(id)}"
+"function api(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json())}"
+"function loadConfig(){fetch('/api/config').then(r=>r.json()).then(d=>{"
+"$('normalFlushDur').value=d.normalFlushDur;"
+"$('pureFlushDur').value=d.pureFlushDur;"
+"$('prodTimeout').value=d.prodTimeout;"
+"$('leakConfirm').value=d.leakConfirm||5;"
+"$('saveInterval').value=d.saveInterval||120;"
+"$('relayLevel').value=d.relayLevel;"
+"$('tdsInTh').value=d.tdsInTh;"
+"$('tdsOutTh').value=d.tdsOutTh;"
+"$('roMem').value=d.roMem;"
+"$('pumpType').value=d.pumpType;"
+"$('tankSize').value=d.tankSize;"
+"$('whValveOpen').value=d.whValveOpen||1000;"
+"$('whPumpStop').value=d.whPumpStop||1000;"
+"$('whValveClose').value=d.whValveClose||500;"
+"})}"
+"function loadFilters(){fetch('/api/status').then(r=>r.json()).then(d=>{"
+"if(d.filters){for(let i=0;i<5;i++){const f=d.filters[i];if(f){$('f'+i).textContent=f.effPct+'%';$('fw'+i).textContent=f.waterPct+'%';$('ft'+i).textContent=f.timePct+'%';$('bw'+i).style.width=f.waterPct+'%';$('bt'+i).style.width=f.timePct+'%';$('bw'+i).className='filter-bar-fill '+(f.waterPct>50?'good':f.waterPct>20?'warn':'error');$('bt'+i).className='filter-bar-fill '+(f.timePct>50?'good':f.timePct>20?'warn':'error');$('cap'+i).value=f.total;}}}"
+"$('wifiState').textContent=d.wifiState;"
+"$('wifiSSID').textContent=d.ssid||'-';"
+"$('wifiIP').textContent=d.ip||'-';"
+"})}"
+"function startProduction(){api('/api/control',{action:'start_production'}).then(d=>alert(d.status||'已执行'))}"
+"function normalFlush(){api('/api/control',{action:'normal_flush'}).then(d=>alert(d.status||'已执行'))}"
+"function pureFlush(){api('/api/control',{action:'pure_flush'}).then(d=>alert(d.status||'已执行'))}"
+"function resetStop(){api('/api/control',{action:'reset'}).then(d=>alert(d.status||'已执行'))}"
+"function goStandby(){api('/api/control',{action:'standby'}).then(d=>alert(d.status||'已执行'))}"
+"function shutdown(){api('/api/control',{action:'shutdown'}).then(d=>alert(d.status||'已执行'))}"
+"function resetFilter(i){if(confirm('确认重置该滤芯？')){api('/api/filter/reset',{filter:i}).then(d=>{alert(d.filter_name+' 已重置');loadFilters()})}}"
+"function saveFilterCaps(){api('/api/filter/capacity',{caps:[parseInt($('cap0').value),parseInt($('cap1').value),parseInt($('cap2').value),parseInt($('cap3').value),parseInt($('cap4').value)]}).then(d=>alert(d.status||'已保存'))}"
+"function saveConfig(){api('/api/config',{normalFlushDur:parseInt($('normalFlushDur').value),pureFlushDur:parseInt($('pureFlushDur').value),prodTimeout:parseInt($('prodTimeout').value)*60,leakConfirm:parseInt($('leakConfirm').value),saveInterval:parseInt($('saveInterval').value),relayLevel:parseInt($('relayLevel').value),tdsInTh:parseFloat($('tdsInTh').value),tdsOutTh:parseFloat($('tdsOutTh').value),whValveOpen:parseInt($('whValveOpen').value),whPumpStop:parseInt($('whPumpStop').value),whValveClose:parseInt($('whValveClose').value)}).then(d=>alert(d.status||'已保存'))}"
+"function saveHardware(){api('/api/config/hardware',{roMem:parseInt($('roMem').value),pumpType:parseInt($('pumpType').value),tankSize:parseInt($('tankSize').value)}).then(d=>alert(d.status||'已保存'))}"
+"function scanWiFi(){$('wifiList').innerHTML='扫描中...';fetch('/api/wifi/scan').then(r=>r.json()).then(d=>{let h='';if(d.networks)d.networks.forEach(n=>h+='<div class=\"wifi-item\" onclick=\"$(\\'ssid\\').value=\\''+n.ssid+'\\'\">'+n.ssid+' ('+n.rssi+'dBm)</div>');$('wifiList').innerHTML=h||'未找到网络'})}"
+"function saveWiFi(){api('/api/wifi',{ssid:$('ssid').value,password:$('pass').value}).then(d=>alert(d.status))}"
+"function calibrateTDS(sensor){const v=sensor===0?$('tdsInCal').value:$('tdsOutCal').value;if(!v)return alert('请输入标准值');api('/api/tds/calibrate',{sensor:parseInt(sensor),value:parseFloat(v)}).then(d=>alert(d.status||'校准完成'))}"
+"function loadMQTT(){fetch('/api/mqtt/config').then(r=>r.json()).then(d=>{$('mqttEn').value=d.enabled?1:0;$('mqttBroker').value=d.broker||'';$('mqttUser').value=d.user||'';$('mqttPass').value='';$('mqttPrefix').value=d.prefix||'water-purifier'})}"
+"function saveMQTT(){api('/api/mqtt/config',{enabled:$('mqttEn').value==1,broker:$('mqttBroker').value,user:$('mqttUser').value,password:$('mqttPass').value,prefix:$('mqttPrefix').value}).then(d=>alert(d.status||'已保存'))}"
+"loadConfig();loadFilters();loadMQTT();"
+"</script></body></html>";
+
+// ==================== API处理函数 ====================
+
+static esp_err_t handle_index(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html_page, strlen(html_page));
+    return ESP_OK;
+}
+
+static esp_err_t handle_admin(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html_admin_page, strlen(html_admin_page));
+    return ESP_OK;
+}
+
+// favicon处理器 - 返回空内容避免404警告
+static esp_err_t handle_favicon(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "image/x-icon");
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t handle_status(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+
+    fsm_state_t state = fsm_get_state();
+    fsm_runtime_data_t data;
+    fsm_get_runtime_data(&data);
+
+    tds_dual_measurement_t tds;
+    tds_sensor_get_latest_dual(&tds);
+
+    // 获取五级滤芯状态
+    filters_status_t filters_status;
+    tds_sensor_get_filters_status(&filters_status);
+
+    char ip[16] = "";
+    wifi_manager_get_ip(ip, sizeof(ip));
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "state", fsm_get_state_name(state));
+    cJSON_AddNumberToObject(root, "cycles", data.total_production_cycles);
+    cJSON_AddNumberToObject(root, "flushes", data.total_flush_cycles);
+    cJSON_AddNumberToObject(root, "prodTime", data.total_production_time_sec);
+
+    cJSON_AddNumberToObject(root, "uptime", get_uptime_sec());
+
+    // 今日统计
+    daily_stats_t today;
+    if (history_get_today_stats(&today) == ESP_OK) {
+        cJSON_AddNumberToObject(root, "todayProd", today.production_sec / 60);
+    } else {
+        cJSON_AddNumberToObject(root, "todayProd", 0);
+    }
+
+    cJSON_AddNumberToObject(root, "tds_in", tds.inlet.valid ? tds.inlet.tds_value : 0);
+    cJSON_AddNumberToObject(root, "tds_out", tds.outlet.valid ? tds.outlet.tds_value : 0);
+    cJSON_AddNumberToObject(root, "rate", tds.both_valid ? tds.reduction_rate : 0);
+    cJSON_AddBoolToObject(root, "leak", gpio_driver_read_water_leak());
+
+    // SNTP系统时间
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    char time_buf[64];
+    if (tm_now.tm_year > 100) {
+        snprintf(time_buf, sizeof(time_buf), "%04d-%02d-%02d %02d:%02d:%02d",
+                 tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
+                 tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+        cJSON_AddStringToObject(root, "sntpTime", time_buf);
+    } else {
+        cJSON_AddStringToObject(root, "sntpTime", "未同步");
+    }
+
+    // 添加五级滤芯数据
+    cJSON *filters_arr = cJSON_CreateArray();
+    for (int i = 0; i < FILTER_COUNT; i++) {
+        cJSON *f = cJSON_CreateObject();
+        cJSON_AddNumberToObject(f, "waterPct", filters_status.filters[i].percentage);
+        cJSON_AddNumberToObject(f, "timePct", filters_status.filters[i].time_percentage);
+        cJSON_AddNumberToObject(f, "effPct", filters_status.filters[i].effective_percentage);
+        cJSON_AddNumberToObject(f, "used", filters_status.filters[i].used_liters);
+        cJSON_AddNumberToObject(f, "total", filters_status.filters[i].total_liters);
+        cJSON_AddBoolToObject(f, "needReplace", filters_status.filters[i].replacement_needed);
+        cJSON_AddItemToArray(filters_arr, f);
+    }
+    cJSON_AddItemToObject(root, "filters", filters_arr);
+    cJSON_AddNumberToObject(root, "totalWater", filters_status.total_water_used);
+
+    cJSON_AddStringToObject(root, "wifiState", wifi_manager_get_state_name(wifi_manager_get_state()));
+    cJSON_AddStringToObject(root, "ssid", wifi_manager_get_ssid());
+    cJSON_AddStringToObject(root, "ip", ip);
+
+    char *resp = cJSON_PrintUnformatted(root);
+    httpd_resp_send(req, resp, strlen(resp));
+    free(resp);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t handle_control(httpd_req_t *req)
+{
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        // 客户端断开连接，静默返回
+        return ESP_FAIL;
+    }
+    buf[len] = 0;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+
+    cJSON *action = cJSON_GetObjectItem(root, "action");
+    if (!action) { cJSON_Delete(root); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing action"); return ESP_FAIL; }
+
+    const char *a = action->valuestring;
+    if (strcmp(a, "start_production") == 0) fsm_manual_start_production();
+    else if (strcmp(a, "normal_flush") == 0) fsm_manual_normal_flush();
+    else if (strcmp(a, "pure_flush") == 0) fsm_manual_pure_flush();
+    else if (strcmp(a, "reset") == 0) fsm_clear_stop();
+    else if (strcmp(a, "standby") == 0) fsm_manual_go_standby();
+    else if (strcmp(a, "shutdown") == 0) fsm_manual_shutdown();
+
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+static esp_err_t handle_config_get(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+
+    system_config_t cfg;
+    config_manager_get_config(&cfg);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "normalFlushDur", cfg.normal_flush_duration_sec);
+    cJSON_AddNumberToObject(root, "pureFlushDur", cfg.pure_flush_duration_sec);
+    cJSON_AddNumberToObject(root, "prodTimeout", cfg.production_timeout_sec / 60);
+    cJSON_AddNumberToObject(root, "leakConfirm", cfg.leak_confirm_time_sec);
+    cJSON_AddNumberToObject(root, "saveInterval", cfg.runtime_save_interval_min);
+    cJSON_AddNumberToObject(root, "relayLevel", cfg.relay_trigger_level);
+    cJSON_AddNumberToObject(root, "tdsInTh", cfg.tds_inlet_threshold);
+    cJSON_AddNumberToObject(root, "tdsOutTh", cfg.tds_outlet_threshold);
+    cJSON_AddNumberToObject(root, "roMem", cfg.ro_membrane_type);
+    cJSON_AddNumberToObject(root, "pumpType", cfg.pump_type);
+    cJSON_AddNumberToObject(root, "tankSize", cfg.tank_size);
+    cJSON_AddNumberToObject(root, "whValveOpen", cfg.water_hammer_valve_open_delay_ms);
+    cJSON_AddNumberToObject(root, "whPumpStop", cfg.water_hammer_pump_stop_delay_ms);
+    cJSON_AddNumberToObject(root, "whValveClose", cfg.water_hammer_valve_close_delay_ms);
+
+    char *resp = cJSON_PrintUnformatted(root);
+    httpd_resp_send(req, resp, strlen(resp));
+    free(resp);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t handle_config_set(httpd_req_t *req)
+{
+    char buf[256];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        return ESP_FAIL;
+    }
+    buf[len] = 0;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+
+    system_config_t cfg;
+    config_manager_get_config(&cfg);
+
+    cJSON *v;
+    if ((v = cJSON_GetObjectItem(root, "normalFlushDur"))) cfg.normal_flush_duration_sec = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "pureFlushDur"))) cfg.pure_flush_duration_sec = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "prodTimeout"))) cfg.production_timeout_sec = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "leakConfirm"))) cfg.leak_confirm_time_sec = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "saveInterval"))) cfg.runtime_save_interval_min = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "relayLevel"))) cfg.relay_trigger_level = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "tdsInTh"))) cfg.tds_inlet_threshold = v->valuedouble;
+    if ((v = cJSON_GetObjectItem(root, "tdsOutTh"))) cfg.tds_outlet_threshold = v->valuedouble;
+    if ((v = cJSON_GetObjectItem(root, "whValveOpen"))) cfg.water_hammer_valve_open_delay_ms = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "whPumpStop"))) cfg.water_hammer_pump_stop_delay_ms = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "whValveClose"))) cfg.water_hammer_valve_close_delay_ms = v->valueint;
+
+    config_manager_set_config(&cfg);
+    config_manager_save();
+
+    // 应用配置
+    fsm_set_normal_flush_duration(cfg.normal_flush_duration_sec);
+    fsm_set_pure_flush_duration(cfg.pure_flush_duration_sec);
+    fsm_set_production_timeout(cfg.production_timeout_sec);
+    fsm_set_leak_confirm_time(cfg.leak_confirm_time_sec);
+    fsm_set_water_hammer_delays(cfg.water_hammer_valve_open_delay_ms,
+                                 cfg.water_hammer_pump_stop_delay_ms,
+                                 cfg.water_hammer_valve_close_delay_ms);
+    fsm_set_runtime_save_interval(cfg.runtime_save_interval_min);
+    gpio_driver_set_relay_trigger_level(cfg.relay_trigger_level);
+    tds_sensor_set_alarm_threshold(TDS_SENSOR_INLET, cfg.tds_inlet_threshold);
+    tds_sensor_set_alarm_threshold(TDS_SENSOR_OUTLET, cfg.tds_outlet_threshold);
+
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+static esp_err_t handle_hardware_config_set(httpd_req_t *req)
+{
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        return ESP_FAIL;
+    }
+    buf[len] = 0;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+
+    system_config_t cfg;
+    config_manager_get_config(&cfg);
+
+    cJSON *v;
+    if ((v = cJSON_GetObjectItem(root, "roMem"))) cfg.ro_membrane_type = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "pumpType"))) cfg.pump_type = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "tankSize"))) cfg.tank_size = v->valueint;
+
+    config_manager_set_config(&cfg);
+    config_manager_save();
+
+    // 应用硬件配置
+    fsm_set_production_rate_by_membrane(cfg.ro_membrane_type);
+
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"已保存\"}");
+    return ESP_OK;
+}
+
+static esp_err_t handle_wifi_scan(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+
+    // 切换到站模式进行扫描
+    wifi_mode_t original_mode;
+    esp_wifi_get_mode(&original_mode);
+
+    // 确保WiFi已启动
+    esp_wifi_scan_stop();
+
+    // 开始扫描
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+    };
+
+    esp_err_t ret = esp_wifi_scan_start(&scan_config, true);
+    if (ret != ESP_OK) {
+        httpd_resp_sendstr(req, "{\"networks\":[],\"error\":\"scan_failed\"}");
+        return ESP_OK;
+    }
+
+    // 获取扫描结果
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+
+    if (ap_count == 0) {
+        httpd_resp_sendstr(req, "{\"networks\":[]}");
+        return ESP_OK;
+    }
+
+    wifi_ap_record_t *ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
+    if (!ap_list) {
+        httpd_resp_sendstr(req, "{\"networks\":[],\"error\":\"no_memory\"}");
+        return ESP_OK;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_list));
+
+    // 构建JSON响应
+    cJSON *root = cJSON_CreateObject();
+    cJSON *networks = cJSON_CreateArray();
+
+    for (int i = 0; i < ap_count && i < 20; i++) {  // 最多返回20个网络
+        cJSON *net = cJSON_CreateObject();
+        cJSON_AddStringToObject(net, "ssid", (char*)ap_list[i].ssid);
+        cJSON_AddNumberToObject(net, "rssi", ap_list[i].rssi);
+        cJSON_AddNumberToObject(net, "channel", ap_list[i].primary);
+        cJSON_AddNumberToObject(net, "auth", ap_list[i].authmode);
+        cJSON_AddItemToArray(networks, net);
+    }
+
+    cJSON_AddItemToObject(root, "networks", networks);
+    cJSON_AddNumberToObject(root, "count", ap_count);
+
+    char *resp = cJSON_PrintUnformatted(root);
+    httpd_resp_sendstr(req, resp);
+
+    free(resp);
+    cJSON_Delete(root);
+    free(ap_list);
+
+    return ESP_OK;
+}
+
+static esp_err_t handle_wifi_config(httpd_req_t *req)
+{
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        return ESP_FAIL;
+    }
+    buf[len] = 0;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+
+    cJSON *ssid = cJSON_GetObjectItem(root, "ssid");
+    cJSON *pass = cJSON_GetObjectItem(root, "password");
+
+    if (ssid && ssid->valuestring) {
+        wifi_manager_set_config(ssid->valuestring, pass ? pass->valuestring : "");
+        wifi_manager_save_config();
+    }
+
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+static esp_err_t handle_filter_reset(httpd_req_t *req)
+{
+    char buf[64];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        return ESP_FAIL;
+    }
+    buf[len] = 0;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+
+    cJSON *filter_idx = cJSON_GetObjectItem(root, "filter");
+    if (!filter_idx) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing filter index");
+        return ESP_FAIL;
+    }
+
+    int idx = filter_idx->valueint;
+    esp_err_t ret = tds_sensor_reset_filter((filter_type_t)idx);
+
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+
+    if (ret == ESP_OK) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "status", "ok");
+        cJSON_AddStringToObject(resp, "filter_name", tds_sensor_get_filter_name(idx));
+        char *json_str = cJSON_PrintUnformatted(resp);
+        httpd_resp_sendstr(req, json_str);
+        free(json_str);
+        cJSON_Delete(resp);
+    } else {
+        httpd_resp_sendstr(req, "{\"status\":\"error\"}");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t handle_filter_capacity(httpd_req_t *req)
+{
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        return ESP_FAIL;
+    }
+    buf[len] = 0;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+
+    cJSON *caps = cJSON_GetObjectItem(root, "caps");
+    if (!caps || !cJSON_IsArray(caps)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing caps array");
+        return ESP_FAIL;
+    }
+
+    int array_size = cJSON_GetArraySize(caps);
+    if (array_size != FILTER_COUNT) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid caps array size");
+        return ESP_FAIL;
+    }
+
+    for (int i = 0; i < FILTER_COUNT; i++) {
+        cJSON *cap = cJSON_GetArrayItem(caps, i);
+        if (cap) {
+            uint32_t capacity = (uint32_t)cap->valueint;
+            tds_sensor_set_filter_capacity_ex((filter_type_t)i, capacity);
+        }
+    }
+
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+static esp_err_t tds_calibrate_handler(httpd_req_t *req)
+{
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) return ESP_FAIL;
+    buf[len] = 0;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return ESP_FAIL;
+
+    cJSON *sensor = cJSON_GetObjectItem(root, "sensor");
+    cJSON *value = cJSON_GetObjectItem(root, "value");
+
+    if (!sensor || !value) {
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"参数错误\"}");
+        return ESP_OK;
+    }
+
+    int sensor_id = sensor->valueint;
+    float cal_value = (float)value->valuedouble;
+
+    esp_err_t err = tds_sensor_calibrate((tds_sensor_id_t)sensor_id, cal_value);
+
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+
+    if (err == ESP_OK) {
+        char resp[64];
+        snprintf(resp, sizeof(resp), "{\"status\":\"校准成功，标准值: %.1f ppm\"}", cal_value);
+        httpd_resp_sendstr(req, resp);
+    } else {
+        httpd_resp_sendstr(req, "{\"status\":\"校准失败\"}");
+    }
+    return ESP_OK;
+}
+
+// ==================== MQTT配置API ====================
+
+static esp_err_t handle_mqtt_config_get(httpd_req_t *req)
+{
+    system_config_t cfg;
+    config_manager_get_config(&cfg);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "enabled", cfg.mqtt_enabled);
+    cJSON_AddStringToObject(root, "broker", cfg.mqtt_broker);
+    cJSON_AddStringToObject(root, "user", cfg.mqtt_username);
+    cJSON_AddStringToObject(root, "prefix", cfg.mqtt_topic_prefix);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t handle_mqtt_config_set(httpd_req_t *req)
+{
+    char buf[256];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) return ESP_FAIL;
+    buf[len] = 0;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return ESP_FAIL;
+
+    system_config_t cfg;
+    config_manager_get_config(&cfg);
+
+    cJSON *item;
+    if ((item = cJSON_GetObjectItem(root, "enabled"))) {
+        cfg.mqtt_enabled = item->valueint;
+    }
+    if ((item = cJSON_GetObjectItem(root, "broker"))) {
+        strncpy(cfg.mqtt_broker, item->valuestring, sizeof(cfg.mqtt_broker) - 1);
+    }
+    if ((item = cJSON_GetObjectItem(root, "user"))) {
+        strncpy(cfg.mqtt_username, item->valuestring, sizeof(cfg.mqtt_username) - 1);
+    }
+    if ((item = cJSON_GetObjectItem(root, "password"))) {
+        strncpy(cfg.mqtt_password, item->valuestring, sizeof(cfg.mqtt_password) - 1);
+    }
+    if ((item = cJSON_GetObjectItem(root, "prefix"))) {
+        strncpy(cfg.mqtt_topic_prefix, item->valuestring, sizeof(cfg.mqtt_topic_prefix) - 1);
+    }
+
+    cJSON_Delete(root);
+    config_manager_set_config(&cfg);
+    config_manager_save();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"已保存\"}");
+    return ESP_OK;
+}
+
+// ==================== 公共接口 ====================
+
+esp_err_t web_server_init(void)
+{
+    if (ctx.initialized) return ESP_OK;
+    ESP_LOGI(TAG, "初始化Web服务器");
+    ctx.initialized = true;
+    return ESP_OK;
+}
+
+esp_err_t web_server_deinit(void)
+{
+    web_server_stop();
+    ctx.initialized = false;
+    return ESP_OK;
+}
+
+esp_err_t web_server_start(void)
+{
+    if (!ctx.initialized) return ESP_ERR_INVALID_STATE;
+    if (ctx.running) return ESP_OK;
+
+    ESP_LOGI(TAG, "启动Web服务器端口 %d", ctx.config.port);
+
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.server_port = ctx.config.port;
+    cfg.lru_purge_enable = true;
+    cfg.max_uri_handlers = 15;
+
+    if (httpd_start(&ctx.server, &cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "启动失败");
+        return ESP_FAIL;
+    }
+
+    // 注册URI
+    httpd_uri_t uri;
+    uri.user_ctx = NULL;
+
+    uri.uri = "/", uri.method = HTTP_GET, uri.handler = handle_index;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/favicon.ico", uri.method = HTTP_GET, uri.handler = handle_favicon;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/status", uri.method = HTTP_GET, uri.handler = handle_status;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/control", uri.method = HTTP_POST, uri.handler = handle_control;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/config", uri.method = HTTP_GET, uri.handler = handle_config_get;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/config", uri.method = HTTP_POST, uri.handler = handle_config_set;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/config/hardware", uri.method = HTTP_POST, uri.handler = handle_hardware_config_set;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/wifi/scan", uri.method = HTTP_GET, uri.handler = handle_wifi_scan;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/wifi", uri.method = HTTP_POST, uri.handler = handle_wifi_config;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/filter/reset", uri.method = HTTP_POST, uri.handler = handle_filter_reset;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/filter/capacity", uri.method = HTTP_POST, uri.handler = handle_filter_capacity;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/tds/calibrate", uri.method = HTTP_POST, uri.handler = tds_calibrate_handler;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/mqtt/config", uri.method = HTTP_GET, uri.handler = handle_mqtt_config_get;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/mqtt/config", uri.method = HTTP_POST, uri.handler = handle_mqtt_config_set;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/admin", uri.method = HTTP_GET, uri.handler = handle_admin;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    ctx.running = true;
+    ESP_LOGI(TAG, "Web服务器已启动");
+    return ESP_OK;
+}
+
+esp_err_t web_server_stop(void)
+{
+    if (!ctx.running) return ESP_OK;
+    if (ctx.server) { httpd_stop(ctx.server); ctx.server = NULL; }
+    ctx.running = false;
+    return ESP_OK;
+}
+
+esp_err_t web_server_set_config(const web_server_config_t *config)
+{
+    if (!config) return ESP_ERR_INVALID_ARG;
+    memcpy(&ctx.config, config, sizeof(web_server_config_t));
+    return ESP_OK;
+}
+
+esp_err_t web_server_get_config(web_server_config_t *config)
+{
+    if (!config) return ESP_ERR_INVALID_ARG;
+    memcpy(config, &ctx.config, sizeof(web_server_config_t));
+    return ESP_OK;
+}
+
+bool web_server_is_running(void) { return ctx.running; }
+
+esp_err_t web_server_get_status_string(char *buf, size_t len)
+{
+    if (!buf) return ESP_ERR_INVALID_ARG;
+    snprintf(buf, len, "Web服务器: %s, 端口: %d", ctx.running ? "运行中" : "停止", ctx.config.port);
+    return ESP_OK;
+}

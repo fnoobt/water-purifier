@@ -1,0 +1,10 @@
+idf_component_register(SRCS "history_logger.c" "main.c"
+                    "gpio_driver.c"
+                    "tds_sensor.c"
+                    "water_purifier_fsm.c"
+                    "wifi_manager.c"
+                    "mqtt_client.c"
+                    "web_server.c"
+                    "config_manager.c"
+                    INCLUDE_DIRS "." "include"
+                    REQUIRES driver esp_wifi esp_event mqtt esp_http_server esp_adc json nvs_flash)
