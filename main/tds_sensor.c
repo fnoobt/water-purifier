@@ -1,7 +1,7 @@
 /**
  * @file tds_sensor.c
  * @brief TDS传感器检测模块实现
- * @note 进水TDS: GPIO4 (ADC1_CH4), 出水TDS: GPIO5 (ADC1_CH5)
+ * @note 进水TDS: GPIO2 (ADC1_CH2), 出水TDS: GPIO3 (ADC1_CH3)
  */
 
 #include "tds_sensor.h"
@@ -25,15 +25,6 @@ static const char *TAG = "TDS";
 #define ADC_SAMPLE_COUNT    16      // 每次测量采样次数
 #define ADC_SAMPLE_DELAY_US 500     // 采样间隔(微秒)
 
-// 滤芯默认时间寿命（小时）
-static const uint32_t filter_default_time_hours[FILTER_COUNT] = {
-    3000,   // PP棉：约3-6个月
-    4000,   // 颗粒活性炭：约6个月
-    4000,   // 压缩活性炭：约6个月
-    8000,   // RO膜：约24个月
-    4000,   // 后置活性炭：约12个月
-};
-
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
 
 static struct {
@@ -55,40 +46,19 @@ static struct {
 
     // 最新测量值
     tds_measurement_t latest[TDS_SENSOR_COUNT];
-
-    // 滤芯寿命（兼容旧接口）
-    uint32_t filter_total_liters;
-    uint32_t filter_used_liters;
-    uint32_t filter_install_time;  // Unix秒，NTP墙钟
-
-    // 五级滤芯管理
-    filter_info_t filters[FILTER_COUNT];
-    uint32_t total_water_used;
-
-    // 用水量累积器（避免短时间制水被丢弃）
-    float water_usage_accumulator;
-
-    // RO制水速率（升/小时）
-    float production_rate_lph;
 } tds_ctx = {
     .initialized = false,
     .running = false,
     .alarm_threshold = {500.0f, 100.0f},  // 进水500ppm，出水100ppm
     .temperature = 25.0f,
-    .filter_total_liters = 3000,  // 默认3000升
-    .filter_used_liters = 0,
-    .filter_install_time = 0,
-    .total_water_used = 0
 };
 
 // ==================== ESP32-C3 ADC通道映射 ====================
-// ESP32-C3 ADC通道映射:
-// GPIO0=ADC1_CH0, GPIO1=ADC1_CH1, GPIO2=ADC1_CH2, GPIO3=ADC1_CH3, GPIO4=ADC1_CH4
-// GPIO5=ADC2_CH0 (WiFi运行时不可用!)
+// ESP32-C3 ADC1通道: GPIO0=CH0, GPIO1=CH1, GPIO2=CH2, GPIO3=CH3, GPIO4=CH4
+// GPIO5=ADC2 (WiFi运行时不可用!)
 //
 // 当前配置: GPIO2(进水TDS), GPIO3(出水TDS) - 都使用ADC1，与WiFi兼容
 
-// ADC通道映射 (ESP32-C3) - 使用ADC1可用通道
 static const adc_channel_t tds_adc_channels[TDS_SENSOR_COUNT] = {
     ADC_CHANNEL_2,  // 进水TDS - GPIO2 (ADC1_CH2)
     ADC_CHANNEL_3   // 出水TDS - GPIO3 (ADC1_CH3)
@@ -100,29 +70,11 @@ static const char* const sensor_names[] = {
     "出水TDS"
 };
 
-// 滤芯名称
-static const char* const filter_names[FILTER_COUNT] = {
-    "PP棉",
-    "颗粒活性炭",
-    "压缩活性炭",
-    "RO膜",
-    "后置活性炭"
-};
-
-// 滤芯默认容量（升）
-static const uint32_t filter_default_capacities[FILTER_COUNT] = {
-    FILTER_DEFAULT_LIFE_PP,
-    FILTER_DEFAULT_LIFE_GRANULAR,
-    FILTER_DEFAULT_LIFE_COMPRESSED,
-    FILTER_DEFAULT_LIFE_RO,
-    FILTER_DEFAULT_LIFE_POST
-};
-
 // ==================== 私有函数 ====================
 
 static float calculate_tds(float voltage, float temperature);
 static float voltage_to_ec(float voltage);
-static float temperature_compensation(float ec, float temperature);
+static int adc_read_averaged(adc_channel_t channel);
 
 // ==================== 初始化 ====================
 
@@ -178,26 +130,6 @@ esp_err_t tds_sensor_init(void)
         tds_ctx.calibration[i].scale = 1.0f;
         tds_ctx.latest[i].valid = false;
     }
-
-    // 初始化五级滤芯
-    time_t now_sec = time(NULL);
-    for (int i = 0; i < FILTER_COUNT; i++) {
-        tds_ctx.filters[i].percentage = 100;
-        tds_ctx.filters[i].time_percentage = 100;
-        tds_ctx.filters[i].effective_percentage = 100;
-        tds_ctx.filters[i].used_liters = 0;
-        tds_ctx.filters[i].total_liters = filter_default_capacities[i];
-        tds_ctx.filters[i].time_limit_hours = filter_default_time_hours[i];
-        tds_ctx.filters[i].install_time = (uint32_t)now_sec;
-        tds_ctx.filters[i].last_reset_time = (uint32_t)now_sec;
-        tds_ctx.filters[i].replacement_needed = false;
-        strncpy(tds_ctx.filters[i].name, filter_names[i], sizeof(tds_ctx.filters[i].name) - 1);
-    }
-    tds_ctx.total_water_used = 0;
-    tds_ctx.production_rate_lph = 12.0f;  // 默认汇通75G
-
-    // 记录滤芯安装时间（兼容旧接口）
-    tds_ctx.filter_install_time = (uint32_t)now_sec;
 
     tds_ctx.initialized = true;
     ESP_LOGI(TAG, "TDS传感器初始化完成");
@@ -314,71 +246,6 @@ esp_err_t tds_sensor_stop(void)
 // ==================== 测量 ====================
 
 /**
- * @brief 在NTP同步后回补滤芯安装时间戳
- * 如果系统初始化时NTP尚未同步，last_reset_time会是0或1，
- * 当NTP同步后首次调用此函数自动修正为当前时间。
- */
-static void fixup_filter_time_on_ntp_sync(void)
-{
-    time_t now_sec = time(NULL);
-    if (now_sec <= 1) return;  // NTP仍未同步
-
-    bool fixed = false;
-    for (int i = 0; i < FILTER_COUNT; i++) {
-        if (tds_ctx.filters[i].last_reset_time <= 1) {
-            tds_ctx.filters[i].last_reset_time = (uint32_t)now_sec;
-            tds_ctx.filters[i].install_time = (uint32_t)now_sec;
-            fixed = true;
-        }
-    }
-    if (tds_ctx.filter_install_time <= 1) {
-        tds_ctx.filter_install_time = (uint32_t)now_sec;
-        fixed = true;
-    }
-    if (fixed) {
-        ESP_LOGI(TAG, "NTP已同步，修正滤芯日历时间戳");
-    }
-}
-
-/**
- * @brief 更新所有滤芯的时间维度寿命百分比
- * 此函数独立于水量更新调用，确保设备闲置时倒计时仍然工作
- * @note 应在查询滤芯状态或周期性保存时调用
- */
-static void update_filter_time_percentage(void)
-{
-    time_t now_sec = time(NULL);
-    if (now_sec <= 0) return;  // NTP未同步，无法计算日历时长
-
-    for (int i = 0; i < FILTER_COUNT; i++) {
-        // 时间维度（日历时长，NTP墙钟）
-        if (tds_ctx.filters[i].time_limit_hours > 0 &&
-            now_sec > 0 && tds_ctx.filters[i].last_reset_time > 0 &&
-            now_sec >= tds_ctx.filters[i].last_reset_time) {
-            uint32_t elapsed_hours = (uint32_t)((now_sec - tds_ctx.filters[i].last_reset_time) / 3600);
-            float time_remaining = 1.0f - (float)elapsed_hours / tds_ctx.filters[i].time_limit_hours;
-            if (time_remaining < 0) time_remaining = 0;
-            tds_ctx.filters[i].time_percentage = (uint8_t)(time_remaining * 100);
-        }
-
-        // 有效寿命 = min(水量%, 时间%)
-        tds_ctx.filters[i].effective_percentage =
-            (tds_ctx.filters[i].percentage < tds_ctx.filters[i].time_percentage) ?
-            tds_ctx.filters[i].percentage : tds_ctx.filters[i].time_percentage;
-
-        // 检查是否需要更换（低于10%）
-        bool needs_replacement = (tds_ctx.filters[i].effective_percentage < 10);
-
-        // 边沿触发警告：只在首次进入低于10%时输出
-        if (needs_replacement && !tds_ctx.filters[i].replacement_needed) {
-            ESP_LOGW(TAG, "%s滤芯寿命不足10%%，请及时更换", filter_names[i]);
-        }
-
-        tds_ctx.filters[i].replacement_needed = needs_replacement;
-    }
-}
-
-/**
  * @brief 多次采样ADC并计算平均值（去除极值）
  */
 static int adc_read_averaged(adc_channel_t channel)
@@ -432,7 +299,7 @@ esp_err_t tds_sensor_measure(tds_sensor_id_t sensor_id, tds_measurement_t *measu
     measurement->valid = sensor_connected;  // 传感器未连接时标记为无效
     measurement->timestamp = esp_timer_get_time();
 
-    // 调试输出原始ADC值 (改为INFO级别方便调试)
+    // 调试输出原始ADC值
     ESP_LOGD(TAG, "%s: ADC=%d, V=%.1fmV, TDS=%.1fppm, connected=%d",
              sensor_names[sensor_id], adc_raw, voltage, measurement->tds_value, sensor_connected);
 
@@ -591,225 +458,7 @@ bool tds_sensor_is_alarm(tds_sensor_id_t sensor_id)
             tds_ctx.latest[sensor_id].tds_value > tds_ctx.alarm_threshold[sensor_id]);
 }
 
-// ==================== 滤芯寿命 ====================
-
-esp_err_t tds_sensor_set_filter_capacity(uint32_t total_liters)
-{
-    tds_ctx.filter_total_liters = total_liters;
-    ESP_LOGI(TAG, "滤芯容量设置: %lu 升", total_liters);
-    return ESP_OK;
-}
-
-esp_err_t tds_sensor_update_water_usage(float liters)
-{
-    if (liters <= 0.0f) {
-        return ESP_OK;
-    }
-
-    // 如果NTP刚同步，回补滤芯时间戳
-    fixup_filter_time_on_ntp_sync();
-
-    // 累积小数水量
-    tds_ctx.water_usage_accumulator += liters;
-
-    // 当累积达到1升时，更新总量
-    if (tds_ctx.water_usage_accumulator >= 1.0f) {
-        uint32_t committed_liters = (uint32_t)tds_ctx.water_usage_accumulator;
-        tds_ctx.water_usage_accumulator -= committed_liters;
-
-        tds_ctx.filter_used_liters += committed_liters;
-        tds_ctx.total_water_used += committed_liters;
-
-        // 更新每个滤芯的用水量
-        for (int i = 0; i < FILTER_COUNT; i++) {
-            tds_ctx.filters[i].used_liters += committed_liters;
-
-            // 水量维度
-            if (tds_ctx.filters[i].total_liters > 0) {
-                float remaining = 1.0f - (float)tds_ctx.filters[i].used_liters / tds_ctx.filters[i].total_liters;
-                if (remaining < 0) remaining = 0;
-                tds_ctx.filters[i].percentage = (uint8_t)(remaining * 100);
-            }
-        }
-    }
-
-    // 统一更新所有滤芯的时间维度寿命、有效寿命、更换标志
-    update_filter_time_percentage();
-
-    return ESP_OK;
-}
-
-esp_err_t tds_sensor_get_filter_life(filter_life_t *life)
-{
-    if (!life) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    update_filter_time_percentage();
-
-    life->used_liters = tds_ctx.filter_used_liters;
-    life->total_liters = tds_ctx.filter_total_liters;
-    life->install_time = tds_ctx.filter_install_time;
-
-    // 使用RO膜的有效寿命（水量+时间最小值）
-    if (tds_ctx.filter_total_liters > 0) {
-        uint8_t pct = tds_ctx.filters[FILTER_RO_MEMBRANE].effective_percentage;
-        life->percentage = pct;
-    } else {
-        life->percentage = 100;
-    }
-
-    life->replacement_needed = (life->percentage < 10);
-
-    return ESP_OK;
-}
-
-esp_err_t tds_sensor_reset_filter_life(void)
-{
-    tds_ctx.filter_used_liters = 0;
-    tds_ctx.filter_install_time = (uint32_t)time(NULL);
-    ESP_LOGI(TAG, "滤芯寿命已重置");
-    return ESP_OK;
-}
-
-// ==================== 五级滤芯管理 ====================
-
-esp_err_t tds_sensor_get_filters_status(filters_status_t *status)
-{
-    if (!status) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // 如果NTP刚同步，回补滤芯时间戳
-    fixup_filter_time_on_ntp_sync();
-
-    // 更新所有滤芯的时间维度寿命（确保查询时倒计时实时）
-    update_filter_time_percentage();
-
-    memcpy(status->filters, tds_ctx.filters, sizeof(tds_ctx.filters));
-    status->total_water_used = tds_ctx.total_water_used;
-    status->any_filter_needs_replacement = tds_sensor_any_filter_needs_replacement();
-
-    return ESP_OK;
-}
-
-esp_err_t tds_sensor_get_filter_info(filter_type_t filter_type, filter_info_t *info)
-{
-    if (filter_type >= FILTER_COUNT || !info) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    update_filter_time_percentage();
-    memcpy(info, &tds_ctx.filters[filter_type], sizeof(filter_info_t));
-    return ESP_OK;
-}
-
-esp_err_t tds_sensor_reset_filter(filter_type_t filter_type)
-{
-    if (filter_type >= FILTER_COUNT) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    time_t now_sec = time(NULL);
-    tds_ctx.filters[filter_type].percentage = 100;
-    tds_ctx.filters[filter_type].time_percentage = 100;
-    tds_ctx.filters[filter_type].effective_percentage = 100;
-    tds_ctx.filters[filter_type].used_liters = 0;
-    tds_ctx.filters[filter_type].install_time = (uint32_t)now_sec;
-    tds_ctx.filters[filter_type].last_reset_time = (uint32_t)now_sec;
-    tds_ctx.filters[filter_type].replacement_needed = false;
-
-    ESP_LOGI(TAG, "%s滤芯已重置", filter_names[filter_type]);
-    return ESP_OK;
-}
-
-esp_err_t tds_sensor_reset_all_filters(void)
-{
-    time_t now_sec = time(NULL);
-
-    for (int i = 0; i < FILTER_COUNT; i++) {
-        tds_ctx.filters[i].percentage = 100;
-        tds_ctx.filters[i].time_percentage = 100;
-        tds_ctx.filters[i].effective_percentage = 100;
-        tds_ctx.filters[i].used_liters = 0;
-        tds_ctx.filters[i].install_time = (uint32_t)now_sec;
-        tds_ctx.filters[i].last_reset_time = (uint32_t)now_sec;
-        tds_ctx.filters[i].replacement_needed = false;
-    }
-    tds_ctx.total_water_used = 0;
-    tds_ctx.filter_used_liters = 0;
-    tds_ctx.water_usage_accumulator = 0.0f;
-
-    ESP_LOGI(TAG, "所有滤芯已重置");
-    return ESP_OK;
-}
-
-esp_err_t tds_sensor_set_filter_capacity_ex(filter_type_t filter_type, uint32_t total_liters)
-{
-    if (filter_type >= FILTER_COUNT) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    tds_ctx.filters[filter_type].total_liters = total_liters;
-    // 重新计算水量百分比
-    if (total_liters > 0) {
-        float remaining = 1.0f - (float)tds_ctx.filters[filter_type].used_liters / total_liters;
-        if (remaining < 0) remaining = 0;
-        tds_ctx.filters[filter_type].percentage = (uint8_t)(remaining * 100);
-        if (tds_ctx.filters[filter_type].percentage > 100) {
-            tds_ctx.filters[filter_type].percentage = 100;
-        }
-    }
-    // 更新有效寿命
-    tds_ctx.filters[filter_type].effective_percentage =
-        (tds_ctx.filters[filter_type].percentage < tds_ctx.filters[filter_type].time_percentage) ?
-        tds_ctx.filters[filter_type].percentage : tds_ctx.filters[filter_type].time_percentage;
-    tds_ctx.filters[filter_type].replacement_needed = (tds_ctx.filters[filter_type].effective_percentage < 10);
-
-    ESP_LOGI(TAG, "%s滤芯容量设置为 %lu 升", filter_names[filter_type], total_liters);
-    return ESP_OK;
-}
-
-const char* tds_sensor_get_filter_name(filter_type_t filter_type)
-{
-    if (filter_type < FILTER_COUNT) {
-        return filter_names[filter_type];
-    }
-    return "未知滤芯";
-}
-
-bool tds_sensor_any_filter_needs_replacement(void)
-{
-    for (int i = 0; i < FILTER_COUNT; i++) {
-        if (tds_ctx.filters[i].replacement_needed ||
-            tds_ctx.filters[i].percentage < 10) {
-            return true;
-        }
-    }
-    return false;
-}
-
 // ==================== 温度 ====================
-
-uint32_t tds_sensor_get_total_water_usage(void)
-{
-    return tds_ctx.total_water_used;
-}
-
-esp_err_t tds_sensor_set_production_rate(float lph)
-{
-    if (lph <= 0.0f) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    tds_ctx.production_rate_lph = lph;
-    ESP_LOGI(TAG, "RO制水速率设置: %.1f L/h", lph);
-    return ESP_OK;
-}
-
-float tds_sensor_get_production_rate(void)
-{
-    return tds_ctx.production_rate_lph;
-}
 
 esp_err_t tds_sensor_set_temperature(float temperature)
 {
@@ -840,19 +489,14 @@ esp_err_t tds_sensor_get_status_string(char *buffer, size_t buffer_size)
     float outlet_tds = tds_ctx.latest[TDS_SENSOR_OUTLET].valid ?
                        tds_ctx.latest[TDS_SENSOR_OUTLET].tds_value : 0;
 
-    filter_life_t filter;
-    tds_sensor_get_filter_life(&filter);
-
     snprintf(buffer, buffer_size,
              "进水TDS: %.1f ppm (阈值: %.1f)\n"
              "出水TDS: %.1f ppm (阈值: %.1f)\n"
              "去除率: %.1f%%\n"
-             "滤芯寿命: %d%%\n"
              "温度: %.1f°C",
              inlet_tds, tds_ctx.alarm_threshold[TDS_SENSOR_INLET],
              outlet_tds, tds_ctx.alarm_threshold[TDS_SENSOR_OUTLET],
              (inlet_tds > 0) ? (1.0f - outlet_tds / inlet_tds) * 100 : 0,
-             filter.percentage,
              tds_ctx.temperature);
 
     return ESP_OK;

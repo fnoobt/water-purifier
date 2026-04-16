@@ -27,7 +27,7 @@
 - **增压泵**: 可配置（三角洲 50G~400G）
 - **压力桶**: 可配置（3G/3.2G/4G/6G/10G）
 - **工作电压**: 24V（设备供电）/ 5V（降压模块给ESP32）
-- **固件版本**: 1.0.0
+- **固件版本**: 1.0.5
 
 ### 技术栈
 - **框架**: ESP-IDF v5.5.2
@@ -46,7 +46,8 @@ WaterPurifier/
 │   │   ├── board_params.h         # 硬件配置参数（压力开关阈值等）
 │   │   ├── gpio_config.h          # GPIO引脚定义和电气参数
 │   │   ├── gpio_driver.h          # GPIO驱动接口
-│   │   ├── tds_sensor.h           # TDS传感器接口（双路+滤芯管理）
+│   │   ├── filter_manager.h       # 滤芯管理接口（5级滤芯，水量+时间双维度）
+│   │   ├── tds_sensor.h           # TDS传感器接口（TDS测量）
 │   │   ├── water_purifier_fsm.h   # 状态机接口（8状态FSM）
 │   │   ├── wifi_manager.h         # WiFi管理器接口
 │   │   ├── app_mqtt_public.h      # MQTT客户端接口
@@ -56,7 +57,8 @@ WaterPurifier/
 │   │
 │   ├── main.c                     # 主程序入口
 │   ├── gpio_driver.c              # GPIO驱动实现
-│   ├── tds_sensor.c               # TDS传感器实现（ADC采集+5级滤芯管理）
+│   ├── tds_sensor.c               # TDS传感器实现（ADC采集、校准、报警）
+│   ├── filter_manager.c           # 滤芯管理实现（5级滤芯、用水量、NVS持久化）
 │   ├── water_purifier_fsm.c       # 状态机实现（8状态FSM，双阶段冲洗+水锤控制）
 │   ├── wifi_manager.c             # WiFi管理器（STA/AP+mDNS）
 │   ├── mqtt_client.c              # MQTT客户端（Home Assistant发现）
@@ -88,6 +90,7 @@ WaterPurifier/
 1. config_manager_init()   -> NVS初始化，加载系统配置
 2. gpio_driver_init_*()    -> GPIO输入/输出/LED初始化
 3. tds_sensor_init()       -> ADC初始化
+   filter_mgr_init()       -> 滤芯管理初始化（加载NVS滤芯状态）
    tds_sensor_start()      -> 启动TDS测量任务（1秒周期）
 4. fsm_init()              -> 状态机初始化，加载运行数据
    fsm_set_*()             -> 应用配置
@@ -156,7 +159,9 @@ void gpio_driver_set_relay_trigger_level(uint8_t level);  // 继电器触发电�
 
 ### 3. TDS传感器 (tds_sensor.c/h)
 
-**职责**: TDS值采集、滤波、报警检测、五级滤芯寿命管理
+**职责**: TDS值采集、滤波、校准、报警检测
+
+> **注意**: 滤芯管理功能已提取到独立的 `filter_manager` 模块。
 
 **工作原理**:
 ```
@@ -179,7 +184,7 @@ esp_err_t tds_sensor_measure_dual(tds_dual_measurement_t *dual);
 esp_err_t tds_sensor_get_latest(tds_sensor_id_t id, tds_measurement_t *measurement);
 esp_err_t tds_sensor_get_latest_dual(tds_dual_measurement_t *dual);
 
-// 校准
+// 校准（校准结果通过config_manager持久化到Flash）
 esp_err_t tds_sensor_calibrate(tds_sensor_id_t id, float standard_value);
 esp_err_t tds_sensor_set_calibration(tds_sensor_id_t id, const tds_calibration_t *cal);
 esp_err_t tds_sensor_reset_calibration(tds_sensor_id_t id);
@@ -187,16 +192,6 @@ esp_err_t tds_sensor_reset_calibration(tds_sensor_id_t id);
 // 报警
 esp_err_t tds_sensor_set_alarm_threshold(tds_sensor_id_t id, float threshold);
 bool tds_sensor_is_alarm(tds_sensor_id_t id);
-
-// 五级滤芯管理
-esp_err_t tds_sensor_get_filters_status(filters_status_t *status);
-esp_err_t tds_sensor_reset_filter(filter_type_t filter_type);
-esp_err_t tds_sensor_set_filter_capacity_ex(filter_type_t filter_type, uint32_t liters);
-bool tds_sensor_any_filter_needs_replacement(void);
-
-// 制水速率
-esp_err_t tds_sensor_set_production_rate(float lph);
-float tds_sensor_get_production_rate(void);
 ```
 
 **数据结构**:
@@ -209,24 +204,17 @@ typedef struct {
     bool valid;                // 数据有效性
     uint64_t timestamp;        // 时间戳 (微秒)
 } tds_measurement_t;
-
-typedef struct {
-    uint8_t percentage;           // 剩余寿命百分比，基于水量
-    uint8_t time_percentage;      // 剩余寿命百分比，基于时间
-    uint8_t effective_percentage;  // 有效寿命百分比（min(水量%, 时间%)）
-    uint32_t used_liters;         // 已处理水量（升）
-    uint32_t total_liters;        // 滤芯总容量（升）
-    uint32_t time_limit_hours;    // 时间寿命上限（小时）
-    uint32_t install_time;        // 安装时间戳（Unix秒，NTP墙钟）
-    uint32_t last_reset_time;     // 上次重置时间戳（Unix秒，NTP墙钟）
-    bool replacement_needed;       // 是否需要更换
-    char name[16];                // 滤芯名称
-} filter_info_t;
 ```
 
-**滤芯日历寿命说明**: `install_time` 和 `last_reset_time` 使用 `time(NULL)` 获取的 Unix 秒（NTP 墙钟），而非 `esp_timer_get_time()`。设备首次 NTP 同步后会自动回推滤芯安装时间，确保日历寿命准确反映自然时间流逝，即使设备断电期间也正常计时。
+---
 
-**五级滤芯默认配置**:
+### 4. 滤芯管理 (filter_manager.c/h)
+
+**职责**: 5级滤芯寿命管理、用水量统计、制水速率、NVS持久化
+
+**NVS命名空间**: `wp_filters`（独立于系统配置命名空间）
+
+**五级滤芯**:
 
 | 滤芯 | 默认水量 | 默认时间 | 建议更换周期 |
 |------|---------|---------|-------------|
@@ -236,11 +224,38 @@ typedef struct {
 | RO膜 | 8000升 | 8000小时 | 24-36个月 |
 | 后置活性炭 | 4000升 | 4000小时 | 12个月 |
 
-**滤芯寿命计算**: `effective_percentage = min(water_pct, time_pct)`，低于10%触发更换提醒。
+**寿命计算**: `effective_percentage = min(water_pct, time_pct)`，低于10%触发更换提醒。
+
+**Flash写入策略**:
+- `filter_mgr_update_water_usage()` — 仅设置脏标志，不调用NVS写入
+- `filter_mgr_periodic_save()` — 由FSM周期任务调用，检查脏标志后写入
+- `filter_mgr_reset_filter()` / `filter_mgr_set_filter_capacity_ex()` — 用户操作，立即写入
+- `filter_mgr_set_all_filter_capacity()` — 批量设置5级滤芯容量，一次NVS写入
+
+**日历寿命**: `install_time` 和 `last_reset_time` 使用 `time(NULL)` 获取的 Unix 秒（NTP墙钟）。设备首次 NTP 同步后会自动回推滤芯安装时间，确保日历寿命准确反映自然时间流逝。
+
+**主要函数**:
+```c
+esp_err_t filter_mgr_init(void);
+esp_err_t filter_mgr_update_water_usage(float liters);
+uint32_t filter_mgr_get_total_water_usage(void);
+bool filter_mgr_periodic_save(void);
+
+esp_err_t filter_mgr_get_filters_status(filters_status_t *status);
+esp_err_t filter_mgr_get_filter_info(filter_type_t filter_type, filter_info_t *info);
+esp_err_t filter_mgr_reset_filter(filter_type_t filter_type);
+esp_err_t filter_mgr_reset_all_filters(void);
+esp_err_t filter_mgr_set_filter_capacity_ex(filter_type_t filter_type, uint32_t liters);
+esp_err_t filter_mgr_set_all_filter_capacity(const uint32_t capacities[FILTER_COUNT]);
+bool filter_mgr_any_filter_needs_replacement(void);
+
+esp_err_t filter_mgr_set_production_rate(float lph);
+float filter_mgr_get_production_rate(void);
+```
 
 ---
 
-### 4. 状态机 (water_purifier_fsm.c/h)
+### 5. 状态机 (water_purifier_fsm.c/h)
 
 **职责**: 净水器工作流程控制
 
@@ -256,28 +271,6 @@ typedef struct {
 | FSM_STATE_WATER_SHORTAGE | 缺水 | 进水压力不足 |
 | FSM_STATE_LEAK_ALARM | 漏水报警 | 漏水检测 |
 | FSM_STATE_STOP | 停止 | 制水超时/网页停止 |
-
-**事件定义**:
-```c
-typedef enum {
-    FSM_EVENT_NONE = 0,             // 无事件
-    FSM_EVENT_LOW_PRESSURE_ON,      // 有水
-    FSM_EVENT_LOW_PRESSURE_OFF,     // 缺水
-    FSM_EVENT_TANK_NEED_WATER,      // 需要制水
-    FSM_EVENT_TANK_FULL,            // 压力桶满
-    FSM_EVENT_WATER_LEAK,           // 漏水检测
-    FSM_EVENT_NORMAL_FLUSH_DONE,    // 常规冲洗完成
-    FSM_EVENT_PURE_FLUSH_DONE,      // 纯水洗膜完成
-    FSM_EVENT_PRODUCTION_TIMEOUT,   // 制水超时
-    FSM_EVENT_RESET,                // 复位
-    FSM_EVENT_FORCE_FLUSH,          // 强制冲洗
-    FSM_EVENT_FORCE_PRODUCTION,     // 强制制水
-    FSM_EVENT_NORMAL_FLUSH,         // 常规冲洗（网页控制）
-    FSM_EVENT_PURE_FLUSH,           // 纯水洗膜（网页控制）
-    FSM_EVENT_GO_STANDBY,           // 待机（网页控制）
-    FSM_EVENT_SHUTDOWN,             // 停止（进入停止状态不记录停止，网页控制）
-} fsm_event_t;
-```
 
 **状态转换图**:
 ```
@@ -320,7 +313,6 @@ typedef enum {
            ▼
     ┌─────────┐
     │ STANDBY │
-    │ 待机    │
     └─────────┘
 
     ┌──────────────┐
@@ -355,8 +347,8 @@ typedef struct {
     uint64_t total_production_time_sec;    // 总制水时间（秒）
     uint64_t total_flush_time_sec;         // 总冲洗时间（秒）
     stop_type_t last_stop_type;          // 最近停止类型
-    uint32_t stop_count;                  // 停止次数
     uint64_t last_stop_time;              // 最近停止时间
+    uint64_t last_flush_time;             // 上次冲洗时间
     bool low_pressure_occurred;            // 曾经低压断开过
 } fsm_runtime_data_t;
 ```
@@ -371,16 +363,26 @@ typedef struct {
 400G -> 62.4 L/h  (1.04 L/min × 60)
 ```
 
+**周期保存**: FSM任务循环中按配置的保存间隔（默认120分钟，可选10/60/120/360/720/1440分钟）调用：
+- `save_runtime_data()` — 检查 `fsm_ctx.runtime_dirty` 后写入
+- `filter_mgr_periodic_save()` — 检查 `save_needed` 脏标志后写入
+- `history_periodic_save()` — 检查脏标志+间隔+has_data后写入
+
 ---
 
-### 5. WiFi管理器 (wifi_manager.c/h)
+### 6. WiFi管理器 (wifi_manager.c/h)
 
-**职责**: WiFi连接管理、AP配置模式、mDNS域名服务
+**职责**: WiFi连接管理、AP配置模式、mDNS域名服务、自动重连
 
 **工作模式**:
 - **STA模式**: 连接到配置的WiFi网络
 - **AP+STA模式**: 无配置时启动AP热点配网
 - **mDNS**: 注册 `http://waterpurifier.local`
+
+**自动重连机制**:
+- WiFi断开后启动独立FreeRTOS任务执行指数退避重连（1s→2s→4s→8s→16s→30s）
+- 10次重连失败后进入AP模式，AP模式下每5分钟自动尝试STA重连
+- 重连任务不阻塞事件处理系统，重连成功后自动停止AP模式
 
 **主要函数**:
 ```c
@@ -401,7 +403,7 @@ esp_err_t wifi_manager_get_ip(char *ip_str, size_t buffer_size);
 int8_t wifi_manager_get_rssi(void);
 const char* wifi_manager_get_ssid(void);
 
-// 配置
+// 配置（60秒节流）
 esp_err_t wifi_manager_set_config(const char *ssid, const char *password);
 esp_err_t wifi_manager_save_config(void);
 esp_err_t wifi_manager_load_config(void);
@@ -416,7 +418,7 @@ bool wifi_manager_has_saved_config(void);
 
 ---
 
-### 6. MQTT客户端 (mqtt_client.c/h)
+### 7. MQTT客户端 (mqtt_client.c/h)
 
 **职责**: MQTT通信、Home Assistant集成
 
@@ -457,7 +459,7 @@ water-purifier/set/flush           # 冲洗控制
 
 ---
 
-### 7. Web服务器 (web_server.c/h)
+### 8. Web服务器 (web_server.c/h)
 
 **职责**: HTTP服务器、Web控制界面、RESTful API
 
@@ -480,16 +482,17 @@ water-purifier/set/flush           # 冲洗控制
 | `/api/wifi/scan` | GET | 扫描WiFi网络 |
 | `/api/wifi` | POST | 保存WiFi配置 |
 | `/api/filter/reset` | POST | 重置滤芯 |
-| `/api/filter/capacity` | POST | 设置滤芯容量 |
-| `/api/tds/calibrate` | POST | TDS传感器校准 |
+| `/api/filter/capacity` | POST | 设置滤芯容量（批量，一次NVS写入） |
+| `/api/tds/calibrate` | POST | TDS传感器校准（自动持久化到Flash） |
 | `/api/mqtt/config` | GET | 获取MQTT配置 |
 | `/api/mqtt/config` | POST | 保存MQTT配置 |
 
 **控制命令**:
 ```json
 {"action": "start_production"}  // 制水
-{"action": "normal_flush"}      // 冲洗
-{"action": "pure_flush"}        // 反冲洗
+{"action": "normal_flush"}      // 常规冲洗
+{"action": "pure_flush"}        // 纯水洗膜
+{"action": "filter_flush"}      // 换芯冲洗（仅普通冲洗，时长可配置）
 {"action": "standby"}           // 待机
 {"action": "shutdown"}          // 停止
 {"action": "reset"}             // 复位
@@ -521,31 +524,9 @@ water-purifier/set/flush           # 冲洗控制
 }
 ```
 
-**系统配置请求/响应**:
-```json
-{
-  "flushDur": 30,
-  "prodTimeout": 10800,
-  "leakConfirm": 5,
-  "saveInterval": 120,
-  "relayLevel": 0,
-  "tdsInTh": 500,
-  "tdsOutTh": 100
-}
-```
-
-**硬件配置请求**:
-```json
-{
-  "roMem": 1,
-  "pumpType": 1,
-  "tankSize": 0
-}
-```
-
 ---
 
-### 8. 配置管理器 (config_manager.c/h)
+### 9. 配置管理器 (config_manager.c/h)
 
 **职责**: 配置持久化存储（NVS）
 
@@ -575,8 +556,9 @@ typedef struct {
     uint16_t runtime_save_interval_min;  // 运行数据保存间隔（分钟），10/60/120/360/720/1440，默认120
 
     // 冲洗参数
-    uint32_t normal_flush_duration_sec;  // 常规冲洗持续时间（秒），默认30
-    uint32_t pure_flush_duration_sec;    // 纯水洗膜持续时间（秒），默认20
+    uint32_t normal_flush_duration_sec;  // 常规冲洗持续时间（秒），默认20
+    uint32_t pure_flush_duration_sec;    // 纯水洗膜持续时间（秒），默认15
+    uint32_t filter_flush_duration_sec;   // 换芯冲洗持续时间（秒），默认3600（1小时）
     uint32_t short_prod_threshold_sec;   // 短制水判断阈值（秒），默认180
     uint32_t water_hammer_valve_open_delay_ms;  // 水锤-开阀延时（毫秒），默认1000
     uint32_t water_hammer_pump_stop_delay_ms;   // 水锤-停泵延时（毫秒），默认1000
@@ -609,24 +591,26 @@ typedef struct {
     uint32_t total_flush_cycles;
     uint64_t total_production_time_sec;
     uint64_t total_flush_time_sec;
-    uint32_t stop_count;
     uint32_t total_water_used;
 } runtime_data_t;
 ```
+
+**NVS脏检查**: `config_manager_save_runtime_data()` 使用 `memcmp` 与上次保存的数据比较，数据未变化时跳过NVS写入。
 
 **NVS命名空间**:
 
 | 命名空间 | 用途 | 存储内容 |
 |---------|------|---------|
 | `water_purifier` | 系统配置 | WiFi/MQTT/硬件/TDS/滤芯/Web配置 |
-| `wp_rt` | 运行数据 | 制水/冲洗次数、时间、停止、用水量 |
+| `wp_rt` | 运行数据 | 制水/冲洗次数、时间、用水量 |
 | `wifi` | WiFi配置 | SSID和密码 |
 | `history` | 历史记录 | 事件记录（最多50条循环） |
 | `daily_stats` | 每日统计 | 每日制水/冲洗/TDS统计 |
+| `wp_filters` | 滤芯管理 | 5级滤芯用水量/时间/容量（独立命名空间） |
 
 ---
 
-### 9. 历史记录 (history_logger.c/h)
+### 10. 历史记录 (history_logger.c/h)
 
 **职责**: 运行事件日志记录、每日统计汇总、NVS 脏数据节流写入
 
@@ -692,13 +676,12 @@ bool history_periodic_save(uint32_t min_interval_sec);
                            ▼                ▼
                     ┌─────────────┐    ┌─────────────┐
                     │  滤芯管理   │    │   输出控制   │
-                    └─────────────┘    └──────┬──────┘
-                                             │
+                    │  (NVS存储)  │    └──────┬──────┘
+                    └─────────────┘         │
                     ┌─────────────┐         │
                     │ MQTT客户端  │◄────────┤
                     │ Web服务器   │         │
                     └─────────────┘         │
-                                             │
                     ┌─────────────┐         │
                     │  电磁阀/泵  │◄────────┘
                     │  (GPIO输出) │
@@ -759,13 +742,14 @@ GET /api/status
 POST /api/control
 Content-Type: application/json
 
-{"action": "start"}
+{"action": "start_production"}
 ```
 
 **action参数**:
 - `start_production`: 开始制水
 - `normal_flush`: 常规冲洗
 - `pure_flush`: 纯水洗膜
+- `filter_flush`: 换芯冲洗（仅普通冲洗，时长可配置）
 - `standby`: 切换到待机
 - `shutdown`: 停止（进入停止状态）
 - `reset`: 系统复位
@@ -827,8 +811,9 @@ Content-Type: application/json
 | `flush_dur` | u32 | water_purifier | 冲洗时间（秒），默认30 |
 | `prod_timeout` | u32 | water_purifier | 制水超时（秒），默认10800 |
 | `leak_confirm` | u32 | water_purifier | 漏水确认时间（秒），默认5 |
-| `nflush_dur` | u32 | water_purifier | 常规冲洗时间（秒），默认30 |
-| `pflush_dur` | u32 | water_purifier | 纯水洗膜时间（秒），默认20 |
+| `nflush_dur` | u32 | water_purifier | 常规冲洗时间（秒），默认20 |
+| `pflush_dur` | u32 | water_purifier | 纯水洗膜时间（秒），默认15 |
+| `fflush_dur` | u32 | water_purifier | 换芯冲洗时间（秒），默认3600 |
 | `short_prod` | u32 | water_purifier | 短制水判断阈值（秒），默认180 |
 | `wh_vopn` | u32 | water_purifier | 水锤开阀延时（毫秒），默认1000 |
 | `wh_pstp` | u32 | water_purifier | 水锤停泵延时（毫秒），默认1000 |
@@ -853,6 +838,11 @@ Content-Type: application/json
 | `prod_time` | u64 | wp_rt | 总制水时间（秒） |
 | `flush_time` | u64 | wp_rt | 总冲洗时间（秒） |
 | `total_water` | u32 | wp_rt | 总用水量（升） |
+| `f%d_used` | u32 | wp_filters | 各级滤芯已用水量（%d=0~4） |
+| `f%d_reset` | u32 | wp_filters | 各级滤芯重置时间（Unix秒） |
+| `f%d_cap` | u32 | wp_filters | 各级滤芯自定义容量（可选） |
+| `total_water` | u32 | wp_filters | 滤芯总用水量（升） |
+| `prod_rate` | i32 | wp_filters | 制水速率（×100编码） |
 
 ---
 
@@ -879,8 +869,9 @@ Content-Type: application/json
 | 状态机任务 | ~16KB | FSM任务栈(4096) |
 | TDS传感器任务 | ~12KB | TDS任务栈(3072) |
 | 配置管理 | ~2KB | 配置数据 |
-| **总使用** | ~180KB | - |
-| **可用** | ~220KB | - |
+| 滤芯管理 | ~2KB | 滤芯数据 |
+| **总使用** | ~182KB | - |
+| **可用** | ~218KB | - |
 
 ### 优化建议
 
@@ -958,6 +949,8 @@ Content-Type: application/json
 | 1.0.1 | 2026-04 | 支持可配置RO膜/泵/压力桶，双维度滤芯管理，移除排空功能 |
 | 1.0.2 | 2026-04 | 双阶段冲洗（常规冲洗+纯水洗膜），水锤效应控制，短制水判断，缺水自动恢复至待机，NVS脏数据节流写入，滤芯日历寿命使用NTP墙钟，运行数据保存间隔可配置，mDNS改为.lan，TDS校准参数持久化，NVS运行时命名空间缩短为wp_rt，TDS报警边沿触发日志 |
 | 1.0.3 | 2026-04 | FSM_STATE_FAULT→STOP（故障改停止），制水水锤改为开进水阀→延时→开泵（废水阀关），常规冲洗水锤自适应（检测进水阀GPIO），冲洗时间统计修复（常规冲洗+纯水洗膜合并统计），纯水洗膜入口区分正常过渡/网页直接进入，网页面板6按钮（制水/冲洗/反冲洗/复位/待机/停止），水锤UI按启动/过渡阶段分组显示，API action参数重命名（start→start_production等） |
+| 1.0.4 | 2026-04 | 换芯冲洗功能（网页面板新增按钮，仅普通冲洗1小时不切纯水），WiFi重连机制优化（独立FreeRTOS任务+指数退避+AP模式周期重连），mDNS/SNTP重复初始化防护，运行时间/总用水量NVS持久化修复，今日统计跨重启恢复 |
+| 1.0.5 | 2026-04 | 滤芯管理模块从tds_sensor提取为独立filter_manager，tds_sensor仅保留纯TDS测量功能；TDS校准结果自动持久化到Flash；config_manager_save_runtime_data()增加memcmp脏检查；handle_filter_capacity改为批量一次NVS写入；NVS命名空间wp_filters独立管理滤芯数据 |
 
 ---
 

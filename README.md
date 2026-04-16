@@ -311,6 +311,7 @@ idf.py -p COM3 monitor
 | FSM_EVENT_FORCE_PRODUCTION | 强制制水 | 网页端"制水"按钮 |
 | FSM_EVENT_NORMAL_FLUSH | 常规冲洗 | 网页端"冲洗"按钮（从待机状态） |
 | FSM_EVENT_PURE_FLUSH | 纯水洗膜 | 网页端"反冲洗"按钮 |
+| FSM_EVENT_FILTER_FLUSH | 换芯冲洗 | 网页端"换芯冲洗"按钮 |
 | FSM_EVENT_GO_STANDBY | 待机 | 网页端"待机"按钮 |
 | FSM_EVENT_SHUTDOWN | 停止（进入停止状态不记录停止） | 网页端"停止"按钮 |
 | FSM_EVENT_NORMAL_FLUSH_DONE | 常规冲洗完成 | 状态机内部定时器 |
@@ -352,7 +353,7 @@ idf.py -p COM3 monitor
 
 #### 管理页（`/admin`）
 
-**控制面板**: 制水、冲洗、反冲洗、复位、待机、停止
+**控制面板**: 制水、常规冲洗、纯水洗膜、换芯冲洗、复位、待机、停止
 
 **硬件配置**:
 - RO膜通量选择（50G/75G/100G/200G/400G）
@@ -512,6 +513,7 @@ Content-Type: application/json
 - `start_production`: 开始制水
 - `normal_flush`: 常规冲洗
 - `pure_flush`: 纯水洗膜
+- `filter_flush`: 换芯冲洗（仅普通冲洗持续1小时，不计统计）
 - `standby`: 切换到待机
 - `shutdown`: 停止（进入停止状态）
 - `reset`: 系统复位（清除停止/漏水报警状态）
@@ -635,7 +637,8 @@ WaterPurifier/
 │   │   ├── board_params.h         # 硬件参数（压力开关、TDS阈值等）
 │   │   ├── gpio_config.h          # GPIO引脚定义
 │   │   ├── gpio_driver.h          # GPIO驱动接口
-│   │   ├── tds_sensor.h           # TDS传感器接口
+│   │   ├── tds_sensor.h           # TDS传感器接口（TDS测量）
+│   │   ├── filter_manager.h       # 滤芯管理接口（5级滤芯寿命+用水量）
 │   │   ├── water_purifier_fsm.h   # 状态机接口
 │   │   ├── wifi_manager.h         # WiFi管理器接口
 │   │   ├── mqtt_client.h          # MQTT客户端接口
@@ -645,7 +648,8 @@ WaterPurifier/
 │   │
 │   ├── main.c                     # 主程序入口
 │   ├── gpio_driver.c              # GPIO驱动实现
-│   ├── tds_sensor.c               # TDS传感器实现（双路ADC+滤芯管理）
+│   ├── tds_sensor.c               # TDS传感器实现（双路ADC采集+校准）
+│   ├── filter_manager.c           # 滤芯管理实现（5级滤芯+用水量+NVS持久化）
 │   ├── water_purifier_fsm.c       # 状态机实现（8状态FSM）
 │   ├── wifi_manager.c             # WiFi管理器（STA/AP+mDNS）
 │   ├── mqtt_client.c              # MQTT客户端（Home Assistant发现）
@@ -671,7 +675,8 @@ WaterPurifier/
 |------|------|------|
 | **主控** | `main.c` | 初始化顺序、状态回调、MQTT启动、监控任务 |
 | **FSM** | `water_purifier_fsm.c` | 8状态有限状态机、双阶段冲洗、水锤控制、停止处理 |
-| **TDS** | `tds_sensor.c` | 双路ADC采集、TDS计算、5级滤芯寿命管理 |
+| **TDS** | `tds_sensor.c` | 双路ADC采集、TDS计算、校准、报警 |
+| **Filter** | `filter_manager.c` | 5级滤芯寿命管理、用水量统计、NVS持久化 |
 | **GPIO** | `gpio_driver.c` | 输入开关读取、24V继电器控制、LED指示 |
 | **WiFi** | `wifi_manager.c` | STA/AP模式、自动重连、mDNS域名服务 |
 | **Web** | `web_server.c` | HTTP服务器、REST API、HTML/CSS/JS嵌入 |
@@ -684,18 +689,19 @@ WaterPurifier/
 ```
 1. config_manager_init()   -> NVS初始化，加载系统配置
 2. gpio_driver_init_*()    -> GPIO输入/输出/LED初始化
-3. tds_sensor_init()       -> ADC初始化，滤芯初始化
+3. tds_sensor_init()       -> ADC初始化，启动TDS测量任务
    tds_sensor_start()      -> 启动TDS测量任务（1秒周期）
-4. fsm_init()              -> 状态机初始化，加载运行数据
+4. filter_mgr_init()       -> 滤芯管理初始化，从NVS恢复滤芯状态
+5. fsm_init()              -> 状态机初始化，加载运行数据
    fsm_set_*()             -> 应用配置（冲洗时间、超时、制水速率）
    fsm_start()             -> 启动FSM任务（100ms周期）
-5. history_logger_init()   -> 历史记录初始化
-6. wifi_manager_init()     -> WiFi初始化
+6. history_logger_init()   -> 历史记录初始化
+7. wifi_manager_init()     -> WiFi初始化
    wifi_manager_start()    -> 启动WiFi（有配置则STA，无配置则AP）
-7. mqtt_client_init()      -> MQTT客户端初始化
-8. web_server_init()       -> HTTP服务器初始化
+8. mqtt_client_init()      -> MQTT客户端初始化
+9. web_server_init()       -> HTTP服务器初始化
    web_server_start()      -> 启动Web服务
-9. xTaskCreate(monitor)    -> 启动监控任务（30秒周期）
+10. xTaskCreate(monitor)   -> 启动监控任务（30秒周期）
 ```
 
 ---
@@ -745,6 +751,7 @@ WaterPurifier/
 |---------|------|---------|
 | `water_purifier` | 系统配置 | WiFi、MQTT、硬件配置、TDS参数等 |
 | `wp_rt` | 运行数据 | 制水/冲洗次数、时间、停止/漏水记录 |
+| `wp_filters` | 滤芯数据 | 5级滤芯用水量、重置时间、自定义容量、总用水量、制水速率 |
 | `wifi` | WiFi配置 | SSID和密码（由ESP-IDF WiFi框架管理） |
 
 NVS存储在Flash的专用分区中，**断电不丢失**。可通过网页端恢复出厂设置擦除所有配置。

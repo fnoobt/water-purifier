@@ -7,6 +7,7 @@
 #include "web_server.h"
 #include "water_purifier_fsm.h"
 #include "tds_sensor.h"
+#include "filter_manager.h"
 #include "gpio_driver.h"
 #include "wifi_manager.h"
 #include "config_manager.h"
@@ -169,6 +170,7 @@ static const char html_admin_page[] =
 ".btn-danger{background:linear-gradient(135deg,#dc3545,#c82333)}"
 ".btn-warning{background:linear-gradient(135deg,#ffc107,#fd7e14)}"
 ".btn-info{background:linear-gradient(135deg,#17a2b8,#20c997)}"
+".btn-dark{background:linear-gradient(135deg,#343a40,#495057)}"
 ".btn-group{display:flex;flex-wrap:wrap;gap:8px}"
 "input,select{padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:14px;transition:border-color .2s;width:100%}"
 "input:focus,select:focus{outline:none;border-color:#667eea}"
@@ -196,11 +198,11 @@ static const char html_admin_page[] =
 
 "<div class='card'><h3>控制面板</h3>"
 "<div class='btn-group'>"
-"<button class='btn btn-success' onclick='startProduction()'>制水</button>"
-"<button class='btn btn-primary' onclick='normalFlush()'>冲洗</button>"
-"<button class='btn btn-info' onclick='pureFlush()'>反冲洗</button>"
-"<button class='btn btn-warning' onclick='resetStop()'>复位</button>"
-"<button class='btn btn-primary' onclick='goStandby()'>待机</button>"
+"<button class='btn btn-primary' onclick='normalFlush()'>常规冲洗</button>"
+"<button class='btn btn-info' onclick='pureFlush()'>纯水洗膜</button>"
+"<button class='btn btn-warning' onclick='filterFlush()'>换芯冲洗</button>"
+"<button class='btn btn-dark' onclick='goStandby()'>待机</button>"
+"<button class='btn btn-success' onclick='resetStop()'>复位</button>"
 "<button class='btn btn-danger' onclick='shutdown()'>停止</button>"
 "</div></div>"
 
@@ -232,7 +234,8 @@ static const char html_admin_page[] =
 
 "<div class='card'><h3>系统配置</h3>"
 "<div class='form-row'><label>常规冲洗时间 (秒)</label><input type='number' id='normalFlushDur' value='30'></div>"
-"<div class='form-row'><label>纯水洗膜时间 (秒)</label><input type='number' id='pureFlushDur' value='20'></div>"
+"<div class='form-row'><label>纯水洗膜时间 (秒)</label><input type='number' id='pureFlushDur' value='15'></div>"
+"<div class='form-row'><label>换芯冲洗时间 (分钟)</label><input type='number' id='filterFlushDur' value='60'></div>"
 "<div class='form-row'><label>制水超时 (分钟)</label><input type='number' id='prodTimeout' value='180'></div>"
 "<div class='form-row'><label>漏水确认 (秒)</label><input type='number' id='leakConfirm' value='5'></div>"
 "<div class='form-row'><label>Flash保存周期</label><select id='saveInterval'><option value='10'>10分钟</option><option value='60'>1小时</option><option value='120'>2小时 (推荐)</option><option value='360'>6小时</option><option value='720'>12小时</option><option value='1440'>24小时</option></select></div>"
@@ -296,6 +299,7 @@ static const char html_admin_page[] =
 "function loadConfig(){fetch('/api/config').then(r=>r.json()).then(d=>{"
 "$('normalFlushDur').value=d.normalFlushDur;"
 "$('pureFlushDur').value=d.pureFlushDur;"
+"$('filterFlushDur').value=d.filterFlushDur;"
 "$('prodTimeout').value=d.prodTimeout;"
 "$('leakConfirm').value=d.leakConfirm||5;"
 "$('saveInterval').value=d.saveInterval||120;"
@@ -315,15 +319,15 @@ static const char html_admin_page[] =
 "$('wifiSSID').textContent=d.ssid||'-';"
 "$('wifiIP').textContent=d.ip||'-';"
 "})}"
-"function startProduction(){api('/api/control',{action:'start_production'}).then(d=>alert(d.status||'已执行'))}"
 "function normalFlush(){api('/api/control',{action:'normal_flush'}).then(d=>alert(d.status||'已执行'))}"
 "function pureFlush(){api('/api/control',{action:'pure_flush'}).then(d=>alert(d.status||'已执行'))}"
+"function filterFlush(){if(confirm('确认启动换芯冲洗？将连续冲洗'+($('filterFlushDur').value)+'分钟。')){api('/api/control',{action:'filter_flush'}).then(d=>alert(d.status||'已执行'))}}"
 "function resetStop(){api('/api/control',{action:'reset'}).then(d=>alert(d.status||'已执行'))}"
 "function goStandby(){api('/api/control',{action:'standby'}).then(d=>alert(d.status||'已执行'))}"
 "function shutdown(){api('/api/control',{action:'shutdown'}).then(d=>alert(d.status||'已执行'))}"
 "function resetFilter(i){if(confirm('确认重置该滤芯？')){api('/api/filter/reset',{filter:i}).then(d=>{alert(d.filter_name+' 已重置');loadFilters()})}}"
 "function saveFilterCaps(){api('/api/filter/capacity',{caps:[parseInt($('cap0').value),parseInt($('cap1').value),parseInt($('cap2').value),parseInt($('cap3').value),parseInt($('cap4').value)]}).then(d=>alert(d.status||'已保存'))}"
-"function saveConfig(){api('/api/config',{normalFlushDur:parseInt($('normalFlushDur').value),pureFlushDur:parseInt($('pureFlushDur').value),prodTimeout:parseInt($('prodTimeout').value)*60,leakConfirm:parseInt($('leakConfirm').value),saveInterval:parseInt($('saveInterval').value),relayLevel:parseInt($('relayLevel').value),tdsInTh:parseFloat($('tdsInTh').value),tdsOutTh:parseFloat($('tdsOutTh').value),whValveOpen:parseInt($('whValveOpen').value),whPumpStop:parseInt($('whPumpStop').value),whValveClose:parseInt($('whValveClose').value)}).then(d=>alert(d.status||'已保存'))}"
+"function saveConfig(){api('/api/config',{normalFlushDur:parseInt($('normalFlushDur').value),pureFlushDur:parseInt($('pureFlushDur').value),filterFlushDur:parseInt($('filterFlushDur').value)*60,prodTimeout:parseInt($('prodTimeout').value)*60,leakConfirm:parseInt($('leakConfirm').value),saveInterval:parseInt($('saveInterval').value),relayLevel:parseInt($('relayLevel').value),tdsInTh:parseFloat($('tdsInTh').value),tdsOutTh:parseFloat($('tdsOutTh').value),whValveOpen:parseInt($('whValveOpen').value),whPumpStop:parseInt($('whPumpStop').value),whValveClose:parseInt($('whValveClose').value)}).then(d=>alert(d.status||'已保存'))}"
 "function saveHardware(){api('/api/config/hardware',{roMem:parseInt($('roMem').value),pumpType:parseInt($('pumpType').value),tankSize:parseInt($('tankSize').value)}).then(d=>alert(d.status||'已保存'))}"
 "function scanWiFi(){$('wifiList').innerHTML='扫描中...';fetch('/api/wifi/scan').then(r=>r.json()).then(d=>{let h='';if(d.networks)d.networks.forEach(n=>h+='<div class=\"wifi-item\" onclick=\"$(\\'ssid\\').value=\\''+n.ssid+'\\'\">'+n.ssid+' ('+n.rssi+'dBm)</div>');$('wifiList').innerHTML=h||'未找到网络'})}"
 "function saveWiFi(){api('/api/wifi',{ssid:$('ssid').value,password:$('pass').value}).then(d=>alert(d.status))}"
@@ -371,7 +375,7 @@ static esp_err_t handle_status(httpd_req_t *req)
 
     // 获取五级滤芯状态
     filters_status_t filters_status;
-    tds_sensor_get_filters_status(&filters_status);
+    filter_mgr_get_filters_status(&filters_status);
 
     char ip[16] = "";
     wifi_manager_get_ip(ip, sizeof(ip));
@@ -457,6 +461,7 @@ static esp_err_t handle_control(httpd_req_t *req)
     if (strcmp(a, "start_production") == 0) fsm_manual_start_production();
     else if (strcmp(a, "normal_flush") == 0) fsm_manual_normal_flush();
     else if (strcmp(a, "pure_flush") == 0) fsm_manual_pure_flush();
+    else if (strcmp(a, "filter_flush") == 0) fsm_manual_filter_flush();
     else if (strcmp(a, "reset") == 0) fsm_clear_stop();
     else if (strcmp(a, "standby") == 0) fsm_manual_go_standby();
     else if (strcmp(a, "shutdown") == 0) fsm_manual_shutdown();
@@ -477,6 +482,7 @@ static esp_err_t handle_config_get(httpd_req_t *req)
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "normalFlushDur", cfg.normal_flush_duration_sec);
     cJSON_AddNumberToObject(root, "pureFlushDur", cfg.pure_flush_duration_sec);
+    cJSON_AddNumberToObject(root, "filterFlushDur", cfg.filter_flush_duration_sec / 60);
     cJSON_AddNumberToObject(root, "prodTimeout", cfg.production_timeout_sec / 60);
     cJSON_AddNumberToObject(root, "leakConfirm", cfg.leak_confirm_time_sec);
     cJSON_AddNumberToObject(root, "saveInterval", cfg.runtime_save_interval_min);
@@ -515,6 +521,7 @@ static esp_err_t handle_config_set(httpd_req_t *req)
     cJSON *v;
     if ((v = cJSON_GetObjectItem(root, "normalFlushDur"))) cfg.normal_flush_duration_sec = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "pureFlushDur"))) cfg.pure_flush_duration_sec = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "filterFlushDur"))) cfg.filter_flush_duration_sec = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "prodTimeout"))) cfg.production_timeout_sec = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "leakConfirm"))) cfg.leak_confirm_time_sec = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "saveInterval"))) cfg.runtime_save_interval_min = v->valueint;
@@ -531,6 +538,7 @@ static esp_err_t handle_config_set(httpd_req_t *req)
     // 应用配置
     fsm_set_normal_flush_duration(cfg.normal_flush_duration_sec);
     fsm_set_pure_flush_duration(cfg.pure_flush_duration_sec);
+    fsm_set_filter_flush_duration(cfg.filter_flush_duration_sec);
     fsm_set_production_timeout(cfg.production_timeout_sec);
     fsm_set_leak_confirm_time(cfg.leak_confirm_time_sec);
     fsm_set_water_hammer_delays(cfg.water_hammer_valve_open_delay_ms,
@@ -694,7 +702,7 @@ static esp_err_t handle_filter_reset(httpd_req_t *req)
     }
 
     int idx = filter_idx->valueint;
-    esp_err_t ret = tds_sensor_reset_filter((filter_type_t)idx);
+    esp_err_t ret = filter_mgr_reset_filter((filter_type_t)idx);
 
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
@@ -702,7 +710,7 @@ static esp_err_t handle_filter_reset(httpd_req_t *req)
     if (ret == ESP_OK) {
         cJSON *resp = cJSON_CreateObject();
         cJSON_AddStringToObject(resp, "status", "ok");
-        cJSON_AddStringToObject(resp, "filter_name", tds_sensor_get_filter_name(idx));
+        cJSON_AddStringToObject(resp, "filter_name", filter_mgr_get_filter_name(idx));
         char *json_str = cJSON_PrintUnformatted(resp);
         httpd_resp_sendstr(req, json_str);
         free(json_str);
@@ -739,13 +747,13 @@ static esp_err_t handle_filter_capacity(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    // 收集所有容量，一次性写入NVs
+    uint32_t capacities[FILTER_COUNT];
     for (int i = 0; i < FILTER_COUNT; i++) {
         cJSON *cap = cJSON_GetArrayItem(caps, i);
-        if (cap) {
-            uint32_t capacity = (uint32_t)cap->valueint;
-            tds_sensor_set_filter_capacity_ex((filter_type_t)i, capacity);
-        }
+        capacities[i] = cap ? (uint32_t)cap->valueint : 0;
     }
+    filter_mgr_set_all_filter_capacity(capacities);
 
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
@@ -777,6 +785,19 @@ static esp_err_t tds_calibrate_handler(httpd_req_t *req)
     float cal_value = (float)value->valuedouble;
 
     esp_err_t err = tds_sensor_calibrate((tds_sensor_id_t)sensor_id, cal_value);
+
+    // 同步校准结果到config_manager并写入Flash，确保重启后不丢失
+    if (err == ESP_OK) {
+        system_config_t cfg;
+        config_manager_get_config(&cfg);
+        tds_calibration_t cal;
+        if (tds_sensor_get_calibration((tds_sensor_id_t)sensor_id, &cal) == ESP_OK) {
+            cfg.tds_calibration_offset[sensor_id] = cal.offset;
+            cfg.tds_calibration_scale[sensor_id] = cal.scale;
+            config_manager_set_config(&cfg);
+            config_manager_save();
+        }
+    }
 
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");

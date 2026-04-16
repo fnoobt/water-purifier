@@ -1,4 +1,4 @@
-idf_component_register(SRCS "history_logger.c" "main.c"
+idf_component_register(SRCS "filter_manager.c" "history_logger.c" "main.c"
                     "gpio_driver.c"
                     "tds_sensor.c"
                     "water_purifier_fsm.c"

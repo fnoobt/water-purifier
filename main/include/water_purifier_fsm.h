@@ -63,6 +63,7 @@ typedef enum {
     FSM_EVENT_PURE_FLUSH,           // 切换到纯水洗膜
     FSM_EVENT_GO_STANDBY,           // 切换到待机
     FSM_EVENT_SHUTDOWN,             // 停机（进入停止但不记录）
+    FSM_EVENT_FILTER_FLUSH,         // 换芯冲洗（仅普通冲洗，持续1小时）
 } fsm_event_t;
 
 /**
@@ -245,6 +246,19 @@ esp_err_t fsm_set_pure_flush_duration(uint32_t duration_sec);
 uint32_t fsm_get_pure_flush_duration(void);
 
 /**
+ * @brief 设置换芯冲洗持续时间
+ * @param duration_sec 冲洗时间（秒），默认3600
+ * @return ESP_OK 成功
+ */
+esp_err_t fsm_set_filter_flush_duration(uint32_t duration_sec);
+
+/**
+ * @brief 获取换芯冲洗持续时间
+ * @return 冲洗时间（秒）
+ */
+uint32_t fsm_get_filter_flush_duration(void);
+
+/**
  * @brief 设置制水超时时间
  * @param timeout_sec 超时时间（秒），默认3小时
  * @return ESP_OK 成功
@@ -314,6 +328,12 @@ esp_err_t fsm_manual_normal_flush(void);
  * @return ESP_OK 成功
  */
 esp_err_t fsm_manual_pure_flush(void);
+
+/**
+ * @brief 手动启动换芯冲洗（仅普通冲洗，持续1小时）
+ * @return ESP_OK 成功
+ */
+esp_err_t fsm_manual_filter_flush(void);
 
 /**
  * @brief 手动切换到待机状态

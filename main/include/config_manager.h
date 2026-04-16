@@ -44,8 +44,9 @@ typedef struct {
     uint16_t runtime_save_interval_min;  // 运行数据保存间隔（分钟），10/60/120/360/720/1440
 
     // 冲洗参数
-    uint32_t normal_flush_duration_sec;  // 常规冲洗持续时间（秒），默认30
-    uint32_t pure_flush_duration_sec;    // 纯水洗膜持续时间（秒），默认20
+    uint32_t normal_flush_duration_sec;  // 常规冲洗持续时间（秒），默认20
+    uint32_t pure_flush_duration_sec;    // 纯水洗膜持续时间（秒），默认15
+    uint32_t filter_flush_duration_sec;   // 换芯冲洗持续时间（秒），默认3600
     uint32_t short_prod_threshold_sec;   // 短制水判断阈值（秒），默认180
     uint32_t water_hammer_valve_open_delay_ms;  // 水锤-开阀延时（毫秒），默认1000
     uint32_t water_hammer_pump_stop_delay_ms;   // 水锤-停泵延时（毫秒），默认1000

@@ -3,6 +3,21 @@
 > 分析时间: 2026-04-14
 > 代码版本: water_purifier_fsm.c (约 1280 行)
 
+## 状态机当前状态（更新于 2026-04-15）
+
+第三轮和第四轮分析中发现的关键问题均已修复：
+- `transition_to_pure_flush()` 已调用 `transition_to(FSM_STATE_PURE_FLUSH)`
+- 所有无条件 `transition_to()` 前均添加了状态守卫
+- `standby_manual` 标志阻止 check_inputs 自动制水
+- `fsm_force_standby()` 清理了 `flush_start_time`
+- `execute_pure_flush()` 中 came_from_normal_flush 分支删除了冗余 GPIO 检查
+
+新增功能（第四轮）：
+- `FSM_EVENT_FILTER_FLUSH` 换芯冲洗事件
+- `fsm_ctx.filter_flush_mode` 和 `filter_flush_start` 字段
+- `fsm_manual_filter_flush()` 公共函数
+- `execute_normal_flush()` 中换芯冲洗模式：仅普通冲洗持续1小时，不切换纯水洗膜，不计统计
+
 ---
 
 ## 第三轮新发现问题
@@ -197,6 +212,7 @@ transition_to(FSM_STATE_NORMAL_FLUSH);
 | FORCE_PRODUCTION | STANDBY | STANDBY | ✅ |
 | NORMAL_FLUSH | STANDBY/NORMAL_FLUSH/PURE_FLUSH | 非STOP/LEAK_ALARM | ✅ (函数宽松) |
 | PURE_FLUSH | STANDBY/NORMAL_FLUSH/PURE_FLUSH | 非STOP/LEAK_ALARM | ✅ (函数宽松) |
+| FILTER_FLUSH | STANDBY/NORMAL_FLUSH/PURE_FLUSH | 非STOP/LEAK_ALARM | ✅ (函数宽松) |
 | GO_STANDBY | 任意状态 | 无守卫 | ✅ |
 | SHUTDOWN | 任意状态 | 无守卫 | ✅ |
 | RESET | STOP/LEAK_ALARM | 无单独函数 | ✅ |

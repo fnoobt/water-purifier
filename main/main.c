@@ -14,6 +14,7 @@
 // 模块头文件
 #include "gpio_driver.h"
 #include "tds_sensor.h"
+#include "filter_manager.h"
 #include "water_purifier_fsm.h"
 #include "wifi_manager.h"
 #include "web_server.h"
@@ -143,7 +144,8 @@ void app_main(void)
     tds_sensor_init();
     tds_sensor_set_alarm_threshold(TDS_SENSOR_INLET, cfg.tds_inlet_threshold);
     tds_sensor_set_alarm_threshold(TDS_SENSOR_OUTLET, cfg.tds_outlet_threshold);
-    tds_sensor_set_filter_capacity(cfg.filter_capacity_liters);
+    filter_mgr_init();
+    filter_mgr_set_filter_capacity(cfg.filter_capacity_liters);
     tds_sensor_start();
 
     // 4. 初始化状态机
@@ -152,6 +154,7 @@ void app_main(void)
     fsm_register_state_callback(fsm_state_callback);
     fsm_set_normal_flush_duration(cfg.normal_flush_duration_sec);
     fsm_set_pure_flush_duration(cfg.pure_flush_duration_sec);
+    fsm_set_filter_flush_duration(cfg.filter_flush_duration_sec);
     fsm_set_production_timeout(cfg.production_timeout_sec);
     fsm_set_leak_confirm_time(cfg.leak_confirm_time_sec);
     fsm_set_water_hammer_delays(cfg.water_hammer_valve_open_delay_ms,

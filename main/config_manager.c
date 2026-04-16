@@ -35,8 +35,9 @@ static const system_config_t default_config = {
     .runtime_save_interval_min = 120,      // 2小时（默认保存间隔）
 
     // 冲洗参数
-    .normal_flush_duration_sec = 30,       // 常规冲洗30秒
-    .pure_flush_duration_sec = 20,         // 纯水洗膜20秒
+    .normal_flush_duration_sec = 20,       // 常规冲洗20秒
+    .pure_flush_duration_sec = 15,         // 纯水洗膜15秒
+    .filter_flush_duration_sec = 3600,     // 换芯冲洗3600秒（1小时）
     .short_prod_threshold_sec = 180,       // 短制水判断阈值3分钟
     .water_hammer_valve_open_delay_ms = 1000,  // 开阀延时1秒
     .water_hammer_pump_stop_delay_ms = 1000,   // 停泵延时1秒
@@ -175,6 +176,7 @@ esp_err_t config_manager_load(void)
     // 冲洗参数
     nvs_get_u32(handle, "nflush_dur", &ctx.config.normal_flush_duration_sec);
     nvs_get_u32(handle, "pflush_dur", &ctx.config.pure_flush_duration_sec);
+    nvs_get_u32(handle, "fflush_dur", &ctx.config.filter_flush_duration_sec);
     nvs_get_u32(handle, "short_prod", &ctx.config.short_prod_threshold_sec);
     nvs_get_u32(handle, "wh_vopn", &ctx.config.water_hammer_valve_open_delay_ms);
     nvs_get_u32(handle, "wh_pstp", &ctx.config.water_hammer_pump_stop_delay_ms);
@@ -272,6 +274,7 @@ esp_err_t config_manager_save(void)
     // 冲洗参数
     nvs_set_u32(handle, "nflush_dur", ctx.config.normal_flush_duration_sec);
     nvs_set_u32(handle, "pflush_dur", ctx.config.pure_flush_duration_sec);
+    nvs_set_u32(handle, "fflush_dur", ctx.config.filter_flush_duration_sec);
     nvs_set_u32(handle, "short_prod", ctx.config.short_prod_threshold_sec);
     nvs_set_u32(handle, "wh_vopn", ctx.config.water_hammer_valve_open_delay_ms);
     nvs_set_u32(handle, "wh_pstp", ctx.config.water_hammer_pump_stop_delay_ms);
@@ -332,8 +335,22 @@ esp_err_t config_manager_factory_reset(void)
 
 // ==================== 运行数据持久化 ====================
 
+// 上次保存的运行数据，用于脏检查
+static runtime_data_t s_last_saved_runtime = {0};
+static bool s_runtime_data_initialized = false;
+
 esp_err_t config_manager_save_runtime_data(const runtime_data_t *data)
 {
+    if (!data) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 脏检查：数据未变化则跳过写入
+    if (s_runtime_data_initialized &&
+        memcmp(data, &s_last_saved_runtime, sizeof(runtime_data_t)) == 0) {
+        return ESP_OK;
+    }
+
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_RUNTIME_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
@@ -351,6 +368,8 @@ esp_err_t config_manager_save_runtime_data(const runtime_data_t *data)
     nvs_close(handle);
 
     if (err == ESP_OK) {
+        s_last_saved_runtime = *data;
+        s_runtime_data_initialized = true;
         ESP_LOGD(TAG, "运行数据已保存");
     }
     return err;
@@ -603,6 +622,9 @@ bool config_manager_validate(const system_config_t *config)
         return false;
     }
     if (config->pure_flush_duration_sec < 5 || config->pure_flush_duration_sec > 300) {
+        return false;
+    }
+    if (config->filter_flush_duration_sec < 60 || config->filter_flush_duration_sec > 7200) {
         return false;
     }
     if (config->short_prod_threshold_sec < 30 || config->short_prod_threshold_sec > 600) {

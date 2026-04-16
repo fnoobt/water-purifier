@@ -126,6 +126,27 @@ static void save_daily_to_nvs(void)
     nvs_close(handle);
 }
 
+static void load_today_from_nvs(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READONLY, &handle) != ESP_OK) {
+        return;
+    }
+
+    char key[16];
+    snprintf(key, sizeof(key), "d%lu", ctx.today.date);
+
+    size_t len = sizeof(daily_stats_t);
+    daily_stats_t loaded;
+    if (nvs_get_blob(handle, key, &loaded, &len) == ESP_OK && loaded.date == ctx.today.date) {
+        memcpy(&ctx.today, &loaded, sizeof(daily_stats_t));
+        ESP_LOGI(TAG, "加载今日统计: 制水%lu秒, 冲洗%lu次",
+                 ctx.today.production_sec, ctx.today.flush_count);
+    }
+
+    nvs_close(handle);
+}
+
 // ==================== 公共接口实现 ====================
 
 esp_err_t history_logger_init(void)
@@ -146,9 +167,10 @@ esp_err_t history_logger_init(void)
     memset(ctx.records, 0, sizeof(ctx.records));
     load_from_nvs();
 
-    // 初始化今日统计
+    // 初始化今日统计：先尝试从NVS加载今日数据
     memset(&ctx.today, 0, sizeof(daily_stats_t));
     ctx.today.date = get_today_date();
+    load_today_from_nvs();
 
     ctx.initialized = true;
     ESP_LOGI(TAG, "历史记录模块初始化完成，已有%lu条记录", ctx.record_count);
