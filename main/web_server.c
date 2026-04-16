@@ -79,10 +79,8 @@ static const char html_page[] =
 ".filter-bar-fill.warn{background:linear-gradient(90deg,#ffc107,#fd7e14)}"
 ".filter-bar-fill.error{background:linear-gradient(90deg,#dc3545,#c82333)}"
 "</style></head><body>"
-"<div style='display:flex;justify-content:space-between;align-items:center;margin:5px 0'>"
-"<button class='back-btn' onclick=\"location.href='/admin'\" style='margin:0'>管理设置 →</button>"
-"</div>"
-"<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>净水器</h1>"
+"<div class='container'>"
+"<h1>净水器</h1>"
 
 "<div class='card'><h3>系统状态</h3>"
 "<div class='grid'>"
