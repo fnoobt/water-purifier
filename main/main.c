@@ -20,6 +20,7 @@
 #include "web_server.h"
 #include "config_manager.h"
 #include "history_logger.h"
+#include "ota_update.h"
 #include "app_mqtt_public.h"
 
 static const char *TAG = "MAIN";
@@ -175,11 +176,17 @@ void app_main(void)
     wifi_manager_start();
 
     // 7. 初始化MQTT客户端
-    ESP_LOGI(TAG, "[7/8] 初始化MQTT客户端...");
+    ESP_LOGI(TAG, "[7/9] 初始化MQTT客户端...");
     mqtt_client_init();
 
-    // 8. 初始化Web服务器
-    ESP_LOGI(TAG, "[8/8] 初始化Web服务器...");
+    // 8. 初始化OTA模块
+    ESP_LOGI(TAG, "[8/9] 初始化OTA模块...");
+    if (ota_update_init() != ESP_OK) {
+        ESP_LOGW(TAG, "OTA模块初始化失败，固件升级功能不可用");
+    }
+
+    // 9. 初始化Web服务器
+    ESP_LOGI(TAG, "[9/9] 初始化Web服务器...");
     web_server_init();
     web_server_start();
 

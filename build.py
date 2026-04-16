@@ -16,10 +16,11 @@ os.environ['PATH'] = (
 )
 
 # 切换到项目目录
-os.chdir(r'D:\Projects\esp32\WaterPurifier')
+os.chdir(r'D:\Projects\esp32\water-purifier')
 
 # 清理旧的构建目录
 import shutil
+
 if os.path.exists('build'):
     shutil.rmtree('build')
 os.makedirs('build')

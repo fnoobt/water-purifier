@@ -12,9 +12,13 @@
 #include "wifi_manager.h"
 #include "config_manager.h"
 #include "history_logger.h"
+#include "ota_update.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "cJSON.h"
 #include <string.h>
 #include <time.h>
@@ -75,8 +79,10 @@ static const char html_page[] =
 ".filter-bar-fill.warn{background:linear-gradient(90deg,#ffc107,#fd7e14)}"
 ".filter-bar-fill.error{background:linear-gradient(90deg,#dc3545,#c82333)}"
 "</style></head><body>"
-"<div class='container'>"
-"<h1>净水器</h1>"
+"<div style='display:flex;justify-content:space-between;align-items:center;margin:5px 0'>"
+"<button class='back-btn' onclick=\"location.href='/admin'\" style='margin:0'>管理设置 →</button>"
+"</div>"
+"<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>净水器</h1>"
 
 "<div class='card'><h3>系统状态</h3>"
 "<div class='grid'>"
@@ -193,8 +199,11 @@ static const char html_admin_page[] =
 ".dim-label{font-size:10px;color:#999}"
 "</style></head><body>"
 "<div class='container'>"
-"<button class='back-btn' onclick=\"location.href='/'\">← 返回首页</button>"
-"<h1>管理页面</h1>"
+"<div style='display:flex;justify-content:space-between;align-items:center;margin:5px 0'>"
+"<button class='back-btn' onclick=\"location.href='/'\" style='margin:0'>← 返回首页</button>"
+"<button class='back-btn' onclick=\"location.href='/ota'\" style='margin:0'>固件升级 →</button>"
+"</div>"
+"<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>管理页面</h1>"
 
 "<div class='card'><h3>控制面板</h3>"
 "<div class='btn-group'>"
@@ -337,6 +346,102 @@ static const char html_admin_page[] =
 "loadConfig();loadFilters();loadMQTT();"
 "</script></body></html>";
 
+// 固件升级页面 - 独立页面
+static const char html_ota_page[] =
+"<!DOCTYPE html><html><head>"
+"<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>固件升级</title>"
+"<style>"
+"*{box-sizing:border-box}"
+"body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh}"
+".container{max-width:600px;margin:0 auto}"
+".card{background:rgba(255,255,255,0.95);padding:20px;margin:15px 0;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}"
+"h1{color:#fff;text-align:center;margin-bottom:20px;text-shadow:0 2px 4px rgba(0,0,0,0.2)}"
+"h3{color:#333;margin:0 0 15px 0;padding-bottom:10px;border-bottom:2px solid #eee}"
+".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}"
+".stat{background:#f8f9fa;padding:15px;border-radius:12px;text-align:center}"
+".stat-label{color:#666;font-size:12px;margin-bottom:5px}"
+".stat-value{color:#333;font-size:20px;font-weight:600}"
+".btn{padding:12px 20px;margin:5px;border:none;border-radius:10px;cursor:pointer;color:#fff;font-size:14px;font-weight:500;transition:all .2s}"
+".btn:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.2)}"
+".btn-success{background:linear-gradient(135deg,#28a745,#20c997)}"
+".btn-primary{background:linear-gradient(135deg,#667eea,#764ba2)}"
+".btn-group{display:flex;flex-wrap:wrap;gap:8px}"
+"input,select{padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:14px;transition:border-color .2s;width:100%}"
+"input:focus,select:focus{outline:none;border-color:#667eea}"
+".form-row{margin:10px 0}"
+".form-row label{display:block;color:#555;margin-bottom:5px;font-size:13px}"
+".form-row small{color:#999;font-size:11px}"
+".back-btn{background:rgba(255,255,255,0.2);color:#fff;padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:10px}"
+".back-btn:hover{background:rgba(255,255,255,0.3)}"
+"</style></head><body>"
+"<div class='container'>"
+"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>"
+"<button class='back-btn' onclick=\"location.href='/admin'\" style='margin:0'>← 返回管理</button>"
+"<button class='back-btn' onclick=\"location.href='/'\" style='margin:0'>首页 →</button>"
+"</div>"
+"<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>固件升级 (OTA)</h1>"
+
+"<div class='card'><h3>版本信息</h3>"
+"<div class='grid'>"
+"<div class='stat'><div class='stat-label'>当前版本</div><div id='fwVer' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>编译时间</div><div id='compileTime' class='stat-value' style='font-size:14px'>-</div></div>"
+"<div class='stat'><div class='stat-label'>升级状态</div><div id='otaState' class='stat-value'>就绪</div></div>"
+"</div>"
+"</div>"
+
+"<div class='card'><h3>上传固件</h3>"
+"<div class='form-row'>"
+"<label>选择固件文件 (.bin)</label>"
+"<input type='file' id='fwFile' accept='.bin' style='padding:8px'>"
+"</div>"
+"<div id='otaProgress' style='display:none;margin:10px 0'>"
+"<div style='display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px'>"
+"<span id='otaProgressText'>上传中...</span>"
+"<span id='otaProgressPct'>0%</span>"
+"</div>"
+"<div style='height:8px;background:#e0e0e0;border-radius:4px;overflow:hidden'>"
+"<div id='otaProgressBar' style='height:100%;width:0%;background:linear-gradient(90deg,#667eea,#764ba2);transition:width 0.3s'></div>"
+"</div>"
+"</div>"
+"<div class='btn-group'><button class='btn btn-success' onclick='uploadFirmware()'>开始升级</button></div>"
+"<p style='font-size:11px;color:#999;margin-top:8px'>升级过程中设备将自动重启，请勿断电</p>"
+"</div>"
+
+"</div>"
+"<script>"
+"function $(id){return document.getElementById(id)}"
+"function formatSize(b){if(!b||b<=0)return'-';return b<1024?b+'B':b<1048576?(b/1024).toFixed(1)+'KB':(b/1048576).toFixed(2)+'MB';}"
+"function loadOTA(){fetch('/api/ota/status').then(r=>r.json()).then(d=>{$('fwVer').textContent=d.running_version||'-';$('compileTime').textContent=(d.compile_time||'')+' '+(d.compile_date||'')||'-';$('otaState').textContent=d.state==='idle'?'就绪':d.state})}"
+"function uploadFirmware(){var f=$('fwFile').files[0];if(!f)return alert('请选择固件文件');if(!f.name.endsWith('.bin'))return alert('只支持 .bin 文件');if(!confirm('确认升级固件？设备将自动重启。'))return;var fd=new FormData();fd.append('firmware',f);$('otaProgress').style.display='block';$('otaState').textContent='上传中...';$('otaState').className='stat-value warn';var xhr=new XMLHttpRequest();xhr.open('POST','/api/ota/update');xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('otaProgressText').textContent='上传中 '+formatSize(e.loaded)+'/'+formatSize(e.total);$('otaProgressPct').textContent=p+'%';$('otaProgressBar').style.width=p+'%';}};xhr.onload=function(){if(xhr.status===200){$('otaState').textContent='升级成功，重启中...';$('otaState').className='stat-value good';$('otaProgressText').textContent='升级完成，设备正在重启';$('otaProgressBar').style.width='100%';}else{try{var e=JSON.parse(xhr.responseText);alert(e.message||'升级失败');}catch(e){alert('升级失败: '+xhr.responseText);}$('otaState').textContent='升级失败';$('otaState').className='stat-value error';}};xhr.onerror=function(){$('otaState').textContent='网络错误';$('otaState').className='stat-value error';};xhr.send(fd);}"
+"loadOTA();"
+"</script></body></html>";
+
+// ==================== 辅助函数 ====================
+
+/**
+ * @brief 消费剩余 HTTP 请求体，防止连接被重置导致客户端网络错误
+ */
+static void drain_http_body(httpd_req_t *req)
+{
+    char drain_buf[256];
+    while (httpd_req_recv(req, drain_buf, sizeof(drain_buf)) > 0) { }
+}
+
+/**
+ * @brief 发送 JSON 错误响应（自动先消费请求体）
+ */
+static esp_err_t send_json_error(httpd_req_t *req, int status_code, const char *msg)
+{
+    drain_http_body(req);
+    httpd_resp_set_status(req, status_code == 500 ? "500 Internal Server Error" : "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    char json_buf[256];
+    snprintf(json_buf, sizeof(json_buf), "{\"status\":\"error\",\"message\":\"%s\"}", msg);
+    httpd_resp_send(req, json_buf, HTTPD_RESP_USE_STRLEN);
+    return ESP_FAIL;
+}
+
 // ==================== API处理函数 ====================
 
 static esp_err_t handle_index(httpd_req_t *req)
@@ -350,6 +455,13 @@ static esp_err_t handle_admin(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html_admin_page, strlen(html_admin_page));
+    return ESP_OK;
+}
+
+static esp_err_t handle_ota(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html_ota_page, strlen(html_ota_page));
     return ESP_OK;
 }
 
@@ -873,6 +985,240 @@ static esp_err_t handle_mqtt_config_set(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ==================== OTA升级 ====================
+
+/**
+ * @brief 延迟重启任务（等待 HTTP 响应发出后再重启）
+ */
+static void ota_reboot_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    ESP_LOGI(TAG, "OTA 升级完成，系统重启...");
+    esp_restart();
+}
+
+/**
+ * @brief OTA 固件上传处理器
+ * @note 接收 multipart/form-data 上传的 .bin 固件，流式写入 OTA 分区
+ * @note 使用静态缓冲区避免 httpd 任务栈溢出
+ */
+static esp_err_t ota_update_handler(httpd_req_t *req)
+{
+    // 大缓冲区用静态分配，避免 httpd 任务栈溢出
+    static char buf[4096];
+    static char close_bnd[130];
+    static char bnd_copy[120];
+
+    // 1. 解析 Content-Type 中的 boundary
+    char content_type[128] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "缺少 Content-Type");
+        return ESP_FAIL;
+    }
+
+    char *bs = strstr(content_type, "boundary=");
+    if (!bs) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "缺少 boundary 参数");
+        return ESP_FAIL;
+    }
+    bs += 9;  // 跳过 "boundary="
+
+    // 处理引号包裹的 boundary（如 boundary="----WebKitFormBoundary..."）
+    if (*bs == '"') {
+        bs++;
+    }
+
+    // 构建关闭边界标记: "\r\n--<boundary>--"
+    memset(close_bnd, 0, sizeof(close_bnd));
+    memcpy(close_bnd, "\r\n--", 4);
+    memset(bnd_copy, 0, sizeof(bnd_copy));
+    size_t bnd_len = 0;
+    while (*bs && *bs != '"' && *bs != ';' && *bs != ' ' && bnd_len < sizeof(bnd_copy) - 1) {
+        bnd_copy[bnd_len++] = *bs++;
+    }
+    memcpy(close_bnd + 4, bnd_copy, bnd_len);
+
+    ESP_LOGD(TAG, "OTA boundary: %s, close marker len: %u", bnd_copy, (unsigned)strlen(close_bnd));
+
+    // 2. 开始 OTA 会话
+    esp_err_t ret = ota_update_begin();
+    if (ret != ESP_OK) {
+        if (ret == ESP_ERR_INVALID_ARG) {
+            return send_json_error(req, 500, "版本相同，已拒绝。请编译新版本后再升级。");
+        }
+        char err_msg[128];
+        snprintf(err_msg, sizeof(err_msg), "OTA 初始化失败: %s", esp_err_to_name(ret));
+        return send_json_error(req, 500, err_msg);
+    }
+
+    // 3. 流式接收，用尾缓冲处理跨 chunk 边界
+    size_t tail_len = 0;       // 尾缓冲中的字节数（来自上一次迭代）
+    bool headers_done = false; // 是否已跳过 multipart 头部
+    size_t total_written = 0;  // 累计写入字节数（用于日志）
+
+    while (true) {
+        int len = httpd_req_recv(req, buf + tail_len, sizeof(buf) - tail_len);
+        if (len < 0) {
+            if (len == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            ESP_LOGE(TAG, "OTA 接收失败: %d", len);
+            ota_update_abort();
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"网络接收失败\"}", HTTPD_RESP_USE_STRLEN);
+            return ESP_FAIL;
+        }
+        if (len == 0) {
+            // 连接关闭，用已接收数据结束 OTA
+            ESP_LOGW(TAG, "OTA 连接提前关闭，已接收 %lu 字节", (unsigned long)total_written);
+            break;
+        }
+
+        size_t total = tail_len + len;  // 缓冲中总数据量
+        tail_len = 0;
+
+        // 首个 chunk: 跳过 multipart 头部
+        if (!headers_done) {
+            for (size_t i = 0; i + 3 < total; i++) {
+                if (buf[i] == '\r' && buf[i+1] == '\n' &&
+                    buf[i+2] == '\r' && buf[i+3] == '\n') {
+                    size_t remain = total - (i + 4);
+                    if (remain > 0) {
+                        memmove(buf, buf + i + 4, remain);
+                    }
+                    total = remain;
+                    headers_done = true;
+                    ESP_LOGD(TAG, "OTA multipart 头部已跳过，文件数据 %u 字节", (unsigned)total);
+                    break;
+                }
+            }
+            if (!headers_done) {
+                tail_len = total;
+                continue;
+            }
+        }
+
+        if (total == 0) {
+            continue;
+        }
+
+        // 搜索关闭边界 "\r\n--<boundary>--"
+        const size_t cb_len = strlen(close_bnd);
+        int found = -1;
+        for (size_t i = 0; i + cb_len <= total; i++) {
+            if (memcmp(buf + i, close_bnd, cb_len) == 0) {
+                found = (int)i;
+                break;
+            }
+        }
+
+        if (found >= 0) {
+            // 找到关闭边界，写入边界之前的数据
+            if (found > 0) {
+                ret = ota_update_write((const uint8_t *)buf, found);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "OTA 最终写入失败: %s", esp_err_to_name(ret));
+                    ota_update_abort();
+                    char err_buf[128];
+                    snprintf(err_buf, sizeof(err_buf), "OTA 写入失败: %s", esp_err_to_name(ret));
+                    return send_json_error(req, 500, err_buf);
+                }
+                total_written += found;
+            }
+            ESP_LOGD(TAG, "OTA 接收完成，找到关闭边界，总计写入 %lu 字节", (unsigned long)total_written);
+            goto done_receiving;
+        }
+
+        // 未找到关闭边界
+        if (total > cb_len) {
+            // 写入 total - cb_len 字节（保留最后 cb_len 字节用于下一轮边界检测）
+            size_t write_len = total - cb_len;
+            ret = ota_update_write((const uint8_t *)buf, write_len);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "OTA 流式写入失败: %s", esp_err_to_name(ret));
+                ota_update_abort();
+                char err_buf[128];
+                snprintf(err_buf, sizeof(err_buf), "OTA 写入失败: %s", esp_err_to_name(ret));
+                return send_json_error(req, 500, err_buf);
+            }
+            total_written += write_len;
+            // 保留最后 cb_len 字节作为尾缓冲
+            memmove(buf, buf + write_len, cb_len);
+            tail_len = cb_len;
+
+            if (total_written % (64 * 1024) < write_len) {
+                ESP_LOGD(TAG, "OTA 已接收 %lu 字节", (unsigned long)total_written);
+            }
+        } else {
+            // 数据太少，全部保留到尾缓冲
+            memmove(buf, buf, total);
+            tail_len = total;
+        }
+    }
+
+done_receiving:
+    // 4. 完成 OTA
+    ret = ota_update_end();
+    if (ret != ESP_OK) {
+        char err_buf[128];
+        snprintf(err_buf, sizeof(err_buf), "OTA 校验失败: %s", esp_err_to_name(ret));
+        return send_json_error(req, 500, err_buf);
+    }
+
+    // 5. 发送成功响应
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"固件升级成功，系统正在重启\"}");
+
+    // 6. 延迟重启
+    xTaskCreate(ota_reboot_task, "ota_reboot", 2048, NULL, 1, NULL);
+    return ESP_OK;
+}
+
+/**
+ * @brief OTA 状态查询
+ */
+static esp_err_t ota_status_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    // FAILED 状态无活跃会话时，自动恢复为 idle
+    ota_state_t ota_st = ota_update_get_state();
+    if (ota_st == OTA_STATE_FAILED && ota_update_get_bytes_written() == 0) {
+        ota_st = OTA_STATE_IDLE;
+    }
+    cJSON_AddStringToObject(root, "state",
+        ota_st == OTA_STATE_IDLE ? "idle" :
+        ota_st == OTA_STATE_UPLOADING ? "uploading" :
+        ota_st == OTA_STATE_WRITING ? "writing" :
+        ota_st == OTA_STATE_COMPLETE ? "complete" : "failed");
+    cJSON_AddNumberToObject(root, "written", ota_update_get_bytes_written());
+
+    // 获取当前运行分区的编译时间
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running) {
+        esp_app_desc_t app_info;
+        if (esp_ota_get_partition_description(running, &app_info) == ESP_OK) {
+            cJSON_AddStringToObject(root, "running_version", app_info.version);
+            cJSON_AddStringToObject(root, "compile_time", app_info.date);
+            cJSON_AddStringToObject(root, "compile_date", app_info.time);
+        } else {
+            cJSON_AddStringToObject(root, "running_version", "unknown");
+        }
+        cJSON_AddStringToObject(root, "partition", running->label);
+        cJSON_AddNumberToObject(root, "partition_size", running->size);
+    }
+
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    if (next) {
+        cJSON_AddNumberToObject(root, "next_partition_size", next->size);
+    }
+
+    char *resp = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    free(resp);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
 // ==================== 公共接口 ====================
 
 esp_err_t web_server_init(void)
@@ -900,7 +1246,7 @@ esp_err_t web_server_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = ctx.config.port;
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 15;
+    cfg.max_uri_handlers = 18;
 
     if (httpd_start(&ctx.server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "启动失败");
@@ -954,6 +1300,15 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(ctx.server, &uri);
 
     uri.uri = "/admin", uri.method = HTTP_GET, uri.handler = handle_admin;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/ota/update", uri.method = HTTP_POST, uri.handler = ota_update_handler;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/ota/status", uri.method = HTTP_GET, uri.handler = ota_status_handler;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/ota", uri.method = HTTP_GET, uri.handler = handle_ota;
     httpd_register_uri_handler(ctx.server, &uri);
 
     ctx.running = true;
