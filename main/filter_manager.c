@@ -23,11 +23,11 @@ static const char *TAG = "FILTER_MGR";
 
 // 滤芯默认时间寿命（小时）
 static const uint32_t filter_default_time_hours[FILTER_COUNT] = {
-    3000,   // PP棉：约3-6个月
-    4000,   // 颗粒活性炭：约6个月
-    4000,   // 压缩活性炭：约6个月
-    8000,   // RO膜：约24个月
-    4000,   // 后置活性炭：约12个月
+    2190,   // PP棉：3个月
+    4380,   // 颗粒活性炭：6个月
+    4380,   // 压缩活性炭：6个月
+    17520,  // RO膜：24个月
+    6570,   // 后置活性炭：9个月
 };
 
 // 滤芯名称
@@ -129,6 +129,13 @@ static void load_from_nvs(void)
             fctx.filters[i].total_liters = cap;
         }
 
+        // 时间寿命
+        snprintf(key, sizeof(key), "f%d_time", i);
+        uint32_t t;
+        if (nvs_get_u32(handle, key, &t) == ESP_OK) {
+            fctx.filters[i].time_limit_hours = t;
+        }
+
         // 重新计算水量百分比
         if (fctx.filters[i].total_liters > 0) {
             float remaining = 1.0f - (float)fctx.filters[i].used_liters / fctx.filters[i].total_liters;
@@ -170,6 +177,10 @@ static void save_to_nvs(void)
         // 保存滤芯容量（始终保存，确保恢复默认值时不残留旧值）
         snprintf(key, sizeof(key), "f%d_cap", i);
         nvs_set_u32(handle, key, fctx.filters[i].total_liters);
+
+        // 保存滤芯时间寿命（始终保存）
+        snprintf(key, sizeof(key), "f%d_time", i);
+        nvs_set_u32(handle, key, fctx.filters[i].time_limit_hours);
     }
 
     nvs_commit(handle);
@@ -495,6 +506,25 @@ esp_err_t filter_mgr_set_all_filter_capacity(const uint32_t capacities[FILTER_CO
     ESP_LOGI(TAG, "所有滤芯容量已批量更新，RO膜: %lu 升", capacities[FILTER_RO_MEMBRANE]);
     fctx.save_needed = true;
     save_to_nvs();  // 一次性写入所有滤芯
+    return ESP_OK;
+}
+
+esp_err_t filter_mgr_set_all_filter_times(const uint32_t time_hours[FILTER_COUNT])
+{
+    if (!time_hours) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (int i = 0; i < FILTER_COUNT; i++) {
+        if (time_hours[i] > 0) {
+            fctx.filters[i].time_limit_hours = time_hours[i];
+        }
+    }
+
+    update_filter_time_percentage();
+    ESP_LOGI(TAG, "所有滤芯时间寿命已批量更新");
+    fctx.save_needed = true;
+    save_to_nvs();
     return ESP_OK;
 }
 

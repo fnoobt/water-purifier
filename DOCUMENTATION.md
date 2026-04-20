@@ -27,7 +27,7 @@
 - **增压泵**: 可配置（三角洲 50G~400G）
 - **压力桶**: 可配置（3G/3.2G/4G/6G/10G）
 - **工作电压**: 24V（设备供电）/ 5V（降压模块给ESP32）
-- **固件版本**: 1.0.5
+- **固件版本**: 1.1.2
 
 ### 技术栈
 - **框架**: ESP-IDF v5.5.2
@@ -53,6 +53,8 @@ WaterPurifier/
 │   │   ├── app_mqtt_public.h      # MQTT客户端接口
 │   │   ├── web_server.h           # Web服务器接口
 │   │   ├── config_manager.h       # 配置管理器接口
+│   │   ├── ota_update.h           # OTA升级接口
+│   │   ├── pm_manager.h           # 电源管理接口（CPU频率切换、WiFi TX功率、堆监控）
 │   │   └── history_logger.h       # 历史记录接口
 │   │
 │   ├── main.c                     # 主程序入口
@@ -64,6 +66,8 @@ WaterPurifier/
 │   ├── mqtt_client.c              # MQTT客户端（Home Assistant发现）
 │   ├── web_server.c               # Web服务器（HTML/CSS/JS嵌入）
 │   ├── config_manager.c           # 配置管理器（NVS存储）
+│   ├── ota_update.c               # OTA固件升级（流式写入+版本检测+回滚）
+│   ├── pm_manager.c               # 电源管理（CPU频率切换、WiFi TX功率、堆监控）
 │   ├── history_logger.c           # 历史记录实现
 │   │
 │   ├── CMakeLists.txt             # 构建配置
@@ -71,6 +75,7 @@ WaterPurifier/
 │
 ├── build/                         # 编译输出目录
 ├── sdkconfig                      # ESP-IDF配置文件
+├── partitions.csv                 # 自定义分区表（双OTA槽位）
 ├── CMakeLists.txt                 # 项目构建配置
 ├── README.md                      # 项目说明
 ├── DOCUMENTATION.md               # 本文档
@@ -99,9 +104,11 @@ WaterPurifier/
 6. wifi_manager_init()     -> WiFi初始化
    wifi_manager_start()    -> 启动WiFi（有配置则STA，无配置则AP）
 7. mqtt_client_init()      -> MQTT客户端初始化
-8. web_server_init()       -> HTTP服务器初始化
+8. ota_update_init()       -> OTA模块初始化（验证分区、读取当前版本）
+9. web_server_init()       -> HTTP服务器初始化
    web_server_start()      -> 启动Web服务
-9. xTaskCreate(monitor)    -> 启动监控任务（30秒周期）
+10. xTaskCreate(monitor)    -> 启动监控任务（30秒周期）
+    pm_manager_init()       -> 电源管理初始化（CPU频率切换、堆内存监控）
 ```
 
 **回调函数**:
@@ -218,11 +225,11 @@ typedef struct {
 
 | 滤芯 | 默认水量 | 默认时间 | 建议更换周期 |
 |------|---------|---------|-------------|
-| PP棉 | 3000升 | 3000小时 | 3-6个月 |
-| 颗粒活性炭 | 4000升 | 4000小时 | 6-12个月 |
-| 压缩活性炭 | 4000升 | 4000小时 | 6-12个月 |
-| RO膜 | 8000升 | 8000小时 | 24-36个月 |
-| 后置活性炭 | 4000升 | 4000小时 | 12个月 |
+| PP棉 | 3000升 | 2190小时（3个月） | 3个月 |
+| 颗粒活性炭 | 5000升 | 4380小时（6个月） | 6个月 |
+| 压缩活性炭 | 5000升 | 4380小时（6个月） | 6个月 |
+| RO膜 | 10000升 | 17520小时（24个月） | 24个月 |
+| 后置活性炭 | 4000升 | 6570小时（9个月） | 9个月 |
 
 **寿命计算**: `effective_percentage = min(water_pct, time_pct)`，低于10%触发更换提醒。
 
@@ -230,7 +237,10 @@ typedef struct {
 - `filter_mgr_update_water_usage()` — 仅设置脏标志，不调用NVS写入
 - `filter_mgr_periodic_save()` — 由FSM周期任务调用，检查脏标志后写入
 - `filter_mgr_reset_filter()` / `filter_mgr_set_filter_capacity_ex()` — 用户操作，立即写入
-- `filter_mgr_set_all_filter_capacity()` — 批量设置5级滤芯容量，一次NVS写入
+- `filter_mgr_set_all_filter_capacity()` — 批量设置5级滤芯水量容量，一次NVS写入
+- `filter_mgr_set_all_filter_times()` — 批量设置5级滤芯时间寿命，一次NVS写入
+
+**网页配置**: 管理页支持水量容量（升，下拉框）和时间寿命（月，下拉框）分别设置，各滤芯可选范围不同（PP: 1000~5000L/1~6月，UDF/CTO: 2000~10000L/3~9月，RO: 5000~20000L/18~36月，Post: 1000~5000L/6~12月）。
 
 **日历寿命**: `install_time` 和 `last_reset_time` 使用 `time(NULL)` 获取的 Unix 秒（NTP墙钟）。设备首次 NTP 同步后会自动回推滤芯安装时间，确保日历寿命准确反映自然时间流逝。
 
@@ -330,11 +340,11 @@ float filter_mgr_get_production_rate(void);
 
 | 状态 | 输出 | 转换条件 |
 |------|------|---------|
-| STANDBY | 全部关闭 | 有水+需制水→PRODUCTION，无水→SHORTAGE，漏水→LEAK |
+| STANDBY | 全部关闭 | 有水+需制水+!standby_manual→PRODUCTION，无水→SHORTAGE，漏水→LEAK |
 | PRODUCTION | 进水阀+增压泵（开阀→延时→泵，废水阀关） | 压力桶满→TANK_FULL，缺水→SHORTAGE，漏水→LEAK，超时→STOP |
 | TANK_FULL | 无（瞬时过渡） | 无条件→NORMAL_FLUSH |
 | NORMAL_FLUSH | 进水阀+废水阀+增压泵（检测进水阀状态决定水锤流程） | 完成→PURE_FLUSH，缺水→SHORTAGE，漏水→LEAK |
-| PURE_FLUSH | 回水阀+废水阀（停泵→延时→关进水阀→延时→开回水阀+废水阀） | 完成→STANDBY，压力开关闭合→STANDBY，缺水→SHORTAGE，漏水→LEAK |
+| PURE_FLUSH | 回水阀+废水阀（停泵→延时→关进水阀→延时→开回水阀+废水阀） | 完成→STANDBY（设standby_manual，桶缺水时恢复），压力开关闭合+FLUSH_PHASE_RUNNING→STANDBY，缺水→SHORTAGE，漏水→LEAK |
 | WATER_SHORTAGE | 全部关闭 | 有水→STANDBY（待机判断是否制水），漏水→LEAK |
 | LEAK_ALARM | 全部关闭 | 手动复位→STANDBY |
 | STOP | 全部关闭 | 手动复位→STANDBY |
@@ -482,10 +492,12 @@ water-purifier/set/flush           # 冲洗控制
 | `/api/wifi/scan` | GET | 扫描WiFi网络 |
 | `/api/wifi` | POST | 保存WiFi配置 |
 | `/api/filter/reset` | POST | 重置滤芯 |
-| `/api/filter/capacity` | POST | 设置滤芯容量（批量，一次NVS写入） |
+| `/api/filter/capacity` | POST | 设置滤芯水量+时间寿命（批量，一次NVS写入） |
 | `/api/tds/calibrate` | POST | TDS传感器校准（自动持久化到Flash） |
 | `/api/mqtt/config` | GET | 获取MQTT配置 |
 | `/api/mqtt/config` | POST | 保存MQTT配置 |
+| `/api/ota/status` | GET | 获取OTA升级状态 |
+| `/api/ota/update` | POST | 上传固件进行OTA升级 |
 
 **控制命令**:
 ```json
@@ -558,7 +570,7 @@ typedef struct {
     // 冲洗参数
     uint32_t normal_flush_duration_sec;  // 常规冲洗持续时间（秒），默认20
     uint32_t pure_flush_duration_sec;    // 纯水洗膜持续时间（秒），默认15
-    uint32_t filter_flush_duration_sec;   // 换芯冲洗持续时间（秒），默认3600（1小时）
+    uint32_t filter_flush_duration_sec;   // 换芯冲洗持续时间（秒），默认1200（20分钟）
     uint32_t short_prod_threshold_sec;   // 短制水判断阈值（秒），默认180
     uint32_t water_hammer_valve_open_delay_ms;  // 水锤-开阀延时（毫秒），默认1000
     uint32_t water_hammer_pump_stop_delay_ms;   // 水锤-停泵延时（毫秒），默认1000
@@ -610,7 +622,29 @@ typedef struct {
 
 ---
 
-### 10. 历史记录 (history_logger.c/h)
+### 11. 电源管理 (pm_manager.c/h)
+
+**职责**: CPU动态频率切换、WiFi TX功率动态调整、堆内存监控、系统看门狗
+
+**CPU频率控制**:
+- `pm_manager_set_cpu_mode(true)` — 降低到80MHz（待机/停止/漏水）
+- `pm_manager_set_cpu_mode(false)` — 保持160MHz（制水/冲洗）
+- 通过 `esp_pm_lock` 机制实现，释放锁后DFS自动降频
+
+**WiFi TX功率**:
+- 根据RSSI动态调整发射功率（`pm_manager_adjust_wifi_tx_power()`）
+- 采用**滞回窗口（Hysteresis）**机制，每个功率档位有独立的升/降功率RSSI阈值，避免边界震荡
+- RSSI < -55dBm 逐步升功率至20dBm，RSSI > -48dBm 逐步降至8dBm
+- 滞回表确保信号在边界附近波动时保持当前功率，仅当信号明显变化才切换
+
+**堆内存监控**:
+- 低于30KB 输出警告日志
+- 低于15KB 自动重启系统
+- `pm_manager_check_heap()` 由监控任务每30秒调用
+
+---
+
+### 12. 历史记录 (history_logger.c/h)
 
 **职责**: 运行事件日志记录、每日统计汇总、NVS 脏数据节流写入
 
@@ -813,7 +847,7 @@ Content-Type: application/json
 | `leak_confirm` | u32 | water_purifier | 漏水确认时间（秒），默认5 |
 | `nflush_dur` | u32 | water_purifier | 常规冲洗时间（秒），默认20 |
 | `pflush_dur` | u32 | water_purifier | 纯水洗膜时间（秒），默认15 |
-| `fflush_dur` | u32 | water_purifier | 换芯冲洗时间（秒），默认3600 |
+| `fflush_dur` | u32 | water_purifier | 换芯冲洗时间（秒），默认1200 |
 | `short_prod` | u32 | water_purifier | 短制水判断阈值（秒），默认180 |
 | `wh_vopn` | u32 | water_purifier | 水锤开阀延时（毫秒），默认1000 |
 | `wh_pstp` | u32 | water_purifier | 水锤停泵延时（毫秒），默认1000 |
@@ -841,6 +875,7 @@ Content-Type: application/json
 | `f%d_used` | u32 | wp_filters | 各级滤芯已用水量（%d=0~4） |
 | `f%d_reset` | u32 | wp_filters | 各级滤芯重置时间（Unix秒） |
 | `f%d_cap` | u32 | wp_filters | 各级滤芯自定义容量（可选） |
+| `f%d_time` | u32 | wp_filters | 各级滤芯时间寿命（小时，可选） |
 | `total_water` | u32 | wp_filters | 滤芯总用水量（升） |
 | `prod_rate` | i32 | wp_filters | 制水速率（×100编码） |
 
@@ -852,12 +887,14 @@ Content-Type: application/json
 
 | 分区 | 大小 | 说明 |
 |------|------|------|
-| Bootloader | 28KB | 系统引导 |
+| Bootloader | 32KB | 系统引导 |
+| Partition Table | 8KB | 分区表 |
 | NVS | 24KB | 配置存储 |
+| otadata | 8KB | OTA启动分区记录 |
 | PHY Init | 4KB | PHY初始化数据 |
-| App | ~1MB | 应用程序 |
-| **固件大小** | ~910KB | 编译后的二进制 |
-| **剩余空间** | ~2.9MB | 未使用 |
+| factory | 1152KB | 初始固件 |
+| ota_0 | 1408KB | OTA槽位0 |
+| ota_1 | 1408KB | OTA槽位1 |
 
 ### RAM使用
 
@@ -951,6 +988,9 @@ Content-Type: application/json
 | 1.0.3 | 2026-04 | FSM_STATE_FAULT→STOP（故障改停止），制水水锤改为开进水阀→延时→开泵（废水阀关），常规冲洗水锤自适应（检测进水阀GPIO），冲洗时间统计修复（常规冲洗+纯水洗膜合并统计），纯水洗膜入口区分正常过渡/网页直接进入，网页面板6按钮（制水/冲洗/反冲洗/复位/待机/停止），水锤UI按启动/过渡阶段分组显示，API action参数重命名（start→start_production等） |
 | 1.0.4 | 2026-04 | 换芯冲洗功能（网页面板新增按钮，仅普通冲洗1小时不切纯水），WiFi重连机制优化（独立FreeRTOS任务+指数退避+AP模式周期重连），mDNS/SNTP重复初始化防护，运行时间/总用水量NVS持久化修复，今日统计跨重启恢复 |
 | 1.0.5 | 2026-04 | 滤芯管理模块从tds_sensor提取为独立filter_manager，tds_sensor仅保留纯TDS测量功能；TDS校准结果自动持久化到Flash；config_manager_save_runtime_data()增加memcmp脏检查；handle_filter_capacity改为批量一次NVS写入；NVS命名空间wp_filters独立管理滤芯数据 |
+| 1.1.0 | 2026-04 | OTA固件升级功能（Web界面上传.bin，流式写入，同版本拒绝，Rollback保护）；待机循环修复（冲洗完成后设standby_manual，压力桶缺水时自动恢复制水） |
+| 1.1.1 | 2026-04 | 换芯冲洗默认时长改为20分钟（1200秒）；standby_manual清除逻辑优化（桶缺水时清除而非桶满时提前清除，逻辑更清晰）；纯水洗膜水锤过渡阶段增加FLUSH_PHASE_RUNNING阶段守卫，防止停泵/关阀期间被tank_pressure误中断 |
+| 1.1.2 | 2026-04 | 滤芯默认容量修正为3000/5000/5000/10000/4000升（修复main.c覆盖所有滤芯为3000的bug）；网页滤芯管理支持水量容量（升，下拉框）+时间寿命（月，下拉框）双维度设置，各滤芯可选范围不同；WiFi TX功率改为滞回窗口机制（Hysteresis），避免RSSI边界波动导致频繁切换；fsm_force_standby()补充缺失的production_start_time统计清理和filter_flush_mode标志重置 |
 
 ---
 

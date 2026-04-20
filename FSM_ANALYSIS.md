@@ -1,22 +1,42 @@
-# FSM 状态机全面分析报告（第三轮）
+# FSM 状态机全面分析报告（第六轮）
 
-> 分析时间: 2026-04-14
-> 代码版本: water_purifier_fsm.c (约 1280 行)
+> 分析时间: 2026-04-18
+> 代码版本: water_purifier_fsm.c (约 1340 行)
 
-## 状态机当前状态（更新于 2026-04-15）
+## 状态机当前状态（更新于 2026-04-18）
 
-第三轮和第四轮分析中发现的关键问题均已修复：
+第五轮和第六轮分析中发现的关键问题均已修复：
 - `transition_to_pure_flush()` 已调用 `transition_to(FSM_STATE_PURE_FLUSH)`
 - 所有无条件 `transition_to()` 前均添加了状态守卫
 - `standby_manual` 标志阻止 check_inputs 自动制水
 - `fsm_force_standby()` 清理了 `flush_start_time`
 - `execute_pure_flush()` 中 came_from_normal_flush 分支删除了冗余 GPIO 检查
+- 换芯冲洗默认时长改为 20 分钟（1200秒）
+- 纯水洗膜水锤过渡阶段增加 FLUSH_PHASE_RUNNING 阶段守卫
+- standby_manual 清除条件改为桶缺水时清除（逻辑更清晰）
+
+### 待机循环修复（第五轮）
+
+**问题**: 完整周期（待机→制水→水满→常规冲洗→纯水洗膜→待机）后，系统立即重新开始制水，形成死循环。
+
+**根因**: 纯水洗膜进入待机后 `standby_manual` 未被设置，下一次 `check_inputs()` 检测到压力桶缺水立即触发制水。
+
+**修复**:
+1. `execute_pure_flush()` 正常完成时设 `standby_manual = true`
+2. `check_inputs()` 纯水洗膜中断时也设 `standby_manual = true`
+3. 待机清除条件改为 `!low_pressure || tank_pressure` —— 缺水恢复或桶缺水时清除标志，清除后同 tick 满足条件即触发自动制水
+
+### 纯水洗膜阶段守卫修复（第六轮）
+
+**问题**: `check_inputs()` 中 PURE_FLUSH 的 `tank_pressure` 检测无条件执行，水锤过渡阶段（停泵1s+关阀0.5s）期间若桶压力变化，冲洗会被误中断。
+
+**修复**: 增加 `fsm_ctx.current_phase == FLUSH_PHASE_RUNNING` 阶段守卫，仅在纯水冲洗正常运行中检测用户用水中断。
 
 新增功能（第四轮）：
 - `FSM_EVENT_FILTER_FLUSH` 换芯冲洗事件
 - `fsm_ctx.filter_flush_mode` 和 `filter_flush_start` 字段
 - `fsm_manual_filter_flush()` 公共函数
-- `execute_normal_flush()` 中换芯冲洗模式：仅普通冲洗持续1小时，不切换纯水洗膜，不计统计
+- `execute_normal_flush()` 中换芯冲洗模式：仅普通冲洗持续20分钟，不切换纯水洗膜，不计统计
 
 ---
 
@@ -156,7 +176,7 @@ transition_to(FSM_STATE_NORMAL_FLUSH);
 ```
 
 **修复:** 添加 `standby_manual` 标志，GO_STANDBY 时设置，阻止 check_inputs 自动制水。
-当传感器条件变化时（低压断开或桶压断开）自动清除标志，恢复自动制水功能。
+待机清除条件为 `!low_pressure || tank_pressure` —— 缺水恢复或压力桶缺水时自动清除标志，恢复制水功能。
 
 ---
 
@@ -250,7 +270,7 @@ transition_to(FSM_STATE_NORMAL_FLUSH);
 | `execute_tank_full()` | 添加 `current_state != TANK_FULL` 守卫 |
 | `execute_pure_flush()` | 添加 `current_state != PURE_FLUSH` 守卫 |
 | `fsm_ctx` 结构体 | 添加 `standby_manual` 标志 |
-| `check_inputs()` STANDBY | 检查 `standby_manual` 阻止自动制水，传感器变化时清除 |
+| `check_inputs()` STANDBY | 检查 `standby_manual` 阻止自动制水，缺水恢复或桶缺水时清除 |
 | GO_STANDBY 事件处理 | 设置 `standby_manual = true` |
 | RESET 事件处理 | 清除 `standby_manual` |
 | FORCE_FLUSH/FORCE_PRODUCTION | 清除 `standby_manual` |
@@ -259,3 +279,7 @@ transition_to(FSM_STATE_NORMAL_FLUSH);
 | `execute_pure_flush()` came_from_normal_flush | 删除冗余GPIO检查，信任 `transition_to_pure_flush()` 设置的阶段 |
 | `transition_to_pure_flush()` | 添加 "已进入纯水洗膜状态" 确认日志 |
 | `execute_normal_flush()` RUNNING | 增强完成日志，显示实际时长、配置时长、短制水标志 |
+| `execute_pure_flush()` 完成 | 设置 `standby_manual = true` 防止冲洗后立即重新制水 |
+| `check_inputs()` PURE_FLUSH中断 | 压力开关触发转待机时设 `standby_manual = true`，增加 FLUSH_PHASE_RUNNING 阶段守卫 |
+| `FILTER_FLUSH_DURATION_DEFAULT_SEC` | 换芯冲洗默认时长改为 1200秒（20分钟） |
+| `check_inputs()` STANDBY清除条件 | 改为 `!low_pressure || tank_pressure` —— 桶缺水时清除而非桶满时提前清除 |

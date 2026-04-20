@@ -36,7 +36,7 @@ static const char *TAG = "FSM";
 #define PRODUCTION_TIMEOUT_DEFAULT_SEC   (3 * 3600)  // 3小时
 #define NORMAL_FLUSH_DURATION_DEFAULT_SEC 20         // 常规冲洗20秒
 #define PURE_FLUSH_DURATION_DEFAULT_SEC   15         // 纯水洗膜15秒
-#define FILTER_FLUSH_DURATION_DEFAULT_SEC 3600       // 换芯冲洗3600秒（1小时）
+#define FILTER_FLUSH_DURATION_DEFAULT_SEC 1200       // 换芯冲洗1200秒（20分钟）
 #define LEAK_CONFIRM_TIME_DEFAULT_SEC     5          // 漏水确认5秒
 #define CHECK_INTERVAL_MS                 100        // 状态检查间隔
 #define LED_BLINK_SLOW_MS                 1000       // 慢闪周期
@@ -683,8 +683,8 @@ static void check_inputs(void)
                 transition_to(FSM_STATE_LEAK_ALARM);
                 return;
             }
-            // 传感器条件变化时清除手动待机标志
-            if (fsm_ctx.standby_manual && (!low_pressure || !tank_pressure)) {
+            // 传感器条件变化时清除手动待机标志（缺水恢复或桶缺水时清除，允许自动恢复制水）
+            if (fsm_ctx.standby_manual && (!low_pressure || tank_pressure)) {
                 fsm_ctx.standby_manual = false;
             }
             if (!low_pressure) {
@@ -734,7 +734,8 @@ static void check_inputs(void)
 
         case FSM_STATE_PURE_FLUSH:
             // 纯水洗膜期间的特殊处理：用户用水导致压力下降
-            if (tank_pressure) {
+            // 仅在 FLUSH_PHASE_RUNNING 阶段检查 tank_pressure，避免水锤过渡阶段（停泵/关阀）被误中断
+            if (fsm_ctx.current_phase == FLUSH_PHASE_RUNNING && tank_pressure) {
                 // 压力桶压力开关闭合 = 用户正在用水/桶空
                 ESP_LOGI(TAG, "纯水洗膜中断：检测到用水需求，停止洗膜进入待机");
                 stop_all_outputs();
@@ -1277,11 +1278,27 @@ esp_err_t fsm_manual_shutdown(void)
 
 esp_err_t fsm_force_standby(void)
 {
+    // 清理未统计的制水时间
+    if (fsm_ctx.production_start_time > 0) {
+        uint64_t duration = get_elapsed_sec(fsm_ctx.production_start_time);
+        fsm_ctx.runtime_data.total_production_time_sec += duration;
+        float water_liters = (float)duration * fsm_get_production_rate_lph() / 3600.0f;
+        if (water_liters > 0.1f) {
+            filter_mgr_update_water_usage(water_liters);
+            history_update_daily_production((uint32_t)duration);
+        }
+        fsm_ctx.production_start_time = 0;
+        fsm_ctx.runtime_dirty = true;
+    }
+    if (fsm_ctx.flush_start_time > 0) {
+        fsm_ctx.flush_start_time = 0;
+    }
     stop_all_outputs();
     fsm_ctx.leak_detected = false;
     fsm_ctx.leak_detect_start_time = 0;
-    fsm_ctx.flush_start_time = 0;  // 清除残留的冲洗时间
-    fsm_ctx.standby_manual = true;  // 阻止自动进入制水
+    fsm_ctx.standby_manual = true;
+    fsm_ctx.filter_flush_mode = false;
+    fsm_ctx.filter_flush_start = 0;
     transition_to(FSM_STATE_STANDBY);
     return ESP_OK;
 }

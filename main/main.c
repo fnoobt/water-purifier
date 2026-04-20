@@ -21,6 +21,7 @@
 #include "config_manager.h"
 #include "history_logger.h"
 #include "ota_update.h"
+#include "pm_manager.h"
 #include "app_mqtt_public.h"
 
 static const char *TAG = "MAIN";
@@ -32,6 +33,18 @@ static void fsm_state_callback(fsm_state_t old_state, fsm_state_t new_state)
     ESP_LOGI(TAG, "状态变化: %s -> %s",
              fsm_get_state_name(old_state),
              fsm_get_state_name(new_state));
+
+    // 根据状态切换CPU频率
+    if (new_state == FSM_STATE_PRODUCTION ||
+        new_state == FSM_STATE_NORMAL_FLUSH ||
+        new_state == FSM_STATE_PURE_FLUSH ||
+        new_state == FSM_STATE_TANK_FULL) {
+        // 制水和冲洗期间保持160MHz高性能
+        pm_manager_set_cpu_mode(false);
+    } else {
+        // 待机/缺水/停止/漏水时降低到80MHz
+        pm_manager_set_cpu_mode(true);
+    }
 
     // 发布MQTT状态更新
     if (mqtt_client_is_connected()) {
@@ -104,6 +117,17 @@ static void monitor_task(void *arg)
                  tds.inlet.valid ? tds.inlet.tds_value : 0,
                  tds.outlet.valid ? tds.outlet.tds_value : 0);
 
+        // 堆内存监控
+        pm_manager_check_heap();
+
+        // WiFi TX功率动态调整（基于RSSI）
+        if (wifi_manager_is_connected()) {
+            int8_t rssi = wifi_manager_get_rssi();
+            if (rssi != 0) {
+                pm_manager_adjust_wifi_tx_power(rssi);
+            }
+        }
+
         // 发布MQTT状态
         if (mqtt_client_is_connected()) {
             mqtt_publish_purifier_status();
@@ -146,7 +170,6 @@ void app_main(void)
     tds_sensor_set_alarm_threshold(TDS_SENSOR_INLET, cfg.tds_inlet_threshold);
     tds_sensor_set_alarm_threshold(TDS_SENSOR_OUTLET, cfg.tds_outlet_threshold);
     filter_mgr_init();
-    filter_mgr_set_filter_capacity(cfg.filter_capacity_liters);
     tds_sensor_start();
 
     // 4. 初始化状态机
@@ -192,6 +215,12 @@ void app_main(void)
 
     // 创建监控任务
     xTaskCreate(monitor_task, "monitor", 4096, NULL, 3, NULL);
+
+    // 初始化电源管理
+    ESP_LOGI(TAG, "[10/10] 初始化电源管理...");
+    if (pm_manager_init() != ESP_OK) {
+        ESP_LOGW(TAG, "电源管理初始化失败");
+    }
 
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "========================================");

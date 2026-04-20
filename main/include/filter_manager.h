@@ -32,11 +32,11 @@ typedef enum {
 /**
  * @brief 滤芯默认寿命配置（升）
  */
-#define FILTER_DEFAULT_LIFE_PP           3000    // PP棉：3000升（约3-6个月）
-#define FILTER_DEFAULT_LIFE_GRANULAR     4000    // 颗粒活性炭：4000升（约6个月）
-#define FILTER_DEFAULT_LIFE_COMPRESSED   4000    // 压缩活性炭：4000升（约6个月）
-#define FILTER_DEFAULT_LIFE_RO           8000    // RO膜：8000升（约24个月）
-#define FILTER_DEFAULT_LIFE_POST         4000    // 后置活性炭：4000升（约12个月）
+#define FILTER_DEFAULT_LIFE_PP           3000    // PP棉：3000升（约3000-5000升范围）
+#define FILTER_DEFAULT_LIFE_GRANULAR     5000    // 颗粒活性炭：5000升（约4000-10000升范围）
+#define FILTER_DEFAULT_LIFE_COMPRESSED   5000    // 压缩活性炭：5000升（约4000-10000升范围）
+#define FILTER_DEFAULT_LIFE_RO           10000   // RO膜：10000升（约8000-20000升范围）
+#define FILTER_DEFAULT_LIFE_POST         4000    // 后置活性炭：4000升（约3000-5000升范围）
 
 /**
  * @brief 单个滤芯寿命信息结构体
@@ -167,6 +167,13 @@ esp_err_t filter_mgr_set_filter_capacity_ex(filter_type_t filter_type, uint32_t 
  * @return ESP_OK 成功
  */
 esp_err_t filter_mgr_set_all_filter_capacity(const uint32_t capacities[FILTER_COUNT]);
+
+/**
+ * @brief 批量设置所有滤芯时间寿命（一次NVS写入）
+ * @param time_hours 时间寿命数组（小时），长度必须为FILTER_COUNT
+ * @return ESP_OK 成功
+ */
+esp_err_t filter_mgr_set_all_filter_times(const uint32_t time_hours[FILTER_COUNT]);
 
 /**
  * @brief 获取滤芯名称

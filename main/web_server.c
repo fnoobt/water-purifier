@@ -80,7 +80,7 @@ static const char html_page[] =
 ".filter-bar-fill.error{background:linear-gradient(90deg,#dc3545,#c82333)}"
 "</style></head><body>"
 "<div class='container'>"
-"<h1>净水器</h1>"
+"<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>净水器</h1>"
 
 "<div class='card'><h3>系统状态</h3>"
 "<div class='grid'>"
@@ -197,7 +197,7 @@ static const char html_admin_page[] =
 ".dim-label{font-size:10px;color:#999}"
 "</style></head><body>"
 "<div class='container'>"
-"<div style='display:flex;justify-content:space-between;align-items:center;margin:5px 0'>"
+"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>"
 "<button class='back-btn' onclick=\"location.href='/'\" style='margin:0'>← 返回首页</button>"
 "<button class='back-btn' onclick=\"location.href='/ota'\" style='margin:0'>固件升级 →</button>"
 "</div>"
@@ -221,15 +221,23 @@ static const char html_admin_page[] =
 "<div class='stat filter-stat'><div class='filter-name'>RO膜</div><div id='f3' class='filter-pct'>-</div><div class='dim-label'>水量 <span id='fw3'>-</span> 时间 <span id='ft3'>-</span></div><div class='filter-bar'><div id='bw3' class='filter-bar-fill good' style='width:100%'></div></div><div class='filter-bar'><div id='bt3' class='filter-bar-fill good' style='width:100%'></div></div><button class='btn btn-primary' style='font-size:11px;padding:4px 8px;margin-top:5px' onclick=\"resetFilter(3)\">重置</button></div>"
 "<div class='stat filter-stat'><div class='filter-name'>后置炭</div><div id='f4' class='filter-pct'>-</div><div class='dim-label'>水量 <span id='fw4'>-</span> 时间 <span id='ft4'>-</span></div><div class='filter-bar'><div id='bw4' class='filter-bar-fill good' style='width:100%'></div></div><div class='filter-bar'><div id='bt4' class='filter-bar-fill good' style='width:100%'></div></div><button class='btn btn-primary' style='font-size:11px;padding:4px 8px;margin-top:5px' onclick=\"resetFilter(4)\">重置</button></div>"
 "</div>"
-"<p style='font-size:13px;color:#666;margin-top:15px'>滤芯容量设置 (升):</p>"
+"<p style='font-size:13px;color:#666;margin-top:15px'>滤芯水量寿命 (升):</p>"
 "<div class='grid'>"
-"<div class='form-row'><label>PP棉</label><input type='number' id='cap0' value='3000'></div>"
-"<div class='form-row'><label>颗粒炭</label><input type='number' id='cap1' value='4000'></div>"
-"<div class='form-row'><label>压缩炭</label><input type='number' id='cap2' value='4000'></div>"
-"<div class='form-row'><label>RO膜</label><input type='number' id='cap3' value='8000'></div>"
-"<div class='form-row'><label>后置炭</label><input type='number' id='cap4' value='4000'></div>"
+"<div class='form-row'><label>PP棉</label><select id='cap0'><option value='1000'>1000</option><option value='2000'>2000</option><option value='3000'>3000</option><option value='4000'>4000</option><option value='5000'>5000</option></select></div>"
+"<div class='form-row'><label>颗粒炭</label><select id='cap1'><option value='2000'>2000</option><option value='3000'>3000</option><option value='4000'>4000</option><option value='5000'>5000</option><option value='6000'>6000</option><option value='8000'>8000</option><option value='10000'>10000</option></select></div>"
+"<div class='form-row'><label>压缩炭</label><select id='cap2'><option value='2000'>2000</option><option value='3000'>3000</option><option value='4000'>4000</option><option value='5000'>5000</option><option value='6000'>6000</option><option value='8000'>8000</option><option value='10000'>10000</option></select></div>"
+"<div class='form-row'><label>RO膜</label><select id='cap3'><option value='5000'>5000</option><option value='6000'>6000</option><option value='8000'>8000</option><option value='10000'>10000</option><option value='12000'>12000</option><option value='15000'>15000</option><option value='20000'>20000</option></select></div>"
+"<div class='form-row'><label>后置炭</label><select id='cap4'><option value='1000'>1000</option><option value='2000'>2000</option><option value='3000'>3000</option><option value='4000'>4000</option><option value='5000'>5000</option></select></div>"
 "</div>"
-"<div class='btn-group'><button class='btn btn-success' onclick='saveFilterCaps()'>保存滤芯容量</button></div>"
+"<p style='font-size:13px;color:#666;margin-top:15px'>滤芯日历寿命 (月):</p>"
+"<div class='grid'>"
+"<div class='form-row'><label>PP棉</label><select id='time0'><option value='730'>1月</option><option value='1460'>2月</option><option value='2190'>3月</option><option value='2920'>4月</option><option value='3650'>5月</option><option value='4380'>6月</option></select></div>"
+"<div class='form-row'><label>颗粒炭</label><select id='time1'><option value='2190'>3月</option><option value='2920'>4月</option><option value='3650'>5月</option><option value='4380'>6月</option><option value='5110'>7月</option><option value='5840'>8月</option><option value='6570'>9月</option></select></div>"
+"<div class='form-row'><label>压缩炭</label><select id='time2'><option value='2190'>3月</option><option value='2920'>4月</option><option value='3650'>5月</option><option value='4380'>6月</option><option value='5110'>7月</option><option value='5840'>8月</option><option value='6570'>9月</option></select></div>"
+"<div class='form-row'><label>RO膜</label><select id='time3'><option value='13140'>18月</option><option value='15330'>21月</option><option value='17520'>24月</option><option value='21900'>30月</option><option value='26280'>36月</option></select></div>"
+"<div class='form-row'><label>后置炭</label><select id='time4'><option value='4380'>6月</option><option value='5110'>7月</option><option value='5840'>8月</option><option value='6570'>9月</option><option value='7300'>10月</option><option value='8030'>11月</option><option value='8760'>12月</option></select></div>"
+"</div>"
+"<div class='btn-group'><button class='btn btn-success' onclick='saveFilterCaps()'>保存滤芯配置</button></div>"
 "</div>"
 
 "<div class='card'><h3>硬件配置</h3>"
@@ -321,7 +329,8 @@ static const char html_admin_page[] =
 "$('whValveClose').value=d.whValveClose||500;"
 "})}"
 "function loadFilters(){fetch('/api/status').then(r=>r.json()).then(d=>{"
-"if(d.filters){for(let i=0;i<5;i++){const f=d.filters[i];if(f){$('f'+i).textContent=f.effPct+'%';$('fw'+i).textContent=f.waterPct+'%';$('ft'+i).textContent=f.timePct+'%';$('bw'+i).style.width=f.waterPct+'%';$('bt'+i).style.width=f.timePct+'%';$('bw'+i).className='filter-bar-fill '+(f.waterPct>50?'good':f.waterPct>20?'warn':'error');$('bt'+i).className='filter-bar-fill '+(f.timePct>50?'good':f.timePct>20?'warn':'error');$('cap'+i).value=f.total;}}}"
+"function selVal(id,val){let s=$(id),best=s.options[0].value,diff=Math.abs(val-best);for(let i=1;i<s.options.length;i++){let dd=Math.abs(s.options[i].value-val);if(dd<diff){diff=dd;best=s.options[i].value}};s.value=best}"
+"if(d.filters){for(let i=0;i<5;i++){const f=d.filters[i];if(f){$('f'+i).textContent=f.effPct+'%';$('fw'+i).textContent=f.waterPct+'%';$('ft'+i).textContent=f.timePct+'%';$('bw'+i).style.width=f.waterPct+'%';$('bt'+i).style.width=f.timePct+'%';$('bw'+i).className='filter-bar-fill '+(f.waterPct>50?'good':f.waterPct>20?'warn':'error');$('bt'+i).className='filter-bar-fill '+(f.timePct>50?'good':f.timePct>20?'warn':'error');selVal('cap'+i,f.total);selVal('time'+i,f.timeLimit);}}}"
 "$('wifiState').textContent=d.wifiState;"
 "$('wifiSSID').textContent=d.ssid||'-';"
 "$('wifiIP').textContent=d.ip||'-';"
@@ -333,7 +342,7 @@ static const char html_admin_page[] =
 "function goStandby(){api('/api/control',{action:'standby'}).then(d=>alert(d.status||'已执行'))}"
 "function shutdown(){api('/api/control',{action:'shutdown'}).then(d=>alert(d.status||'已执行'))}"
 "function resetFilter(i){if(confirm('确认重置该滤芯？')){api('/api/filter/reset',{filter:i}).then(d=>{alert(d.filter_name+' 已重置');loadFilters()})}}"
-"function saveFilterCaps(){api('/api/filter/capacity',{caps:[parseInt($('cap0').value),parseInt($('cap1').value),parseInt($('cap2').value),parseInt($('cap3').value),parseInt($('cap4').value)]}).then(d=>alert(d.status||'已保存'))}"
+"function saveFilterCaps(){api('/api/filter/capacity',{caps:[parseInt($('cap0').value),parseInt($('cap1').value),parseInt($('cap2').value),parseInt($('cap3').value),parseInt($('cap4').value)],times:[parseInt($('time0').value),parseInt($('time1').value),parseInt($('time2').value),parseInt($('time3').value),parseInt($('time4').value)]}).then(d=>alert(d.status||'已保存'))}"
 "function saveConfig(){api('/api/config',{normalFlushDur:parseInt($('normalFlushDur').value),pureFlushDur:parseInt($('pureFlushDur').value),filterFlushDur:parseInt($('filterFlushDur').value)*60,prodTimeout:parseInt($('prodTimeout').value)*60,leakConfirm:parseInt($('leakConfirm').value),saveInterval:parseInt($('saveInterval').value),relayLevel:parseInt($('relayLevel').value),tdsInTh:parseFloat($('tdsInTh').value),tdsOutTh:parseFloat($('tdsOutTh').value),whValveOpen:parseInt($('whValveOpen').value),whPumpStop:parseInt($('whPumpStop').value),whValveClose:parseInt($('whValveClose').value)}).then(d=>alert(d.status||'已保存'))}"
 "function saveHardware(){api('/api/config/hardware',{roMem:parseInt($('roMem').value),pumpType:parseInt($('pumpType').value),tankSize:parseInt($('tankSize').value)}).then(d=>alert(d.status||'已保存'))}"
 "function scanWiFi(){$('wifiList').innerHTML='扫描中...';fetch('/api/wifi/scan').then(r=>r.json()).then(d=>{let h='';if(d.networks)d.networks.forEach(n=>h+='<div class=\"wifi-item\" onclick=\"$(\\'ssid\\').value=\\''+n.ssid+'\\'\">'+n.ssid+' ('+n.rssi+'dBm)</div>');$('wifiList').innerHTML=h||'未找到网络'})}"
@@ -534,6 +543,7 @@ static esp_err_t handle_status(httpd_req_t *req)
         cJSON_AddNumberToObject(f, "effPct", filters_status.filters[i].effective_percentage);
         cJSON_AddNumberToObject(f, "used", filters_status.filters[i].used_liters);
         cJSON_AddNumberToObject(f, "total", filters_status.filters[i].total_liters);
+        cJSON_AddNumberToObject(f, "timeLimit", filters_status.filters[i].time_limit_hours);
         cJSON_AddBoolToObject(f, "needReplace", filters_status.filters[i].replacement_needed);
         cJSON_AddItemToArray(filters_arr, f);
     }
@@ -864,6 +874,17 @@ static esp_err_t handle_filter_capacity(httpd_req_t *req)
         capacities[i] = cap ? (uint32_t)cap->valueint : 0;
     }
     filter_mgr_set_all_filter_capacity(capacities);
+
+    // 解析可选的时间寿命
+    cJSON *times = cJSON_GetObjectItem(root, "times");
+    if (times && cJSON_IsArray(times) && cJSON_GetArraySize(times) == FILTER_COUNT) {
+        uint32_t th[FILTER_COUNT];
+        for (int i = 0; i < FILTER_COUNT; i++) {
+            cJSON *item = cJSON_GetArrayItem(times, i);
+            th[i] = item && cJSON_IsNumber(item) ? (uint32_t)item->valueint : 0;
+        }
+        filter_mgr_set_all_filter_times(th);
+    }
 
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
