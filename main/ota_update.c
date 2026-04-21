@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_app_format.h"
+#include "esp_app_desc.h"
 #include "esp_partition.h"
 #include <string.h>
 
@@ -58,9 +59,9 @@ esp_err_t ota_update_init(void)
              next->label, next->address, next->size / 1024);
 
     // 读取当前固件版本
-    esp_app_desc_t running_app_info;
-    if (esp_ota_get_partition_description(running, &running_app_info) == ESP_OK) {
-        strncpy(s_ctx.running_version, running_app_info.version, sizeof(s_ctx.running_version) - 1);
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    if (app_desc) {
+        strncpy(s_ctx.running_version, app_desc->version, sizeof(s_ctx.running_version) - 1);
         ESP_LOGI(TAG, "当前固件版本: %s", s_ctx.running_version);
     } else {
         strncpy(s_ctx.running_version, "unknown", sizeof(s_ctx.running_version) - 1);

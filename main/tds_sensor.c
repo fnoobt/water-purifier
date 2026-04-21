@@ -10,7 +10,7 @@
 #include "esp_timer.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_rom_sys.h"
-#include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>

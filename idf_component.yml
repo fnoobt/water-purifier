@@ -1,6 +1,0 @@
-## This file is used to configure the ESP Component Manager
-## See https://docs.espressif.com/projects/idf-component-manager/ for details
-
-dependencies:
-  espressif/mdns:
-    version: "^1.0.0"

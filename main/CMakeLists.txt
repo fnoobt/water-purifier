@@ -7,4 +7,4 @@ idf_component_register(SRCS "pm_manager.c" "ota_update.c" "filter_manager.c" "hi
                     "web_server.c"
                     "config_manager.c"
                     INCLUDE_DIRS "." "include"
-                    REQUIRES driver esp_wifi esp_event mqtt esp_http_server esp_adc json nvs_flash esp_app_format esp_partition app_update esp_pm)
+                    REQUIRES driver esp_wifi esp_event mqtt esp_http_server esp_adc esp_driver_gpio cjson nvs_flash esp_app_format esp_partition app_update esp_pm)

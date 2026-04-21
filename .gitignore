@@ -79,4 +79,4 @@ Desktop.ini
 .claude/
 CLAUDE.md
 *.bat
-build_*.py
+build*.py

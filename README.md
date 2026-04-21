@@ -2,7 +2,7 @@
 
 基于ESP32-C3的净水器智能控制系统，支持多种RO膜规格、增压泵和压力桶配置。
 
-[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.5.2-blue)](https://github.com/espressif/esp-idf)
+[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v6.0.0-blue)](https://github.com/espressif/esp-idf)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## 目录
@@ -109,7 +109,7 @@
 
 ### 环境要求
 
-- ESP-IDF v5.5.2
+- ESP-IDF v6.0.0
 - Python 3.8+
 - CMake 3.16+
 
@@ -119,7 +119,7 @@
 
 ```batch
 REM 打开ESP-IDF命令提示符
-ESP-IDF 5.5.2 CMD
+ESP-IDF 6.0.0 CMD
 
 REM 进入项目目录
 cd /d D:\Projects\esp32\WaterPurifier

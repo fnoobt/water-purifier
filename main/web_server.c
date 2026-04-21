@@ -14,6 +14,7 @@
 #include "history_logger.h"
 #include "ota_update.h"
 #include "esp_ota_ops.h"
+#include "esp_app_desc.h"
 #include "esp_partition.h"
 #include "esp_log.h"
 #include "esp_http_server.h"
@@ -1211,16 +1212,16 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "written", ota_update_get_bytes_written());
 
     // 获取当前运行分区的编译时间
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    if (app_desc) {
+        cJSON_AddStringToObject(root, "running_version", app_desc->version);
+        cJSON_AddStringToObject(root, "compile_time", app_desc->date);
+        cJSON_AddStringToObject(root, "compile_date", app_desc->time);
+    } else {
+        cJSON_AddStringToObject(root, "running_version", "unknown");
+    }
     const esp_partition_t *running = esp_ota_get_running_partition();
     if (running) {
-        esp_app_desc_t app_info;
-        if (esp_ota_get_partition_description(running, &app_info) == ESP_OK) {
-            cJSON_AddStringToObject(root, "running_version", app_info.version);
-            cJSON_AddStringToObject(root, "compile_time", app_info.date);
-            cJSON_AddStringToObject(root, "compile_date", app_info.time);
-        } else {
-            cJSON_AddStringToObject(root, "running_version", "unknown");
-        }
         cJSON_AddStringToObject(root, "partition", running->label);
         cJSON_AddNumberToObject(root, "partition_size", running->size);
     }

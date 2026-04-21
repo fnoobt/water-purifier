@@ -218,7 +218,7 @@ esp_err_t mqtt_client_connect(void)
 
     ESP_LOGI(TAG, "连接到MQTT Broker: %s", mqtt_ctx.config.broker_uri);
 
-    // 配置MQTT客户端（ESP-IDF v5.5.2结构）
+    // 配置MQTT客户端
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = mqtt_ctx.config.broker_uri,
         .credentials.username = mqtt_ctx.config.username,

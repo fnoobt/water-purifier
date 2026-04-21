@@ -30,7 +30,7 @@
 - **固件版本**: 1.1.2
 
 ### 技术栈
-- **框架**: ESP-IDF v5.5.2
+- **框架**: ESP-IDF v6.0.0
 - **协议**: WiFi, MQTT (Home Assistant), HTTP, mDNS
 - **数据格式**: JSON
 - **存储**: NVS（非易失性存储）
