@@ -22,6 +22,9 @@ static const char *TAG = "HISTORY";
 #define NVS_NAMESPACE_HISTORY   "history"
 #define NVS_NAMESPACE_DAILY     "daily_stats"
 
+// 最大假日期天数（约3年），超过后循环使用
+#define MAX_BOOT_DAYS           1000
+
 // ==================== 私有变量 ====================
 
 static struct {
@@ -61,20 +64,50 @@ static const char* const event_names[] = {
 
 // ==================== 私有函数 ====================
 
+/**
+ * @brief 生成安全的NVS日期key
+ * @param date_val 日期值（YYYYMMDD格式或boot_day偏移）
+ * @param buffer 输出缓冲区
+ * @param buffer_size 缓冲区大小
+ * @note NTP同步时使用真实日期（9字符），未同步时使用boot_day格式（最多5字符）
+ */
+static void make_date_key(uint32_t date_val, char *buffer, size_t buffer_size)
+{
+    // 真实日期格式：YYYYMMDD（8位数字），key为"dYYYYMMDD"（9字符）
+    // 假日期格式：boot_day偏移（<=MAX_BOOT_DAYS），key为"b%03u"（最多5字符）
+    if (date_val >= 20000101 && date_val <= 20991231) {
+        // 真实日期范围，使用"d"前缀
+        snprintf(buffer, buffer_size, "d%08lu", date_val);
+    } else {
+        // boot_day格式，使用"b"前缀（循环使用防止溢出）
+        uint32_t boot_day = date_val % MAX_BOOT_DAYS;
+        snprintf(buffer, buffer_size, "b%03lu", boot_day);
+    }
+}
+
+/**
+ * @brief 获取今日日期值
+ * @return NTP同步时返回YYYYMMDD格式；未同步时返回boot_day偏移（循环计数）
+ * @note boot_day格式确保NVS key永远不超过5字符，长时间运行安全
+ */
 static uint32_t get_today_date(void)
 {
-    // 返回 YYYYMMDD 格式的日期，确保NVS key不超过15字符
     time_t now = time(NULL);
-    if (now <= 0) {
-        // NTP未同步，使用启动后经过的天数作为临时日期key
-        // 避免写入 d0 导致与真实 1970-01-01 冲突
-        uint64_t uptime_us = esp_timer_get_time();
-        uint32_t days_since_boot = (uint32_t)(uptime_us / 86400000000ULL);
-        return 20260101 + days_since_boot;  // 从2026-01-01开始偏移
+    if (now > 0) {
+        // NTP已同步，使用真实日期
+        struct tm tm_now;
+        localtime_r(&now, &tm_now);
+        // 确保年份在有效范围内（2000-2099）
+        if (tm_now.tm_year >= 100 && tm_now.tm_year < 200) {
+            return (uint32_t)((tm_now.tm_year + 1900) * 10000 +
+                              (tm_now.tm_mon + 1) * 100 + tm_now.tm_mday);
+        }
     }
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-    return (uint32_t)((tm_now.tm_year + 1900) * 10000 + (tm_now.tm_mon + 1) * 100 + tm_now.tm_mday);
+    // NTP未同步或时间异常，使用启动天数计数（循环防止溢出）
+    uint64_t uptime_us = esp_timer_get_time();
+    uint32_t days_since_boot = (uint32_t)(uptime_us / 86400000000ULL);
+    // 循环计数，确保key永远有效
+    return days_since_boot % MAX_BOOT_DAYS;
 }
 
 static void save_to_nvs(void)
@@ -91,8 +124,11 @@ static void save_to_nvs(void)
     // 保存记录数据
     nvs_set_blob(handle, "records", ctx.records, sizeof(ctx.records));
 
-    nvs_commit(handle);
+    esp_err_t err = nvs_commit(handle);
     nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "历史记录NVS提交失败: %s", esp_err_to_name(err));
+    }
 }
 
 static void load_from_nvs(void)
@@ -102,11 +138,23 @@ static void load_from_nvs(void)
         return;
     }
 
-    nvs_get_u32(handle, "count", &ctx.record_count);
-    nvs_get_u32(handle, "index", &ctx.write_index);
+    esp_err_t err;
+    err = nvs_get_u32(handle, "count", &ctx.record_count);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "NVS中无历史记录count，使用默认值");
+    }
+    err = nvs_get_u32(handle, "index", &ctx.write_index);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "NVS中无历史记录index，使用默认值");
+    }
 
     size_t len = sizeof(ctx.records);
-    nvs_get_blob(handle, "records", ctx.records, &len);
+    err = nvs_get_blob(handle, "records", ctx.records, &len);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "NVS中无历史记录blob，使用默认值");
+    } else if (len != sizeof(ctx.records)) {
+        ESP_LOGW(TAG, "历史记录blob大小不匹配: 期望%zu, 实际%zu", sizeof(ctx.records), len);
+    }
 
     nvs_close(handle);
 }
@@ -118,12 +166,15 @@ static void save_daily_to_nvs(void)
         return;
     }
 
-    char key[16];
-    snprintf(key, sizeof(key), "d%lu", ctx.today.date);
+    char key[12];  // 足够容纳 "b999" 或 "d20991231"
+    make_date_key(ctx.today.date, key, sizeof(key));
     nvs_set_blob(handle, key, &ctx.today, sizeof(daily_stats_t));
 
-    nvs_commit(handle);
+    esp_err_t err = nvs_commit(handle);
     nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "每日统计NVS提交失败: %s", esp_err_to_name(err));
+    }
 }
 
 static void load_today_from_nvs(void)
@@ -133,15 +184,17 @@ static void load_today_from_nvs(void)
         return;
     }
 
-    char key[16];
-    snprintf(key, sizeof(key), "d%lu", ctx.today.date);
+    char key[12];
+    make_date_key(ctx.today.date, key, sizeof(key));
 
     size_t len = sizeof(daily_stats_t);
     daily_stats_t loaded;
-    if (nvs_get_blob(handle, key, &loaded, &len) == ESP_OK && loaded.date == ctx.today.date) {
+    if (nvs_get_blob(handle, key, &loaded, &len) == ESP_OK && len == sizeof(daily_stats_t) && loaded.date == ctx.today.date) {
         memcpy(&ctx.today, &loaded, sizeof(daily_stats_t));
         ESP_LOGI(TAG, "加载今日统计: 制水%lu秒, 冲洗%lu次",
                  ctx.today.production_sec, ctx.today.flush_count);
+    } else if (len != sizeof(daily_stats_t)) {
+        ESP_LOGW(TAG, "每日统计blob大小不匹配: 期望%zu, 实际%zu", sizeof(daily_stats_t), len);
     }
 
     nvs_close(handle);
@@ -163,16 +216,25 @@ esp_err_t history_logger_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    // 从NVS加载历史记录
-    memset(ctx.records, 0, sizeof(ctx.records));
-    load_from_nvs();
+    /* 在锁保护下加载数据（确保与其他任务访问一致） */
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memset(ctx.records, 0, sizeof(ctx.records));
+        load_from_nvs();
 
-    // 初始化今日统计：先尝试从NVS加载今日数据
-    memset(&ctx.today, 0, sizeof(daily_stats_t));
-    ctx.today.date = get_today_date();
-    load_today_from_nvs();
+        memset(&ctx.today, 0, sizeof(daily_stats_t));
+        ctx.today.date = get_today_date();
+        load_today_from_nvs();
 
-    ctx.initialized = true;
+        ctx.last_save_time = esp_timer_get_time();
+        ctx.initialized = true;
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        ESP_LOGE(TAG, "获取互斥锁超时");
+        vSemaphoreDelete(ctx.mutex);
+        ctx.mutex = NULL;
+        return ESP_ERR_TIMEOUT;
+    }
+
     ESP_LOGI(TAG, "历史记录模块初始化完成，已有%lu条记录", ctx.record_count);
     return ESP_OK;
 }
@@ -386,9 +448,16 @@ esp_err_t history_update_daily_tds(float tds_in, float tds_out)
         ctx.today.date = today;
     }
 
-    // 更新移动平均
-    ctx.today.tds_sample_count++;
-    float alpha = 1.0f / ctx.today.tds_sample_count;
+    // 更新移动平均（指数平滑）
+    if (ctx.today.tds_sample_count < UINT16_MAX) {
+        ctx.today.tds_sample_count++;
+    }
+    // 计算alpha：当样本数达到上限时，使用固定alpha防止平均值冻结
+    float alpha = 1.0f / (float)ctx.today.tds_sample_count;
+    if (alpha < 0.0005f) {
+        // 样本数超过2000时，使用固定alpha确保平均值仍能响应新数据
+        alpha = 0.0005f;  // 每2000次采样权重为1
+    }
     ctx.today.tds_in_avg = ctx.today.tds_in_avg * (1 - alpha) + tds_in * alpha;
     ctx.today.tds_out_avg = ctx.today.tds_out_avg * (1 - alpha) + tds_out * alpha;
 
@@ -447,19 +516,18 @@ bool history_periodic_save(uint32_t min_interval_sec)
             save_daily_to_nvs();
             // 跨天时重置今日数据
             if (date_changed) {
-                // 如果昨天的key是NTP未同步时的假日期，保存后清除该假key
-                // 避免假日期key残留（如 d20260101）
-                uint32_t yesterday_fake = ctx.today.date;
-                if (yesterday_fake >= 20260101 && yesterday_fake <= 20260200) {
-                    nvs_handle_t erase_handle;
-                    char old_key[16];
-                    snprintf(old_key, sizeof(old_key), "d%lu", yesterday_fake);
-                    if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &erase_handle) == ESP_OK) {
-                        nvs_erase_key(erase_handle, old_key);
-                        nvs_commit(erase_handle);
-                        nvs_close(erase_handle);
-                        ESP_LOGI(TAG, "已清除NTP同步前的假日期key: %s", old_key);
-                    }
+                // 清除旧格式的假日期key（兼容旧固件）
+                // 旧固件使用 d20260101+days 格式，新固件使用 b%03u 格式
+                uint32_t yesterday = ctx.today.date;
+                char old_key[12];
+                // 清除boot_day格式的旧key
+                make_date_key(yesterday, old_key, sizeof(old_key));
+                nvs_handle_t erase_handle;
+                if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &erase_handle) == ESP_OK) {
+                    nvs_erase_key(erase_handle, old_key);
+                    nvs_commit(erase_handle);
+                    nvs_close(erase_handle);
+                    ESP_LOGI(TAG, "已清除昨日key: %s", old_key);
                 }
                 memset(&ctx.today, 0, sizeof(daily_stats_t));
                 ctx.today.date = today;
@@ -467,21 +535,17 @@ bool history_periodic_save(uint32_t min_interval_sec)
             ctx.daily_stats_dirty = false;
             did_save = true;
         } else if (date_changed && !has_data) {
-            // 昨天没有数据，清除脏标志不保存
-            // 但如果昨天的key是假日期，仍需清除
-            uint32_t yesterday_fake = ctx.today.date;
-            if (yesterday_fake >= 20260101 && yesterday_fake <= 20260200) {
-                nvs_handle_t erase_handle;
-                char old_key[16];
-                snprintf(old_key, sizeof(old_key), "d%lu", yesterday_fake);
-                if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &erase_handle) == ESP_OK) {
-                    nvs_erase_key(erase_handle, old_key);
-                    nvs_commit(erase_handle);
-                    nvs_close(erase_handle);
-                    ESP_LOGI(TAG, "已清除无数据假日期key: %s", old_key);
-                }
+            // 昨天没有数据，跳过保存但清除旧key
+            uint32_t yesterday = ctx.today.date;
+            char old_key[12];
+            make_date_key(yesterday, old_key, sizeof(old_key));
+            nvs_handle_t erase_handle;
+            if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &erase_handle) == ESP_OK) {
+                nvs_erase_key(erase_handle, old_key);
+                nvs_commit(erase_handle);
+                nvs_close(erase_handle);
+                ESP_LOGD(TAG, "已清除无数据key: %s", old_key);
             }
-            ESP_LOGD(TAG, "昨日无数据，跳过保存");
             memset(&ctx.today, 0, sizeof(daily_stats_t));
             ctx.today.date = today;
             ctx.daily_stats_dirty = false;
@@ -501,6 +565,10 @@ esp_err_t history_get_today_stats(daily_stats_t *stats)
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     // 检查日期变化
     uint32_t today = get_today_date();
     if (ctx.today.date != today) {
@@ -509,6 +577,7 @@ esp_err_t history_get_today_stats(daily_stats_t *stats)
     }
 
     memcpy(stats, &ctx.today, sizeof(daily_stats_t));
+    xSemaphoreGive(ctx.mutex);
     return ESP_OK;
 }
 
@@ -518,32 +587,42 @@ uint32_t history_get_recent_stats(daily_stats_t *stats, uint32_t max_days)
         return 0;
     }
 
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return 0;
+    }
+
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READONLY, &handle) != ESP_OK) {
-        // 返回今日统计
         memcpy(&stats[0], &ctx.today, sizeof(daily_stats_t));
+        xSemaphoreGive(ctx.mutex);
         return 1;
     }
 
     uint32_t count = 0;
     uint32_t today = get_today_date();
 
-    // 先返回今日统计
+    /* 先返回今日统计 */
     memcpy(&stats[0], &ctx.today, sizeof(daily_stats_t));
     count = 1;
 
-    // 从NVS读取前几天
+    // 从NVS读取前几天（仅在NTP同步时有效，boot_day模式下可能不准确）
     for (uint32_t i = 1; i < max_days && count < max_days; i++) {
-        char key[16];
-        snprintf(key, sizeof(key), "d%lu", (uint32_t)(today - i));
+        char key[12];
+        // 生成前一天的key（boot_day模式下按天数递减）
+        uint32_t prev_date = today - i;
+        make_date_key(prev_date, key, sizeof(key));
 
         size_t len = sizeof(daily_stats_t);
-        if (nvs_get_blob(handle, key, &stats[count], &len) == ESP_OK) {
-            count++;
+        if (nvs_get_blob(handle, key, &stats[count], &len) == ESP_OK && len == sizeof(daily_stats_t)) {
+            // 验证日期匹配（防止读取到错误的记录）
+            if (stats[count].date == prev_date) {
+                count++;
+            }
         }
     }
 
     nvs_close(handle);
+    xSemaphoreGive(ctx.mutex);
     return count;
 }
 

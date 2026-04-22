@@ -10,6 +10,7 @@
 #include "esp_event.h"
 #include "esp_random.h"
 #include "esp_system.h"
+#include "esp_task_wdt.h"  // 任务看门狗
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -25,6 +26,9 @@
 
 // ESP-IDF组件
 #include "cJSON.h"
+
+#define MQTT_MAX_TOPIC_LEN  128
+#define MQTT_MAX_DATA_LEN   1024
 
 // 本地模块头文件
 #include "water_purifier_fsm.h"
@@ -88,20 +92,28 @@ static struct {
     // 回调函数
     app_mqtt_message_callback_t message_callback;
     app_mqtt_connection_callback_t connection_callback;
+
+    // 重连任务
+    TaskHandle_t reconnect_task;
 } mqtt_ctx = {
     .initialized = false,
     .started = false,
     .state = APP_MQTT_STATE_DISCONNECTED,
     .mqtt_client = NULL,
     .message_callback = NULL,
-    .connection_callback = NULL
+    .connection_callback = NULL,
+    .reconnect_task = NULL,
 };
+
+/* 临界保护 spinlock（用于重连任务创建） */
+static portMUX_TYPE mqtt_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 // ==================== 私有函数声明 ====================
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                 int32_t event_id, void *event_data);
 static char* mqtt_get_topic(const char *subtopic, char *buffer, size_t buffer_size);
+static void mqtt_reconnect_task(void *pvParameters);
 
 // ==================== 状态名称字符串 ====================
 
@@ -163,6 +175,10 @@ esp_err_t mqtt_client_stop(void)
         esp_mqtt_client_destroy(mqtt_ctx.mqtt_client);
         mqtt_ctx.mqtt_client = NULL;
     }
+    if (mqtt_ctx.reconnect_task) {
+        vTaskDelete(mqtt_ctx.reconnect_task);
+        mqtt_ctx.reconnect_task = NULL;
+    }
 
     mqtt_ctx.started = false;
     mqtt_ctx.state = APP_MQTT_STATE_DISCONNECTED;
@@ -176,12 +192,32 @@ esp_err_t mqtt_client_set_config(const mqtt_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
 
-    // 将mqtt_config_t转换为app_mqtt_config_t
-    strncpy(mqtt_ctx.config.broker_uri, config->broker_uri, sizeof(mqtt_ctx.config.broker_uri) - 1);
-    strncpy(mqtt_ctx.config.client_id, config->client_id, sizeof(mqtt_ctx.config.client_id) - 1);
-    strncpy(mqtt_ctx.config.username, config->username, sizeof(mqtt_ctx.config.username) - 1);
-    strncpy(mqtt_ctx.config.password, config->password, sizeof(mqtt_ctx.config.password) - 1);
-    strncpy(mqtt_ctx.config.topic_prefix, config->topic_prefix, sizeof(mqtt_ctx.config.topic_prefix) - 1);
+    // 将mqtt_config_t转换为app_mqtt_config_t（安全拷贝，强制null终止）
+    size_t len = strlen(config->broker_uri);
+    memcpy(mqtt_ctx.config.broker_uri, config->broker_uri,
+           (len < sizeof(mqtt_ctx.config.broker_uri) - 1) ? len : sizeof(mqtt_ctx.config.broker_uri) - 1);
+    mqtt_ctx.config.broker_uri[sizeof(mqtt_ctx.config.broker_uri) - 1] = '\0';
+
+    len = strlen(config->client_id);
+    memcpy(mqtt_ctx.config.client_id, config->client_id,
+           (len < sizeof(mqtt_ctx.config.client_id) - 1) ? len : sizeof(mqtt_ctx.config.client_id) - 1);
+    mqtt_ctx.config.client_id[sizeof(mqtt_ctx.config.client_id) - 1] = '\0';
+
+    len = strlen(config->username);
+    memcpy(mqtt_ctx.config.username, config->username,
+           (len < sizeof(mqtt_ctx.config.username) - 1) ? len : sizeof(mqtt_ctx.config.username) - 1);
+    mqtt_ctx.config.username[sizeof(mqtt_ctx.config.username) - 1] = '\0';
+
+    len = strlen(config->password);
+    memcpy(mqtt_ctx.config.password, config->password,
+           (len < sizeof(mqtt_ctx.config.password) - 1) ? len : sizeof(mqtt_ctx.config.password) - 1);
+    mqtt_ctx.config.password[sizeof(mqtt_ctx.config.password) - 1] = '\0';
+
+    len = strlen(config->topic_prefix);
+    memcpy(mqtt_ctx.config.topic_prefix, config->topic_prefix,
+           (len < sizeof(mqtt_ctx.config.topic_prefix) - 1) ? len : sizeof(mqtt_ctx.config.topic_prefix) - 1);
+    mqtt_ctx.config.topic_prefix[sizeof(mqtt_ctx.config.topic_prefix) - 1] = '\0';
+
     mqtt_ctx.config.keepalive = config->keepalive;
     mqtt_ctx.config.retain = config->retain;
     mqtt_ctx.config.qos = config->qos;
@@ -196,12 +232,32 @@ esp_err_t mqtt_client_get_config(mqtt_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
 
-    // 将app_mqtt_config_t转换为mqtt_config_t
-    strncpy(config->broker_uri, mqtt_ctx.config.broker_uri, sizeof(config->broker_uri) - 1);
-    strncpy(config->client_id, mqtt_ctx.config.client_id, sizeof(config->client_id) - 1);
-    strncpy(config->username, mqtt_ctx.config.username, sizeof(config->username) - 1);
-    strncpy(config->password, mqtt_ctx.config.password, sizeof(config->password) - 1);
-    strncpy(config->topic_prefix, mqtt_ctx.config.topic_prefix, sizeof(config->topic_prefix) - 1);
+    // 将app_mqtt_config_t转换为mqtt_config_t（安全拷贝，强制null终止）
+    size_t len = strlen(mqtt_ctx.config.broker_uri);
+    memcpy(config->broker_uri, mqtt_ctx.config.broker_uri,
+           (len < sizeof(config->broker_uri) - 1) ? len : sizeof(config->broker_uri) - 1);
+    config->broker_uri[sizeof(config->broker_uri) - 1] = '\0';
+
+    len = strlen(mqtt_ctx.config.client_id);
+    memcpy(config->client_id, mqtt_ctx.config.client_id,
+           (len < sizeof(config->client_id) - 1) ? len : sizeof(config->client_id) - 1);
+    config->client_id[sizeof(config->client_id) - 1] = '\0';
+
+    len = strlen(mqtt_ctx.config.username);
+    memcpy(config->username, mqtt_ctx.config.username,
+           (len < sizeof(config->username) - 1) ? len : sizeof(config->username) - 1);
+    config->username[sizeof(config->username) - 1] = '\0';
+
+    len = strlen(mqtt_ctx.config.password);
+    memcpy(config->password, mqtt_ctx.config.password,
+           (len < sizeof(config->password) - 1) ? len : sizeof(config->password) - 1);
+    config->password[sizeof(config->password) - 1] = '\0';
+
+    len = strlen(mqtt_ctx.config.topic_prefix);
+    memcpy(config->topic_prefix, mqtt_ctx.config.topic_prefix,
+           (len < sizeof(config->topic_prefix) - 1) ? len : sizeof(config->topic_prefix) - 1);
+    config->topic_prefix[sizeof(config->topic_prefix) - 1] = '\0';
+
     config->keepalive = mqtt_ctx.config.keepalive;
     config->retain = mqtt_ctx.config.retain;
     config->qos = mqtt_ctx.config.qos;
@@ -296,23 +352,16 @@ esp_err_t mqtt_publish_purifier_status(void)
     tds_dual_measurement_t dual_tds;
     bool has_tds = (tds_sensor_get_latest_dual(&dual_tds) == ESP_OK && dual_tds.both_valid);
 
-    cJSON *root = cJSON_CreateObject();
-    cJSON *status = cJSON_CreateString(state_name);
-    cJSON *tds_in = cJSON_CreateNumber(has_tds ? dual_tds.inlet.tds_value : 0);
-    cJSON *tds_out = cJSON_CreateNumber(has_tds ? dual_tds.outlet.tds_value : 0);
-    cJSON *tds_reduction = cJSON_CreateNumber(has_tds ? dual_tds.reduction_rate : 0);
+    // 使用静态缓冲区避免 cJSON_PrintUnformatted 的堆分配
+    static char json_buf[256];
+    snprintf(json_buf, sizeof(json_buf),
+             "{\"state\":\"%s\",\"tds_in\":%.1f,\"tds_out\":%.1f,\"tds_reduction_rate\":%.1f}",
+             state_name,
+             has_tds ? dual_tds.inlet.tds_value : 0,
+             has_tds ? dual_tds.outlet.tds_value : 0,
+             has_tds ? dual_tds.reduction_rate : 0);
 
-    cJSON_AddItemToObject(root, "state", status);
-    cJSON_AddItemToObject(root, "tds_in", tds_in);
-    cJSON_AddItemToObject(root, "tds_out", tds_out);
-    cJSON_AddItemToObject(root, "tds_reduction_rate", tds_reduction);
-
-    char *json_str = cJSON_PrintUnformatted(root);
-    esp_err_t ret = mqtt_client_publish("purifier/status", json_str, strlen(json_str), 0, true);
-    free(json_str);
-    cJSON_Delete(root);
-
-    return ret;
+    return mqtt_client_publish("purifier/status", json_buf, strlen(json_buf), 0, true);
 }
 
 esp_err_t mqtt_publish_tds_value(void)
@@ -322,17 +371,12 @@ esp_err_t mqtt_publish_tds_value(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, "tds_in", cJSON_CreateNumber(dual_tds.inlet.tds_value));
-    cJSON_AddItemToObject(root, "tds_out", cJSON_CreateNumber(dual_tds.outlet.tds_value));
-    cJSON_AddItemToObject(root, "tds_reduction_rate", cJSON_CreateNumber(dual_tds.reduction_rate));
+    static char json_buf[128];
+    snprintf(json_buf, sizeof(json_buf),
+             "{\"tds_in\":%.1f,\"tds_out\":%.1f,\"tds_reduction_rate\":%.1f}",
+             dual_tds.inlet.tds_value, dual_tds.outlet.tds_value, dual_tds.reduction_rate);
 
-    char *json_str = cJSON_PrintUnformatted(root);
-    esp_err_t ret = mqtt_client_publish("sensor/tds", json_str, strlen(json_str), 0, true);
-    free(json_str);
-    cJSON_Delete(root);
-
-    return ret;
+    return mqtt_client_publish("sensor/tds", json_buf, strlen(json_buf), 0, true);
 }
 
 esp_err_t mqtt_publish_system_status(void)
@@ -340,17 +384,13 @@ esp_err_t mqtt_publish_system_status(void)
     uint32_t free_heap = esp_get_free_heap_size();
     uint32_t uptime = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
 
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, "free_heap", cJSON_CreateNumber(free_heap));
-    cJSON_AddItemToObject(root, "uptime", cJSON_CreateNumber(uptime));
-    cJSON_AddItemToObject(root, "wifi_connected", cJSON_CreateBool(wifi_manager_is_connected()));
+    static char json_buf[128];
+    snprintf(json_buf, sizeof(json_buf),
+             "{\"free_heap\":%lu,\"uptime\":%lu,\"wifi_connected\":%s}",
+             (unsigned long)free_heap, (unsigned long)uptime,
+             wifi_manager_is_connected() ? "true" : "false");
 
-    char *json_str = cJSON_PrintUnformatted(root);
-    esp_err_t ret = mqtt_client_publish("system/status", json_str, strlen(json_str), 0, true);
-    free(json_str);
-    cJSON_Delete(root);
-
-    return ret;
+    return mqtt_client_publish("system/status", json_buf, strlen(json_buf), 0, true);
 }
 
 // ==================== 订阅接口 ====================
@@ -439,6 +479,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT已连接");
             mqtt_ctx.state = APP_MQTT_STATE_CONNECTED;
+            /* 临界保护清除重连任务句柄（避免与断开事件竞态） */
+            taskENTER_CRITICAL(&mqtt_spinlock);
+            mqtt_ctx.reconnect_task = NULL;
+            taskEXIT_CRITICAL(&mqtt_spinlock);
             if (mqtt_ctx.connection_callback) {
                 mqtt_ctx.connection_callback(true);
             }
@@ -446,17 +490,30 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             break;
 
         case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "MQTT已断开");
+            ESP_LOGW(TAG, "MQTT已断开，启动自动重连");
             mqtt_ctx.state = APP_MQTT_STATE_DISCONNECTED;
             if (mqtt_ctx.connection_callback) {
                 mqtt_ctx.connection_callback(false);
             }
+            /* 启动重连任务（临界保护防止多任务重复创建） */
+            taskENTER_CRITICAL(&mqtt_spinlock);
+            if (mqtt_ctx.reconnect_task == NULL) {
+                BaseType_t ret = xTaskCreate(mqtt_reconnect_task, "mqtt_recon", 3072, NULL, 4, &mqtt_ctx.reconnect_task);
+                if (ret != pdPASS) {
+                    ESP_LOGE(TAG, "创建MQTT重连任务失败");
+                }
+            }
+            taskEXIT_CRITICAL(&mqtt_spinlock);
             break;
 
         case MQTT_EVENT_DATA:
-            if (event->data_len > 0) {
-                char topic[event->topic_len + 1];
-                char data[event->data_len + 1];
+            if (event->data_len > 0 && event->topic_len > 0) {
+                if (event->topic_len > MQTT_MAX_TOPIC_LEN || event->data_len > MQTT_MAX_DATA_LEN) {
+                    ESP_LOGW(TAG, "MQTT消息过大，丢弃 (topic=%d, data=%d)", event->topic_len, event->data_len);
+                    break;
+                }
+                char topic[MQTT_MAX_TOPIC_LEN + 1];
+                char data[MQTT_MAX_DATA_LEN + 1];
                 memcpy(topic, event->topic, event->topic_len);
                 topic[event->topic_len] = '\0';
                 memcpy(data, event->data, event->data_len);
@@ -651,16 +708,19 @@ esp_err_t mqtt_send_ha_discovery(void)
 
 esp_err_t mqtt_send_ha_sensor_config(const char *sensor_name, const char *sensor_type, const char *unit)
 {
-    char topic[128], discovery_msg[512];
+    char topic[128], discovery_msg[512], state_topic[128];
     char value_template[64];
 
     snprintf(topic, sizeof(topic), "homeassistant/sensor/water_purifier/%s/config", sensor_name);
     snprintf(value_template, sizeof(value_template), "{{ value_json.%s }}", sensor_type);
 
+    // 使用配置的topic前缀构建state_topic
+    mqtt_get_topic("state", state_topic, sizeof(state_topic));
+
     cJSON *root = cJSON_CreateObject();
     cJSON_AddItemToObject(root, "name", cJSON_CreateString(sensor_name));
     cJSON_AddItemToObject(root, "unique_id", cJSON_CreateString(topic));
-    cJSON_AddItemToObject(root, "state_topic", cJSON_CreateString("homeassistant/water_purifier/sensor/tds_in"));
+    cJSON_AddItemToObject(root, "state_topic", cJSON_CreateString(state_topic));
     cJSON_AddItemToObject(root, "value_template", cJSON_CreateString(value_template));
     if (unit) {
         cJSON_AddItemToObject(root, "unit_of_measurement", cJSON_CreateString(unit));
@@ -669,7 +729,7 @@ esp_err_t mqtt_send_ha_sensor_config(const char *sensor_name, const char *sensor
 
     char *json_str = cJSON_PrintUnformatted(root);
     snprintf(discovery_msg, sizeof(discovery_msg), "%s", json_str);
-    cJSON_free(json_str);
+    free(json_str);
     cJSON_Delete(root);
 
     return mqtt_client_publish(topic, discovery_msg, strlen(discovery_msg), 0, true);
@@ -677,15 +737,19 @@ esp_err_t mqtt_send_ha_sensor_config(const char *sensor_name, const char *sensor
 
 esp_err_t mqtt_send_ha_switch_config(const char *switch_name)
 {
-    char topic[128], discovery_msg[512];
+    char topic[128], discovery_msg[512], state_topic[128], command_topic[128];
 
     snprintf(topic, sizeof(topic), "homeassistant/switch/water_purifier/%s/config", switch_name);
+
+    // 使用配置的topic前缀构建state_topic和command_topic
+    mqtt_get_topic("state", state_topic, sizeof(state_topic));
+    mqtt_get_topic("set/state", command_topic, sizeof(command_topic));
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddItemToObject(root, "name", cJSON_CreateString(switch_name));
     cJSON_AddItemToObject(root, "unique_id", cJSON_CreateString(topic));
-    cJSON_AddItemToObject(root, "command_topic", cJSON_CreateString("homeassistant/water_purifier/set/state"));
-    cJSON_AddItemToObject(root, "state_topic", cJSON_CreateString("homeassistant/water_purifier/state"));
+    cJSON_AddItemToObject(root, "command_topic", cJSON_CreateString(command_topic));
+    cJSON_AddItemToObject(root, "state_topic", cJSON_CreateString(state_topic));
     cJSON_AddItemToObject(root, "payload_on", cJSON_CreateString("producing"));
     cJSON_AddItemToObject(root, "payload_off", cJSON_CreateString("idle"));
 
@@ -718,4 +782,100 @@ void mqtt_client_print_info(void)
     char status[256];
     mqtt_client_get_status(status, sizeof(status));
     ESP_LOGI(TAG, "%s", status);
+}
+
+/**
+ * @brief MQTT自动重连任务
+ *
+ * 策略：指数退避重连（1s→2s→4s→8s→16s→30s），连接成功后自动退出
+ */
+static void mqtt_reconnect_task(void *pvParameters)
+{
+    int retry = 0;
+    const int max_retries = 20;
+    const TickType_t delays[] = {
+        pdMS_TO_TICKS(1000),
+        pdMS_TO_TICKS(2000),
+        pdMS_TO_TICKS(4000),
+        pdMS_TO_TICKS(8000),
+        pdMS_TO_TICKS(16000),
+        pdMS_TO_TICKS(30000),
+    };
+    const int delay_count = sizeof(delays) / sizeof(delays[0]);
+
+    ESP_LOGI(TAG, "MQTT重连任务启动");
+
+    // 注册看门狗
+    esp_task_wdt_add(NULL);
+
+    // 首先检查WiFi是否已连接，避免无WiFi时浪费资源
+    if (!wifi_manager_is_connected()) {
+        ESP_LOGW(TAG, "WiFi未连接，MQTT重连任务提前退出");
+        esp_task_wdt_delete(NULL);
+        mqtt_ctx.reconnect_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (retry < max_retries) {
+        TickType_t delay = delays[(retry < delay_count) ? retry : delay_count - 1];
+        esp_task_wdt_reset();  // 长延迟前重置看门狗
+        vTaskDelay(delay);
+
+        // 每次重试前检查WiFi状态
+        if (!wifi_manager_is_connected()) {
+            ESP_LOGW(TAG, "WiFi连接断开，暂停MQTT重连");
+            esp_task_wdt_delete(NULL);
+            mqtt_ctx.reconnect_task = NULL;
+            vTaskDelete(NULL);
+            return;
+        }
+
+        if (mqtt_client_is_connected()) {
+            ESP_LOGI(TAG, "重连期间已恢复连接，取消重连任务");
+            break;
+        }
+
+        if (!mqtt_ctx.started) {
+            ESP_LOGI(TAG, "MQTT已停止，取消重连任务");
+            break;
+        }
+
+        if (mqtt_ctx.mqtt_client == NULL) {
+            ESP_LOGW(TAG, "MQTT客户端为空，重新初始化");
+            esp_err_t conn_ret = mqtt_client_connect();
+            if (conn_ret != ESP_OK) {
+                ESP_LOGE(TAG, "MQTT连接初始化失败: %s", esp_err_to_name(conn_ret));
+                retry++;
+                continue;
+            }
+        } else {
+            ESP_LOGI(TAG, "尝试MQTT重连 %d/%d", retry + 1, max_retries);
+            esp_err_t ret = esp_mqtt_client_start(mqtt_ctx.mqtt_client);
+            if (ret == ESP_OK) {
+                /* 等待连接成功或超时，最多等待5秒 */
+                for (int wait = 0; wait < 50; wait++) {
+                    esp_task_wdt_reset();  // 每100ms重置看门狗
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    if (mqtt_client_is_connected()) {
+                        ESP_LOGI(TAG, "MQTT重连成功");
+                        break;
+                    }
+                }
+                if (!mqtt_client_is_connected()) {
+                    esp_mqtt_client_disconnect(mqtt_ctx.mqtt_client);
+                }
+            }
+        }
+
+        retry++;
+    }
+
+    if (retry >= max_retries && !mqtt_client_is_connected()) {
+        ESP_LOGE(TAG, "MQTT重连失败，已达最大重试次数");
+    }
+
+    esp_task_wdt_delete(NULL);  // 任务结束前注销看门狗
+    mqtt_ctx.reconnect_task = NULL;
+    vTaskDelete(NULL);
 }

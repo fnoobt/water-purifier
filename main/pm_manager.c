@@ -10,6 +10,10 @@
 #include "esp_wifi.h"
 #include "esp_system.h"
 
+// 外部模块声明（用于重启前同步NVS）
+extern esp_err_t config_manager_save(void);
+extern bool config_manager_periodic_save_all(uint32_t min_interval_sec);
+
 static const char *TAG = "PM";
 
 // ==================== 状态 ====================
@@ -34,22 +38,24 @@ esp_err_t pm_manager_init(void)
     ESP_LOGI(TAG, "初始化电源管理...");
 
     // 启用DFS（动态频率调节），最小80MHz，最大160MHz
+    // ESP32-C3不支持light sleep，必须设置为false
     esp_pm_config_t pm_cfg = {
         .max_freq_mhz = 160,
         .min_freq_mhz = 80,
-        .light_sleep_enable = false,
+        .light_sleep_enable = false,  // ESP32-C3不支持light sleep
     };
     esp_err_t ret = esp_pm_configure(&pm_cfg);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "电源管理配置失败: %s", esp_err_to_name(ret));
-        return ret;
+        // 不返回错误，继续初始化其他部分（电源管理可选）
     }
 
     // 创建CPU频率锁（用于强制保持160MHz）
-    ret = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "cpu_freq", &s_ctx.cpu_freq_lock);
+    // ESP32-C3使用ESP_PM_APB_FREQ_MAX锁保持高频
+    ret = esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "cpu_freq", &s_ctx.cpu_freq_lock);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "CPU频率锁创建失败: %s", esp_err_to_name(ret));
-        return ret;
+        // 继续初始化，频率锁可选
     }
 
     // 初始不持有锁，让DFS自动管理（空闲时会降到80MHz）
@@ -59,7 +65,7 @@ esp_err_t pm_manager_init(void)
     s_ctx.current_wifi_tx_power = 78;  // 19.5dBm
     s_ctx.wifi_tx_adjusted = false;
 
-    ESP_LOGI(TAG, "电源管理已启用: DFS 80MHz~160MHz");
+    ESP_LOGI(TAG, "电源管理已启用: DFS 80MHz~160MHz (C3无light sleep)");
     s_ctx.initialized = true;
     return ESP_OK;
 }
@@ -172,6 +178,9 @@ esp_err_t pm_manager_check_heap(void)
     if (free_heap < 15360) {
         ESP_LOGE(TAG, "堆内存严重不足! 可用=%u bytes, 历史最低=%u bytes, 即将重启",
                  (unsigned)free_heap, (unsigned)min_ever_heap);
+        // 重启前尝试保存待写入的NVS数据（统一保存）
+        config_manager_save();  // 系统配置
+        config_manager_periodic_save_all(0);  // 滤芯+历史记录
         esp_restart();
         // 不会执行到这里
         return ESP_ERR_NO_MEM;

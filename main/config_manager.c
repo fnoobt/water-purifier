@@ -5,8 +5,11 @@
 
 #include "config_manager.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <string.h>
 
 static const char *TAG = "CONFIG";
@@ -60,9 +63,11 @@ static struct {
     bool initialized;
     bool config_dirty;
     system_config_t config;
+    SemaphoreHandle_t mutex;  // 保护config和dirty标志的并发访问
 } ctx = {
     .initialized = false,
     .config_dirty = false,
+    .mutex = NULL,
 };
 
 // ==================== 初始化 ====================
@@ -85,6 +90,13 @@ esp_err_t config_manager_init(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "NVS初始化失败: %s", esp_err_to_name(ret));
         return ret;
+    }
+
+    // 创建互斥锁（保护config和dirty标志）
+    ctx.mutex = xSemaphoreCreateMutex();
+    if (!ctx.mutex) {
+        ESP_LOGE(TAG, "创建互斥锁失败");
+        return ESP_ERR_NO_MEM;
     }
 
     // 检测NVS中是否存在超长key，仅在确认超长key时才擦除
@@ -139,8 +151,10 @@ esp_err_t config_manager_load(void)
     // WiFi配置
     len = sizeof(ctx.config.wifi_ssid);
     nvs_get_str(handle, "wifi_ssid", ctx.config.wifi_ssid, &len);
+    ctx.config.wifi_ssid[sizeof(ctx.config.wifi_ssid) - 1] = '\0';
     len = sizeof(ctx.config.wifi_password);
     nvs_get_str(handle, "wifi_pass", ctx.config.wifi_password, &len);
+    ctx.config.wifi_password[sizeof(ctx.config.wifi_password) - 1] = '\0';
 
     // MQTT配置
     uint8_t u8_val;
@@ -159,14 +173,24 @@ esp_err_t config_manager_load(void)
         ctx.config.tank_size = u8_val;
     }
 
-    len = sizeof(ctx.config.mqtt_broker);
-    nvs_get_str(handle, "mqtt_broker", ctx.config.mqtt_broker, &len);
-    len = sizeof(ctx.config.mqtt_username);
-    nvs_get_str(handle, "mqtt_user", ctx.config.mqtt_username, &len);
-    len = sizeof(ctx.config.mqtt_password);
-    nvs_get_str(handle, "mqtt_pass", ctx.config.mqtt_password, &len);
-    len = sizeof(ctx.config.mqtt_topic_prefix);
-    nvs_get_str(handle, "mqtt_topic", ctx.config.mqtt_topic_prefix, &len);
+    char str_buf[128];
+
+    len = sizeof(str_buf);
+    if (nvs_get_str(handle, "mqtt_broker", str_buf, &len) == ESP_OK) {
+        strlcpy(ctx.config.mqtt_broker, str_buf, sizeof(ctx.config.mqtt_broker));
+    }
+    len = sizeof(str_buf);
+    if (nvs_get_str(handle, "mqtt_user", str_buf, &len) == ESP_OK) {
+        strlcpy(ctx.config.mqtt_username, str_buf, sizeof(ctx.config.mqtt_username));
+    }
+    len = sizeof(str_buf);
+    if (nvs_get_str(handle, "mqtt_pass", str_buf, &len) == ESP_OK) {
+        strlcpy(ctx.config.mqtt_password, str_buf, sizeof(ctx.config.mqtt_password));
+    }
+    len = sizeof(str_buf);
+    if (nvs_get_str(handle, "mqtt_topic", str_buf, &len) == ESP_OK) {
+        strlcpy(ctx.config.mqtt_topic_prefix, str_buf, sizeof(ctx.config.mqtt_topic_prefix));
+    }
 
     // 系统参数
     nvs_get_u32(handle, "flush_dur", &ctx.config.flush_duration_sec);
@@ -230,8 +254,10 @@ esp_err_t config_manager_load(void)
     }
     len = sizeof(ctx.config.web_username);
     nvs_get_str(handle, "web_user", ctx.config.web_username, &len);
+    ctx.config.web_username[sizeof(ctx.config.web_username) - 1] = '\0';
     len = sizeof(ctx.config.web_password);
     nvs_get_str(handle, "web_pass", ctx.config.web_password, &len);
+    ctx.config.web_password[sizeof(ctx.config.web_password) - 1] = '\0';
 
     nvs_close(handle);
     ctx.config_dirty = false;
@@ -241,7 +267,16 @@ esp_err_t config_manager_load(void)
 
 esp_err_t config_manager_save(void)
 {
-    if (!ctx.config_dirty) {
+    // 使用mutex保护dirty标志检查
+    bool is_dirty = false;
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        is_dirty = ctx.config_dirty;
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        is_dirty = ctx.config_dirty;  // 降级处理
+    }
+
+    if (!is_dirty) {
         return ESP_OK;  // 无变化，跳过保存
     }
 
@@ -252,65 +287,85 @@ esp_err_t config_manager_save(void)
         return err;
     }
 
+    // 使用mutex保护配置读取（复制一份用于写入）
+    system_config_t config_copy;
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memcpy(&config_copy, &ctx.config, sizeof(system_config_t));
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        /* mutex获取失败，拒绝保存以避免写入不一致数据 */
+        ESP_LOGE(TAG, "save: mutex获取超时，拒绝保存避免数据不一致");
+        nvs_close(handle);
+        return ESP_ERR_TIMEOUT;
+    }
+
     // WiFi配置
-    nvs_set_str(handle, "wifi_ssid", ctx.config.wifi_ssid);
-    nvs_set_str(handle, "wifi_pass", ctx.config.wifi_password);
+    nvs_set_str(handle, "wifi_ssid", config_copy.wifi_ssid);
+    nvs_set_str(handle, "wifi_pass", config_copy.wifi_password);
 
     // MQTT配置
-    nvs_set_u8(handle, "mqtt_en", ctx.config.mqtt_enabled);
-    nvs_set_u8(handle, "ro_mem", ctx.config.ro_membrane_type);
-    nvs_set_u8(handle, "pump", ctx.config.pump_type);
-    nvs_set_u8(handle, "tank", ctx.config.tank_size);
-    nvs_set_str(handle, "mqtt_broker", ctx.config.mqtt_broker);
-    nvs_set_str(handle, "mqtt_user", ctx.config.mqtt_username);
-    nvs_set_str(handle, "mqtt_pass", ctx.config.mqtt_password);
-    nvs_set_str(handle, "mqtt_topic", ctx.config.mqtt_topic_prefix);
+    nvs_set_u8(handle, "mqtt_en", config_copy.mqtt_enabled);
+    nvs_set_u8(handle, "ro_mem", config_copy.ro_membrane_type);
+    nvs_set_u8(handle, "pump", config_copy.pump_type);
+    nvs_set_u8(handle, "tank", config_copy.tank_size);
+    nvs_set_str(handle, "mqtt_broker", config_copy.mqtt_broker);
+    nvs_set_str(handle, "mqtt_user", config_copy.mqtt_username);
+    nvs_set_str(handle, "mqtt_pass", config_copy.mqtt_password);
+    nvs_set_str(handle, "mqtt_topic", config_copy.mqtt_topic_prefix);
 
     // 系统参数
-    nvs_set_u32(handle, "flush_dur", ctx.config.flush_duration_sec);
-    nvs_set_u32(handle, "prod_timeout", ctx.config.production_timeout_sec);
-    nvs_set_u32(handle, "leak_confirm", ctx.config.leak_confirm_time_sec);
+    nvs_set_u32(handle, "flush_dur", config_copy.flush_duration_sec);
+    nvs_set_u32(handle, "prod_timeout", config_copy.production_timeout_sec);
+    nvs_set_u32(handle, "leak_confirm", config_copy.leak_confirm_time_sec);
 
     // 冲洗参数
-    nvs_set_u32(handle, "nflush_dur", ctx.config.normal_flush_duration_sec);
-    nvs_set_u32(handle, "pflush_dur", ctx.config.pure_flush_duration_sec);
-    nvs_set_u32(handle, "fflush_dur", ctx.config.filter_flush_duration_sec);
-    nvs_set_u32(handle, "short_prod", ctx.config.short_prod_threshold_sec);
-    nvs_set_u32(handle, "wh_vopn", ctx.config.water_hammer_valve_open_delay_ms);
-    nvs_set_u32(handle, "wh_pstp", ctx.config.water_hammer_pump_stop_delay_ms);
-    nvs_set_u32(handle, "wh_vcls", ctx.config.water_hammer_valve_close_delay_ms);
+    nvs_set_u32(handle, "nflush_dur", config_copy.normal_flush_duration_sec);
+    nvs_set_u32(handle, "pflush_dur", config_copy.pure_flush_duration_sec);
+    nvs_set_u32(handle, "fflush_dur", config_copy.filter_flush_duration_sec);
+    nvs_set_u32(handle, "short_prod", config_copy.short_prod_threshold_sec);
+    nvs_set_u32(handle, "wh_vopn", config_copy.water_hammer_valve_open_delay_ms);
+    nvs_set_u32(handle, "wh_pstp", config_copy.water_hammer_pump_stop_delay_ms);
+    nvs_set_u32(handle, "wh_vcls", config_copy.water_hammer_valve_close_delay_ms);
 
     // 继电器配置
-    nvs_set_u8(handle, "relay_lvl", ctx.config.relay_trigger_level);
+    nvs_set_u8(handle, "relay_lvl", config_copy.relay_trigger_level);
 
     // 运行数据保存间隔
-    nvs_set_u16(handle, "save_intv", ctx.config.runtime_save_interval_min);
+    nvs_set_u16(handle, "save_intv", config_copy.runtime_save_interval_min);
 
     // TDS配置
-    nvs_set_u32(handle, "tds_in_th", (uint32_t)ctx.config.tds_inlet_threshold);
-    nvs_set_u32(handle, "tds_out_th", (uint32_t)ctx.config.tds_outlet_threshold);
+    nvs_set_u32(handle, "tds_in_th", (uint32_t)config_copy.tds_inlet_threshold);
+    nvs_set_u32(handle, "tds_out_th", (uint32_t)config_copy.tds_outlet_threshold);
 
     // TDS校准
-    nvs_set_i32(handle, "tds_in_off", (int32_t)(ctx.config.tds_calibration_offset[0] * 100));
-    nvs_set_i32(handle, "tds_out_off", (int32_t)(ctx.config.tds_calibration_offset[1] * 100));
-    nvs_set_i32(handle, "tds_in_scale", (int32_t)(ctx.config.tds_calibration_scale[0] * 10000));
-    nvs_set_i32(handle, "tds_out_scale", (int32_t)(ctx.config.tds_calibration_scale[1] * 10000));
+    nvs_set_i32(handle, "tds_in_off", (int32_t)(config_copy.tds_calibration_offset[0] * 100));
+    nvs_set_i32(handle, "tds_out_off", (int32_t)(config_copy.tds_calibration_offset[1] * 100));
+    nvs_set_i32(handle, "tds_in_scale", (int32_t)(config_copy.tds_calibration_scale[0] * 10000));
+    nvs_set_i32(handle, "tds_out_scale", (int32_t)(config_copy.tds_calibration_scale[1] * 10000));
 
     // 滤芯容量
-    nvs_set_u32(handle, "filter_cap", ctx.config.filter_capacity_liters);
+    nvs_set_u32(handle, "filter_cap", config_copy.filter_capacity_liters);
 
     // Web配置
-    nvs_set_u16(handle, "web_port", ctx.config.web_port);
-    nvs_set_u8(handle, "web_auth", ctx.config.web_auth_enabled);
-    nvs_set_str(handle, "web_user", ctx.config.web_username);
-    nvs_set_str(handle, "web_pass", ctx.config.web_password);
+    nvs_set_u16(handle, "web_port", config_copy.web_port);
+    nvs_set_u8(handle, "web_auth", config_copy.web_auth_enabled);
+    nvs_set_str(handle, "web_user", config_copy.web_username);
+    nvs_set_str(handle, "web_pass", config_copy.web_password);
 
     err = nvs_commit(handle);
     nvs_close(handle);
 
-    if (err == ESP_OK) {
-        ctx.config_dirty = false;
-        ESP_LOGI(TAG, "配置已保存");
+    // 使用mutex保护脏标志清除
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (err == ESP_OK) {
+            ctx.config_dirty = false;
+            ESP_LOGI(TAG, "配置已保存");
+        }
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        if (err == ESP_OK) {
+            ctx.config_dirty = false;
+        }
     }
     return err;
 }
@@ -319,18 +374,44 @@ esp_err_t config_manager_factory_reset(void)
 {
     ESP_LOGW(TAG, "恢复出厂配置");
 
-    memcpy(&ctx.config, &default_config, sizeof(system_config_t));
-    ctx.config_dirty = true;  // 标记为脏，以便下次保存
+    // 使用mutex保护配置重置
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memcpy(&ctx.config, &default_config, sizeof(system_config_t));
+        ctx.config_dirty = true;  // 标记为脏，以便下次保存
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        // 降级处理
+        memcpy(&ctx.config, &default_config, sizeof(system_config_t));
+        ctx.config_dirty = true;
+        ESP_LOGW(TAG, "factory_reset: mutex获取失败");
+    }
 
     nvs_handle_t handle;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_erase_all(handle);
-        nvs_commit(handle);
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        err = nvs_erase_all(handle);
+        if (err == ESP_OK) {
+            err = nvs_commit(handle);
+        }
         nvs_close(handle);
     }
 
-    ctx.config_dirty = false;  // NVS已擦除，清除脏标志
-    return ESP_OK;
+    // 使用mutex保护脏标志更新
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (err == ESP_OK) {
+            ctx.config_dirty = false;  // NVS已擦除，清除脏标志
+            ESP_LOGI(TAG, "出厂配置恢复成功");
+        } else {
+            ESP_LOGE(TAG, "出厂重置失败: %s，内存配置已更新但NVS未擦除", esp_err_to_name(err));
+            // 保持dirty标志为true，因为内存与NVS不一致
+        }
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        if (err == ESP_OK) {
+            ctx.config_dirty = false;
+        }
+    }
+    return err;  // 返回实际错误状态
 }
 
 // ==================== 运行数据持久化 ====================
@@ -405,7 +486,17 @@ esp_err_t config_manager_get_config(system_config_t *config)
     if (!config) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    // 使用mutex保护配置读取
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        memcpy(config, &ctx.config, sizeof(system_config_t));
+        xSemaphoreGive(ctx.mutex);
+        return ESP_OK;
+    }
+
+    // 互斥锁获取失败时降级处理（仍返回数据但可能不一致）
     memcpy(config, &ctx.config, sizeof(system_config_t));
+    ESP_LOGW(TAG, "get_config: mutex获取失败，返回潜在不一致数据");
     return ESP_OK;
 }
 
@@ -414,11 +505,30 @@ esp_err_t config_manager_set_config(const system_config_t *config)
     if (!config) {
         return ESP_ERR_INVALID_ARG;
     }
-    // 仅在值发生变化时标记为脏
+
+    // 验证配置值的有效性
+    if (!config_manager_validate(config)) {
+        ESP_LOGW(TAG, "set_config: 配置值无效，拒绝更新");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 使用mutex保护配置更新
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        // 仅在值发生变化时标记为脏
+        if (memcmp(&ctx.config, config, sizeof(system_config_t)) != 0) {
+            memcpy(&ctx.config, config, sizeof(system_config_t));
+            ctx.config_dirty = true;
+        }
+        xSemaphoreGive(ctx.mutex);
+        return ESP_OK;
+    }
+
+    // 互斥锁获取失败时降级处理
     if (memcmp(&ctx.config, config, sizeof(system_config_t)) != 0) {
         memcpy(&ctx.config, config, sizeof(system_config_t));
         ctx.config_dirty = true;
     }
+    ESP_LOGW(TAG, "set_config: mutex获取失败，配置已更新但可能有竞态");
     return ESP_OK;
 }
 
@@ -440,41 +550,81 @@ esp_err_t config_manager_get_string(const char *key, char *value, size_t value_s
     return err;
 }
 
+/**
+ * @brief 根据key更新内存中的配置字段
+ */
+static void update_config_from_key(const char *key, const char *value, bool *changed)
+{
+    *changed = false;
+#define UPDATE_STR_FIELD(fld) do { \
+    if (strcmp(key, #fld) == 0 && strcmp(ctx.config.fld, value) != 0) { \
+        strlcpy(ctx.config.fld, value, sizeof(ctx.config.fld)); \
+        *changed = true; \
+    } \
+} while (0)
+
+    UPDATE_STR_FIELD(wifi_ssid);
+    UPDATE_STR_FIELD(wifi_password);
+    UPDATE_STR_FIELD(mqtt_broker);
+    UPDATE_STR_FIELD(mqtt_username);
+    UPDATE_STR_FIELD(mqtt_password);
+    UPDATE_STR_FIELD(mqtt_topic_prefix);
+    UPDATE_STR_FIELD(web_username);
+    UPDATE_STR_FIELD(web_password);
+
+#undef UPDATE_STR_FIELD
+}
+
 esp_err_t config_manager_set_string(const char *key, const char *value)
 {
     if (!key || !value) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    // 优化：一次READWRITE打开完成读写，避免两次打开
     nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
-        goto do_write;
+        return err;
     }
 
-    // 读取现有值，比较是否变化
+    // 在同一个handle中读取现有值，比较是否变化
     size_t cur_len = 0;
     err = nvs_get_str(handle, key, NULL, &cur_len);
+    bool value_changed = true;  // 默认假设值已变化
     if (err == ESP_OK && cur_len > 0) {
         char *cur_val = malloc(cur_len);
         if (cur_val) {
             err = nvs_get_str(handle, key, cur_val, &cur_len);
             if (err == ESP_OK && strcmp(cur_val, value) == 0) {
-                free(cur_val);
-                nvs_close(handle);
-                return ESP_OK;  // 值未变化，不写入
+                value_changed = false;  // 值未变化
             }
             free(cur_val);
         }
     }
-    nvs_close(handle);
 
-do_write:
-    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        return err;
+    // 值未变化时直接关闭handle返回，避免不必要的写入
+    if (!value_changed) {
+        nvs_close(handle);
+        return ESP_OK;
     }
 
+    // 先更新内存配置（使用mutex保护，失败时返回错误避免竞态）
+    bool mem_changed = false;
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        update_config_from_key(key, value, &mem_changed);
+        if (mem_changed) {
+            ctx.config_dirty = true;
+        }
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        // mutex获取失败：关闭NVS handle并返回错误，避免竞态条件
+        nvs_close(handle);
+        ESP_LOGE(TAG, "set_string: mutex获取失败，拒绝更新以避免竞态");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    // 写入NVS（handle已打开）
     err = nvs_set_str(handle, key, value);
     if (err == ESP_OK) {
         err = nvs_commit(handle);
@@ -504,6 +654,54 @@ esp_err_t config_manager_get_int(const char *key, int *value)
     return err;
 }
 
+/**
+ * @brief 根据key更新内存中的int配置字段
+ */
+static void update_config_int_from_key(const char *key, int value, bool *changed)
+{
+    *changed = false;
+#define UPDATE_U8_FIELD(fld) do { \
+    if (strcmp(key, #fld) == 0 && ctx.config.fld != (uint8_t)value) { \
+        ctx.config.fld = (uint8_t)value; \
+        *changed = true; \
+    } \
+} while (0)
+#define UPDATE_U32_FIELD(fld) do { \
+    if (strcmp(key, #fld) == 0 && ctx.config.fld != (uint32_t)value) { \
+        ctx.config.fld = (uint32_t)value; \
+        *changed = true; \
+    } \
+} while (0)
+#define UPDATE_U16_FIELD(fld) do { \
+    if (strcmp(key, #fld) == 0 && ctx.config.fld != (uint16_t)value) { \
+        ctx.config.fld = (uint16_t)value; \
+        *changed = true; \
+    } \
+} while (0)
+
+    UPDATE_U8_FIELD(ro_membrane_type);
+    UPDATE_U8_FIELD(pump_type);
+    UPDATE_U8_FIELD(tank_size);
+    UPDATE_U32_FIELD(flush_duration_sec);
+    UPDATE_U32_FIELD(production_timeout_sec);
+    UPDATE_U32_FIELD(leak_confirm_time_sec);
+    UPDATE_U32_FIELD(normal_flush_duration_sec);
+    UPDATE_U32_FIELD(pure_flush_duration_sec);
+    UPDATE_U32_FIELD(filter_flush_duration_sec);
+    UPDATE_U32_FIELD(short_prod_threshold_sec);
+    UPDATE_U32_FIELD(water_hammer_valve_open_delay_ms);
+    UPDATE_U32_FIELD(water_hammer_pump_stop_delay_ms);
+    UPDATE_U32_FIELD(water_hammer_valve_close_delay_ms);
+    UPDATE_U8_FIELD(relay_trigger_level);
+    UPDATE_U16_FIELD(runtime_save_interval_min);
+    UPDATE_U32_FIELD(filter_capacity_liters);
+    UPDATE_U16_FIELD(web_port);
+
+#undef UPDATE_U8_FIELD
+#undef UPDATE_U32_FIELD
+#undef UPDATE_U16_FIELD
+}
+
 esp_err_t config_manager_set_int(const char *key, int value)
 {
     if (!key) {
@@ -521,6 +719,21 @@ esp_err_t config_manager_set_int(const char *key, int value)
         nvs_close(handle);
     }
 
+    // 先更新内存配置（使用mutex保护）
+    bool mem_changed = false;
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        update_config_int_from_key(key, value, &mem_changed);
+        if (mem_changed) {
+            ctx.config_dirty = true;
+        }
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        // mutex获取失败：返回错误避免竞态条件
+        ESP_LOGE(TAG, "set_int: mutex获取失败，拒绝更新以避免竞态");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    // 再写入NVS
     err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         return err;
@@ -555,6 +768,25 @@ esp_err_t config_manager_get_bool(const char *key, bool *value)
     return err;
 }
 
+/**
+ * @brief 根据key更新内存中的bool配置字段
+ */
+static void update_config_bool_from_key(const char *key, bool value, bool *changed)
+{
+    *changed = false;
+#define UPDATE_BOOL_FIELD(fld) do { \
+    if (strcmp(key, #fld) == 0 && ctx.config.fld != value) { \
+        ctx.config.fld = value; \
+        *changed = true; \
+    } \
+} while (0)
+
+    UPDATE_BOOL_FIELD(mqtt_enabled);
+    UPDATE_BOOL_FIELD(web_auth_enabled);
+
+#undef UPDATE_BOOL_FIELD
+}
+
 esp_err_t config_manager_set_bool(const char *key, bool value)
 {
     if (!key) {
@@ -572,6 +804,21 @@ esp_err_t config_manager_set_bool(const char *key, bool value)
         nvs_close(handle);
     }
 
+    // 先更新内存配置（使用mutex保护）
+    bool mem_changed = false;
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        update_config_bool_from_key(key, value, &mem_changed);
+        if (mem_changed) {
+            ctx.config_dirty = true;
+        }
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        // mutex获取失败：返回错误避免竞态条件
+        ESP_LOGE(TAG, "set_bool: mutex获取失败，拒绝更新以避免竞态");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    // 再写入NVS
     err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         return err;
@@ -686,6 +933,58 @@ bool config_manager_has_wifi_config(void)
 bool config_manager_has_mqtt_config(void)
 {
     return (strlen(ctx.config.mqtt_broker) > 0);
+}
+
+// ==================== 统一周期保存 ====================
+
+// 外部模块的周期保存函数声明
+extern bool filter_mgr_periodic_save(void);
+extern bool history_periodic_save(uint32_t min_interval_sec);
+
+// 上次统一保存时间
+static uint64_t s_last_unified_save_time = 0;
+
+/**
+ * @brief 统一周期保存接口（批量写入优化）
+ * @note 协调所有模块的脏数据保存，减少NVS commit次数
+ * @param min_interval_sec 最小保存间隔（秒），0表示立即保存
+ * @return true 执行了保存
+ */
+bool config_manager_periodic_save_all(uint32_t min_interval_sec)
+{
+    uint64_t now_us = esp_timer_get_time();
+    uint64_t elapsed_sec = (now_us - s_last_unified_save_time) / 1000000ULL;
+
+    // 检查是否需要保存（间隔或立即）
+    bool should_save = (min_interval_sec == 0) || (elapsed_sec >= min_interval_sec);
+    if (!should_save) {
+        return false;
+    }
+
+    bool did_save = false;
+
+    // 1. 保存系统配置（如有变化）
+    if (ctx.config_dirty) {
+        config_manager_save();
+        did_save = true;
+    }
+
+    // 2. 保存滤芯数据（如有变化）
+    if (filter_mgr_periodic_save()) {
+        did_save = true;
+    }
+
+    // 3. 保存历史记录和每日统计（如有变化）
+    if (history_periodic_save(min_interval_sec)) {
+        did_save = true;
+    }
+
+    if (did_save) {
+        s_last_unified_save_time = now_us;
+        ESP_LOGD(TAG, "统一保存完成（间隔%lu秒）", min_interval_sec);
+    }
+
+    return did_save;
 }
 
 // ==================== 调试 ====================

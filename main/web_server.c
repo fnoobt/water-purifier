@@ -52,6 +52,12 @@ static struct {
     .server = NULL,
 };
 
+// 防抖时间戳（微秒）
+static uint64_t s_last_control_time = 0;     // 上次控制操作时间
+static uint64_t s_last_wifi_scan_time = 0;   // 上次WiFi扫描时间
+#define CONTROL_DEBOUNCE_MS 1000             // 控制按钮防抖间隔（1秒）
+#define WIFI_SCAN_DEBOUNCE_MS 5000           // WiFi扫描防抖间隔（5秒）
+
 // ==================== HTML页面 ====================
 
 // 首页 - 只读显示
@@ -346,7 +352,8 @@ static const char html_admin_page[] =
 "function saveFilterCaps(){api('/api/filter/capacity',{caps:[parseInt($('cap0').value),parseInt($('cap1').value),parseInt($('cap2').value),parseInt($('cap3').value),parseInt($('cap4').value)],times:[parseInt($('time0').value),parseInt($('time1').value),parseInt($('time2').value),parseInt($('time3').value),parseInt($('time4').value)]}).then(d=>alert(d.status||'已保存'))}"
 "function saveConfig(){api('/api/config',{normalFlushDur:parseInt($('normalFlushDur').value),pureFlushDur:parseInt($('pureFlushDur').value),filterFlushDur:parseInt($('filterFlushDur').value)*60,prodTimeout:parseInt($('prodTimeout').value)*60,leakConfirm:parseInt($('leakConfirm').value),saveInterval:parseInt($('saveInterval').value),relayLevel:parseInt($('relayLevel').value),tdsInTh:parseFloat($('tdsInTh').value),tdsOutTh:parseFloat($('tdsOutTh').value),whValveOpen:parseInt($('whValveOpen').value),whPumpStop:parseInt($('whPumpStop').value),whValveClose:parseInt($('whValveClose').value)}).then(d=>alert(d.status||'已保存'))}"
 "function saveHardware(){api('/api/config/hardware',{roMem:parseInt($('roMem').value),pumpType:parseInt($('pumpType').value),tankSize:parseInt($('tankSize').value)}).then(d=>alert(d.status||'已保存'))}"
-"function scanWiFi(){$('wifiList').innerHTML='扫描中...';fetch('/api/wifi/scan').then(r=>r.json()).then(d=>{let h='';if(d.networks)d.networks.forEach(n=>h+='<div class=\"wifi-item\" onclick=\"$(\\'ssid\\').value=\\''+n.ssid+'\\'\">'+n.ssid+' ('+n.rssi+'dBm)</div>');$('wifiList').innerHTML=h||'未找到网络'})}"
+"function scanWiFi(){$('wifiList').innerHTML='扫描中...';fetch('/api/wifi/scan').then(r=>r.json()).then(d=>{let h='';if(d.networks)d.networks.forEach(function(n){h+='<div class=\"wifi-item\" data-ssid=\"'+n.ssid.replace(/\"/g,'&quot;')+'\">'+n.ssid+' ('+n.rssi+'dBm)</div>'});$('wifiList').innerHTML=h||'未找到网络'})}"
+"$('wifiList').addEventListener('click',function(e){var item=e.target.closest('.wifi-item');if(item){$('ssid').value=item.getAttribute('data-ssid')}});"
 "function saveWiFi(){api('/api/wifi',{ssid:$('ssid').value,password:$('pass').value}).then(d=>alert(d.status))}"
 "function calibrateTDS(sensor){const v=sensor===0?$('tdsInCal').value:$('tdsOutCal').value;if(!v)return alert('请输入标准值');api('/api/tds/calibrate',{sensor:parseInt(sensor),value:parseFloat(v)}).then(d=>alert(d.status||'校准完成'))}"
 "function loadMQTT(){fetch('/api/mqtt/config').then(r=>r.json()).then(d=>{$('mqttEn').value=d.enabled?1:0;$('mqttBroker').value=d.broker||'';$('mqttUser').value=d.user||'';$('mqttPass').value='';$('mqttPrefix').value=d.prefix||'water-purifier'})}"
@@ -487,8 +494,11 @@ static esp_err_t handle_status(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
 
     fsm_state_t state = fsm_get_state();
-    fsm_runtime_data_t data;
-    fsm_get_runtime_data(&data);
+    fsm_runtime_data_t data = {0};
+    if (fsm_get_runtime_data(&data) != ESP_OK) {
+        // 超时使用零值，不影响响应
+        ESP_LOGW(TAG, "获取运行数据超时，使用默认值");
+    }
 
     tds_dual_measurement_t tds;
     tds_sensor_get_latest_dual(&tds);
@@ -500,70 +510,116 @@ static esp_err_t handle_status(httpd_req_t *req)
     char ip[16] = "";
     wifi_manager_get_ip(ip, sizeof(ip));
 
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "state", fsm_get_state_name(state));
-    cJSON_AddNumberToObject(root, "cycles", data.total_production_cycles);
-    cJSON_AddNumberToObject(root, "flushes", data.total_flush_cycles);
-    cJSON_AddNumberToObject(root, "prodTime", data.total_production_time_sec);
-
-    cJSON_AddNumberToObject(root, "uptime", get_uptime_sec());
-
     // 今日统计
+    uint32_t today_prod_min = 0;
     daily_stats_t today;
     if (history_get_today_stats(&today) == ESP_OK) {
-        cJSON_AddNumberToObject(root, "todayProd", today.production_sec / 60);
-    } else {
-        cJSON_AddNumberToObject(root, "todayProd", 0);
+        today_prod_min = today.production_sec / 60;
     }
 
-    cJSON_AddNumberToObject(root, "tds_in", tds.inlet.valid ? tds.inlet.tds_value : 0);
-    cJSON_AddNumberToObject(root, "tds_out", tds.outlet.valid ? tds.outlet.tds_value : 0);
-    cJSON_AddNumberToObject(root, "rate", tds.both_valid ? tds.reduction_rate : 0);
-    cJSON_AddBoolToObject(root, "leak", gpio_driver_read_water_leak());
-
     // SNTP系统时间
+    char sntp_time[64] = "未同步";
     time_t now = time(NULL);
     struct tm tm_now;
     localtime_r(&now, &tm_now);
-    char time_buf[64];
     if (tm_now.tm_year > 100) {
-        snprintf(time_buf, sizeof(time_buf), "%04d-%02d-%02d %02d:%02d:%02d",
+        snprintf(sntp_time, sizeof(sntp_time), "%04d-%02d-%02d %02d:%02d:%02d",
                  tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
                  tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
-        cJSON_AddStringToObject(root, "sntpTime", time_buf);
-    } else {
-        cJSON_AddStringToObject(root, "sntpTime", "未同步");
     }
 
-    // 添加五级滤芯数据
-    cJSON *filters_arr = cJSON_CreateArray();
+    // 构建JSON响应（使用snprintf避免cJSON堆分配）
+    char buf[2048];
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "{\"state\":\"%s\","
+        "\"cycles\":%lu,"
+        "\"flushes\":%lu,"
+        "\"prodTime\":%llu,"
+        "\"uptime\":%lu,"
+        "\"todayProd\":%lu,"
+        "\"tds_in\":%.1f,"
+        "\"tds_out\":%.1f,"
+        "\"rate\":%.1f,"
+        "\"leak\":%s,"
+        "\"sntpTime\":\"%s\","
+        "\"filters\":[",
+        fsm_get_state_name(state),
+        (unsigned long)data.total_production_cycles,
+        (unsigned long)data.total_flush_cycles,
+        (unsigned long long)data.total_production_time_sec,
+        (unsigned long)get_uptime_sec(),
+        (unsigned long)today_prod_min,
+        tds.inlet.valid ? tds.inlet.tds_value : 0.0,
+        tds.outlet.valid ? tds.outlet.tds_value : 0.0,
+        tds.both_valid ? tds.reduction_rate : 0.0,
+        gpio_driver_read_water_leak() ? "true" : "false",
+        sntp_time);
+
+    // 边界检查：确保有足够空间继续写入
+    if (pos >= sizeof(buf) - 400) {
+        ESP_LOGW(TAG, "JSON响应接近溢出，中止写入");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
+        return ESP_FAIL;
+    }
+
     for (int i = 0; i < FILTER_COUNT; i++) {
-        cJSON *f = cJSON_CreateObject();
-        cJSON_AddNumberToObject(f, "waterPct", filters_status.filters[i].percentage);
-        cJSON_AddNumberToObject(f, "timePct", filters_status.filters[i].time_percentage);
-        cJSON_AddNumberToObject(f, "effPct", filters_status.filters[i].effective_percentage);
-        cJSON_AddNumberToObject(f, "used", filters_status.filters[i].used_liters);
-        cJSON_AddNumberToObject(f, "total", filters_status.filters[i].total_liters);
-        cJSON_AddNumberToObject(f, "timeLimit", filters_status.filters[i].time_limit_hours);
-        cJSON_AddBoolToObject(f, "needReplace", filters_status.filters[i].replacement_needed);
-        cJSON_AddItemToArray(filters_arr, f);
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"waterPct\":%u,\"timePct\":%u,\"effPct\":%u,\"used\":%lu,\"total\":%lu,\"timeLimit\":%lu,\"needReplace\":%s}",
+            i > 0 ? "," : "",
+            filters_status.filters[i].percentage,
+            filters_status.filters[i].time_percentage,
+            filters_status.filters[i].effective_percentage,
+            (unsigned long)filters_status.filters[i].used_liters,
+            (unsigned long)filters_status.filters[i].total_liters,
+            (unsigned long)filters_status.filters[i].time_limit_hours,
+            filters_status.filters[i].replacement_needed ? "true" : "false");
+
+        // 边界检查：确保有足够空间继续写入
+        if (pos >= sizeof(buf) - 200) {
+            ESP_LOGW(TAG, "JSON响应接近溢出，中止写入");
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
+            return ESP_FAIL;
+        }
     }
-    cJSON_AddItemToObject(root, "filters", filters_arr);
-    cJSON_AddNumberToObject(root, "totalWater", filters_status.total_water_used);
 
-    cJSON_AddStringToObject(root, "wifiState", wifi_manager_get_state_name(wifi_manager_get_state()));
-    cJSON_AddStringToObject(root, "ssid", wifi_manager_get_ssid());
-    cJSON_AddStringToObject(root, "ip", ip);
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "],"
+        "\"totalWater\":%lu,"
+        "\"wifiState\":\"%s\","
+        "\"ssid\":\"%s\","
+        "\"ip\":\"%s\"}",
+        (unsigned long)filters_status.total_water_used,
+        wifi_manager_get_state_name(wifi_manager_get_state()),
+        wifi_manager_get_ssid(),
+        ip);
 
-    char *resp = cJSON_PrintUnformatted(root);
-    httpd_resp_send(req, resp, strlen(resp));
-    free(resp);
-    cJSON_Delete(root);
+    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
 static esp_err_t handle_control(httpd_req_t *req)
 {
+    // 防抖检查：短时间内不允许重复控制操作
+    uint64_t now = esp_timer_get_time();
+    uint64_t elapsed_ms = (now - s_last_control_time) / 1000;
+    if (elapsed_ms < CONTROL_DEBOUNCE_MS) {
+        ESP_LOGW(TAG, "控制操作防抖，请等待 %llu 毫秒", CONTROL_DEBOUNCE_MS - elapsed_ms);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"操作过快，请稍候\"}");
+        return ESP_OK;
+    }
+    s_last_control_time = now;
+
+    /* 检查请求体长度，防止恶意超大请求 */
+    int content_len = req->content_len;
+    if (content_len > 127) {
+        ESP_LOGW(TAG, "control请求体过大: %d字节", content_len);
+        drain_http_body(req);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request too large");
+        return ESP_FAIL;
+    }
+
     char buf[128];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) {
@@ -573,7 +629,7 @@ static esp_err_t handle_control(httpd_req_t *req)
     buf[len] = 0;
 
     cJSON *root = cJSON_Parse(buf);
-    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+    if (!root) { drain_http_body(req); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
 
     cJSON *action = cJSON_GetObjectItem(root, "action");
     if (!action) { cJSON_Delete(root); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing action"); return ESP_FAIL; }
@@ -586,6 +642,12 @@ static esp_err_t handle_control(httpd_req_t *req)
     else if (strcmp(a, "reset") == 0) fsm_clear_stop();
     else if (strcmp(a, "standby") == 0) fsm_manual_go_standby();
     else if (strcmp(a, "shutdown") == 0) fsm_manual_shutdown();
+    else {
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"未知操作\"}");
+        return ESP_OK;
+    }
 
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
@@ -618,6 +680,11 @@ static esp_err_t handle_config_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "whValveClose", cfg.water_hammer_valve_close_delay_ms);
 
     char *resp = cJSON_PrintUnformatted(root);
+    if (!resp) {
+        cJSON_Delete(root);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     httpd_resp_send(req, resp, strlen(resp));
     free(resp);
     cJSON_Delete(root);
@@ -626,6 +693,15 @@ static esp_err_t handle_config_get(httpd_req_t *req)
 
 static esp_err_t handle_config_set(httpd_req_t *req)
 {
+    /* 检查请求体长度 */
+    int content_len = req->content_len;
+    if (content_len > 255) {
+        ESP_LOGW(TAG, "config_set请求体过大: %d字节", content_len);
+        drain_http_body(req);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request too large");
+        return ESP_FAIL;
+    }
+
     char buf[256];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) {
@@ -634,7 +710,7 @@ static esp_err_t handle_config_set(httpd_req_t *req)
     buf[len] = 0;
 
     cJSON *root = cJSON_Parse(buf);
-    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+    if (!root) { drain_http_body(req); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
 
     system_config_t cfg;
     config_manager_get_config(&cfg);
@@ -654,9 +730,8 @@ static esp_err_t handle_config_set(httpd_req_t *req)
     if ((v = cJSON_GetObjectItem(root, "whValveClose"))) cfg.water_hammer_valve_close_delay_ms = v->valueint;
 
     config_manager_set_config(&cfg);
-    config_manager_save();
 
-    // 应用配置
+    // 先应用配置到各模块，成功后再保存NVS（确保一致性）
     fsm_set_normal_flush_duration(cfg.normal_flush_duration_sec);
     fsm_set_pure_flush_duration(cfg.pure_flush_duration_sec);
     fsm_set_filter_flush_duration(cfg.filter_flush_duration_sec);
@@ -670,6 +745,9 @@ static esp_err_t handle_config_set(httpd_req_t *req)
     tds_sensor_set_alarm_threshold(TDS_SENSOR_INLET, cfg.tds_inlet_threshold);
     tds_sensor_set_alarm_threshold(TDS_SENSOR_OUTLET, cfg.tds_outlet_threshold);
 
+    // 配置应用成功后，持久化到NVS
+    config_manager_save();
+
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
@@ -678,6 +756,15 @@ static esp_err_t handle_config_set(httpd_req_t *req)
 
 static esp_err_t handle_hardware_config_set(httpd_req_t *req)
 {
+    /* 检查请求体长度 */
+    int content_len = req->content_len;
+    if (content_len > 127) {
+        ESP_LOGW(TAG, "hardware_config请求体过大: %d字节", content_len);
+        drain_http_body(req);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request too large");
+        return ESP_FAIL;
+    }
+
     char buf[128];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) {
@@ -686,7 +773,7 @@ static esp_err_t handle_hardware_config_set(httpd_req_t *req)
     buf[len] = 0;
 
     cJSON *root = cJSON_Parse(buf);
-    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+    if (!root) { drain_http_body(req); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
 
     system_config_t cfg;
     config_manager_get_config(&cfg);
@@ -697,10 +784,11 @@ static esp_err_t handle_hardware_config_set(httpd_req_t *req)
     if ((v = cJSON_GetObjectItem(root, "tankSize"))) cfg.tank_size = v->valueint;
 
     config_manager_set_config(&cfg);
-    config_manager_save();
 
-    // 应用硬件配置
+    // 先应用硬件配置，成功后再保存NVS
     fsm_set_production_rate_by_membrane(cfg.ro_membrane_type);
+
+    config_manager_save();
 
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
@@ -712,11 +800,17 @@ static esp_err_t handle_wifi_scan(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
 
-    // 切换到站模式进行扫描
-    wifi_mode_t original_mode;
-    esp_wifi_get_mode(&original_mode);
+    // 防抖检查：短时间内不允许重复扫描
+    uint64_t now = esp_timer_get_time();
+    uint64_t elapsed_ms = (now - s_last_wifi_scan_time) / 1000;
+    if (elapsed_ms < WIFI_SCAN_DEBOUNCE_MS) {
+        ESP_LOGW(TAG, "WiFi扫描防抖，请等待 %llu 毫秒", WIFI_SCAN_DEBOUNCE_MS - elapsed_ms);
+        httpd_resp_sendstr(req, "{\"networks\":[],\"error\":\"scan_too_fast\"}");
+        return ESP_OK;
+    }
+    s_last_wifi_scan_time = now;
 
-    // 确保WiFi已启动
+    // 停止之前的扫描（如果有）
     esp_wifi_scan_stop();
 
     // 开始扫描
@@ -730,6 +824,7 @@ static esp_err_t handle_wifi_scan(httpd_req_t *req)
 
     esp_err_t ret = esp_wifi_scan_start(&scan_config, true);
     if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi扫描启动失败: %s", esp_err_to_name(ret));
         httpd_resp_sendstr(req, "{\"networks\":[],\"error\":\"scan_failed\"}");
         return ESP_OK;
     }
@@ -745,11 +840,18 @@ static esp_err_t handle_wifi_scan(httpd_req_t *req)
 
     wifi_ap_record_t *ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
     if (!ap_list) {
+        ESP_LOGE(TAG, "WiFi扫描结果内存分配失败");
         httpd_resp_sendstr(req, "{\"networks\":[],\"error\":\"no_memory\"}");
         return ESP_OK;
     }
 
-    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_list));
+    esp_err_t scan_ret = esp_wifi_scan_get_ap_records(&ap_count, ap_list);
+    if (scan_ret != ESP_OK) {
+        ESP_LOGW(TAG, "获取扫描结果失败: %s", esp_err_to_name(scan_ret));
+        free(ap_list);
+        httpd_resp_sendstr(req, "{\"networks\":[],\"error\":\"scan_failed\"}");
+        return ESP_OK;
+    }
 
     // 构建JSON响应
     cJSON *root = cJSON_CreateObject();
@@ -768,6 +870,12 @@ static esp_err_t handle_wifi_scan(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "count", ap_count);
 
     char *resp = cJSON_PrintUnformatted(root);
+    if (!resp) {
+        cJSON_Delete(root);
+        free(ap_list);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     httpd_resp_sendstr(req, resp);
 
     free(resp);
@@ -779,6 +887,15 @@ static esp_err_t handle_wifi_scan(httpd_req_t *req)
 
 static esp_err_t handle_wifi_config(httpd_req_t *req)
 {
+    /* 检查请求体长度 */
+    int content_len = req->content_len;
+    if (content_len > 127) {
+        ESP_LOGW(TAG, "wifi_config请求体过大: %d字节", content_len);
+        drain_http_body(req);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request too large");
+        return ESP_FAIL;
+    }
+
     char buf[128];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) {
@@ -787,7 +904,7 @@ static esp_err_t handle_wifi_config(httpd_req_t *req)
     buf[len] = 0;
 
     cJSON *root = cJSON_Parse(buf);
-    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+    if (!root) { drain_http_body(req); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
 
     cJSON *ssid = cJSON_GetObjectItem(root, "ssid");
     cJSON *pass = cJSON_GetObjectItem(root, "password");
@@ -805,6 +922,15 @@ static esp_err_t handle_wifi_config(httpd_req_t *req)
 
 static esp_err_t handle_filter_reset(httpd_req_t *req)
 {
+    /* 检查请求体长度 */
+    int content_len = req->content_len;
+    if (content_len > 63) {
+        ESP_LOGW(TAG, "filter_reset请求体过大: %d字节", content_len);
+        drain_http_body(req);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request too large");
+        return ESP_FAIL;
+    }
+
     char buf[64];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) {
@@ -813,7 +939,7 @@ static esp_err_t handle_filter_reset(httpd_req_t *req)
     buf[len] = 0;
 
     cJSON *root = cJSON_Parse(buf);
-    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+    if (!root) { drain_http_body(req); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
 
     cJSON *filter_idx = cJSON_GetObjectItem(root, "filter");
     if (!filter_idx) {
@@ -823,6 +949,11 @@ static esp_err_t handle_filter_reset(httpd_req_t *req)
     }
 
     int idx = filter_idx->valueint;
+    if (idx < 0 || idx >= FILTER_COUNT) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filter index");
+        return ESP_FAIL;
+    }
     esp_err_t ret = filter_mgr_reset_filter((filter_type_t)idx);
 
     cJSON_Delete(root);
@@ -833,6 +964,11 @@ static esp_err_t handle_filter_reset(httpd_req_t *req)
         cJSON_AddStringToObject(resp, "status", "ok");
         cJSON_AddStringToObject(resp, "filter_name", filter_mgr_get_filter_name(idx));
         char *json_str = cJSON_PrintUnformatted(resp);
+        if (!json_str) {
+            cJSON_Delete(resp);
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
         httpd_resp_sendstr(req, json_str);
         free(json_str);
         cJSON_Delete(resp);
@@ -844,7 +980,16 @@ static esp_err_t handle_filter_reset(httpd_req_t *req)
 
 static esp_err_t handle_filter_capacity(httpd_req_t *req)
 {
-    char buf[128];
+    /* 检查请求体长度 */
+    int content_len = req->content_len;
+    if (content_len > 255) {
+        ESP_LOGW(TAG, "filter_capacity请求体过大: %d字节", content_len);
+        drain_http_body(req);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request too large");
+        return ESP_FAIL;
+    }
+
+    char buf[256];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) {
         return ESP_FAIL;
@@ -852,7 +997,7 @@ static esp_err_t handle_filter_capacity(httpd_req_t *req)
     buf[len] = 0;
 
     cJSON *root = cJSON_Parse(buf);
-    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+    if (!root) { drain_http_body(req); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
 
     cJSON *caps = cJSON_GetObjectItem(root, "caps");
     if (!caps || !cJSON_IsArray(caps)) {
@@ -872,7 +1017,8 @@ static esp_err_t handle_filter_capacity(httpd_req_t *req)
     uint32_t capacities[FILTER_COUNT];
     for (int i = 0; i < FILTER_COUNT; i++) {
         cJSON *cap = cJSON_GetArrayItem(caps, i);
-        capacities[i] = cap ? (uint32_t)cap->valueint : 0;
+        // 验证数组元素必须是有效数字
+        capacities[i] = (cap && cJSON_IsNumber(cap)) ? (uint32_t)cap->valueint : 0;
     }
     filter_mgr_set_all_filter_capacity(capacities);
 
@@ -895,18 +1041,27 @@ static esp_err_t handle_filter_capacity(httpd_req_t *req)
 
 static esp_err_t tds_calibrate_handler(httpd_req_t *req)
 {
+    /* 检查请求体长度 */
+    int content_len = req->content_len;
+    if (content_len > 127) {
+        ESP_LOGW(TAG, "tds_calibrate请求体过大: %d字节", content_len);
+        drain_http_body(req);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request too large");
+        return ESP_FAIL;
+    }
+
     char buf[128];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) return ESP_FAIL;
     buf[len] = 0;
 
     cJSON *root = cJSON_Parse(buf);
-    if (!root) return ESP_FAIL;
+    if (!root) { drain_http_body(req); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
 
     cJSON *sensor = cJSON_GetObjectItem(root, "sensor");
     cJSON *value = cJSON_GetObjectItem(root, "value");
 
-    if (!sensor || !value) {
+    if (!sensor || !value || !cJSON_IsNumber(sensor) || !cJSON_IsNumber(value)) {
         cJSON_Delete(root);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"status\":\"参数错误\"}");
@@ -916,18 +1071,53 @@ static esp_err_t tds_calibrate_handler(httpd_req_t *req)
     int sensor_id = sensor->valueint;
     float cal_value = (float)value->valuedouble;
 
+    // sensor_id边界验证：必须是0(进水)或1(出水)
+    if (sensor_id < 0 || sensor_id > 1) {
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"传感器编号无效(0=进水,1=出水)\"}");
+        return ESP_OK;
+    }
+
+    // 校准前检查：传感器必须有效连接才能校准
+    tds_measurement_t meas;
+    if (tds_sensor_measure((tds_sensor_id_t)sensor_id, &meas) != ESP_OK || !meas.valid) {
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"传感器未连接，无法校准\"}");
+        return ESP_OK;
+    }
+
+    // 校准值必须合理（TDS范围0-2000 ppm）
+    if (cal_value <= 0 || cal_value > 2000) {
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"校准值范围无效（0-2000 ppm）\"}");
+        return ESP_OK;
+    }
+
     esp_err_t err = tds_sensor_calibrate((tds_sensor_id_t)sensor_id, cal_value);
 
-    // 同步校准结果到config_manager并写入Flash，确保重启后不丢失
+    // 校准成功后同步到config_manager持久化
     if (err == ESP_OK) {
-        system_config_t cfg;
-        config_manager_get_config(&cfg);
         tds_calibration_t cal;
         if (tds_sensor_get_calibration((tds_sensor_id_t)sensor_id, &cal) == ESP_OK) {
-            cfg.tds_calibration_offset[sensor_id] = cal.offset;
-            cfg.tds_calibration_scale[sensor_id] = cal.scale;
-            config_manager_set_config(&cfg);
-            config_manager_save();
+            // 校准数据有效性检查：scale必须在合理范围内(0.01~100)
+            // 防止测量值接近0导致scale异常大，或异常测量导致scale为负数
+            if (cal.scale > 0.01f && cal.scale < 100.0f) {
+                system_config_t cfg;
+                config_manager_get_config(&cfg);
+                cfg.tds_calibration_offset[sensor_id] = cal.offset;
+                cfg.tds_calibration_scale[sensor_id] = cal.scale;
+                config_manager_set_config(&cfg);
+                config_manager_save();  // 立即写入Flash
+            } else {
+                ESP_LOGW(TAG, "校准scale异常: %.4f，不保存（有效范围: 0.01~100）", cal.scale);
+                err = ESP_ERR_INVALID_STATE;
+            }
+        } else {
+            ESP_LOGW(TAG, "获取校准参数失败，校准数据未持久化");
+            err = ESP_FAIL;
         }
     }
 
@@ -959,6 +1149,10 @@ static esp_err_t handle_mqtt_config_get(httpd_req_t *req)
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
+    if (!json) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, json);
@@ -968,6 +1162,15 @@ static esp_err_t handle_mqtt_config_get(httpd_req_t *req)
 
 static esp_err_t handle_mqtt_config_set(httpd_req_t *req)
 {
+    /* 检查请求体长度 */
+    int content_len = req->content_len;
+    if (content_len > 255) {
+        ESP_LOGW(TAG, "mqtt_config_set请求体过大: %d字节", content_len);
+        drain_http_body(req);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request too large");
+        return ESP_FAIL;
+    }
+
     char buf[256];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) return ESP_FAIL;
@@ -983,17 +1186,21 @@ static esp_err_t handle_mqtt_config_set(httpd_req_t *req)
     if ((item = cJSON_GetObjectItem(root, "enabled"))) {
         cfg.mqtt_enabled = item->valueint;
     }
-    if ((item = cJSON_GetObjectItem(root, "broker"))) {
+    if ((item = cJSON_GetObjectItem(root, "broker")) && cJSON_IsString(item)) {
         strncpy(cfg.mqtt_broker, item->valuestring, sizeof(cfg.mqtt_broker) - 1);
+        cfg.mqtt_broker[sizeof(cfg.mqtt_broker) - 1] = '\0';
     }
-    if ((item = cJSON_GetObjectItem(root, "user"))) {
+    if ((item = cJSON_GetObjectItem(root, "user")) && cJSON_IsString(item)) {
         strncpy(cfg.mqtt_username, item->valuestring, sizeof(cfg.mqtt_username) - 1);
+        cfg.mqtt_username[sizeof(cfg.mqtt_username) - 1] = '\0';
     }
-    if ((item = cJSON_GetObjectItem(root, "password"))) {
+    if ((item = cJSON_GetObjectItem(root, "password")) && cJSON_IsString(item)) {
         strncpy(cfg.mqtt_password, item->valuestring, sizeof(cfg.mqtt_password) - 1);
+        cfg.mqtt_password[sizeof(cfg.mqtt_password) - 1] = '\0';
     }
-    if ((item = cJSON_GetObjectItem(root, "prefix"))) {
+    if ((item = cJSON_GetObjectItem(root, "prefix")) && cJSON_IsString(item)) {
         strncpy(cfg.mqtt_topic_prefix, item->valuestring, sizeof(cfg.mqtt_topic_prefix) - 1);
+        cfg.mqtt_topic_prefix[sizeof(cfg.mqtt_topic_prefix) - 1] = '\0';
     }
 
     cJSON_Delete(root);
@@ -1007,39 +1214,64 @@ static esp_err_t handle_mqtt_config_set(httpd_req_t *req)
 
 // ==================== OTA升级 ====================
 
-/**
- * @brief 延迟重启任务（等待 HTTP 响应发出后再重启）
- */
-static void ota_reboot_task(void *arg)
-{
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    ESP_LOGI(TAG, "OTA 升级完成，系统重启...");
-    esp_restart();
-}
+// OTA会话锁：防止并发OTA请求（静态缓冲区不支持并发）
+static volatile bool s_ota_session_active = false;
+static portMUX_TYPE s_ota_spinlock = portMUX_INITIALIZER_UNLOCKED;
+
+// OTA接收超时配置
+#define OTA_RECV_TIMEOUT_MS 30000  // 30秒总接收超时
+#define OTA_INACTIVITY_TIMEOUT_MS 5000  // 5秒无数据接收超时
+#define OTA_BUF_SIZE 2048  // OTA接收缓冲区大小
 
 /**
  * @brief OTA 固件上传处理器
  * @note 接收 multipart/form-data 上传的 .bin 固件，流式写入 OTA 分区
- * @note 使用静态缓冲区避免 httpd 任务栈溢出
+ * @note 使用静态缓冲区避免 httpd 任务栈溢出（会话锁保护）
  */
 static esp_err_t ota_update_handler(httpd_req_t *req)
 {
-    // 大缓冲区用静态分配，避免 httpd 任务栈溢出
-    static char buf[4096];
-    static char close_bnd[130];
-    static char bnd_copy[120];
+    esp_err_t result = ESP_FAIL;  // 默认返回失败，成功时修改
+
+    // 检查是否已有OTA会话进行中
+    taskENTER_CRITICAL(&s_ota_spinlock);
+    if (s_ota_session_active) {
+        taskEXIT_CRITICAL(&s_ota_spinlock);
+        ESP_LOGW(TAG, "OTA会话已存在，拒绝并发请求");
+        return send_json_error(req, 400, "已有OTA上传进行中，请等待完成");
+    }
+    s_ota_session_active = true;
+    taskEXIT_CRITICAL(&s_ota_spinlock);
+
+    // 动态分配缓冲区（OTA不频繁使用，节省静态内存）
+    char *buf = malloc(OTA_BUF_SIZE);  // 2048字节足够处理multipart boundary
+    char *close_bnd = malloc(160);  // 足够容纳 \r\n-- + boundary + --
+    char *bnd_copy = malloc(130);   // 足够容纳 boundary
+
+    if (!buf || !close_bnd || !bnd_copy) {
+        ESP_LOGE(TAG, "OTA内存分配失败");
+        free(buf); free(close_bnd); free(bnd_copy);
+        // 释放OTA会话锁（使用自旋锁保护）
+        taskENTER_CRITICAL(&s_ota_spinlock);
+        s_ota_session_active = false;
+        taskEXIT_CRITICAL(&s_ota_spinlock);
+        return send_json_error(req, 500, "内存不足");
+    }
+
+    // OTA超时计时器
+    uint64_t start_time = esp_timer_get_time();  // 开始时间（微秒）
+    uint64_t last_recv_time = start_time;        // 上次成功接收时间
 
     // 1. 解析 Content-Type 中的 boundary
     char content_type[128] = {0};
     if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "缺少 Content-Type");
-        return ESP_FAIL;
+        goto cleanup;
     }
 
     char *bs = strstr(content_type, "boundary=");
     if (!bs) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "缺少 boundary 参数");
-        return ESP_FAIL;
+        goto cleanup;
     }
     bs += 9;  // 跳过 "boundary="
 
@@ -1049,11 +1281,11 @@ static esp_err_t ota_update_handler(httpd_req_t *req)
     }
 
     // 构建关闭边界标记: "\r\n--<boundary>--"
-    memset(close_bnd, 0, sizeof(close_bnd));
+    memset(close_bnd, 0, 160);
     memcpy(close_bnd, "\r\n--", 4);
-    memset(bnd_copy, 0, sizeof(bnd_copy));
+    memset(bnd_copy, 0, 130);
     size_t bnd_len = 0;
-    while (*bs && *bs != '"' && *bs != ';' && *bs != ' ' && bnd_len < sizeof(bnd_copy) - 1) {
+    while (*bs && *bs != '"' && *bs != ';' && *bs != ' ' && bnd_len < 129) {
         bnd_copy[bnd_len++] = *bs++;
     }
     memcpy(close_bnd + 4, bnd_copy, bnd_len);
@@ -1064,11 +1296,13 @@ static esp_err_t ota_update_handler(httpd_req_t *req)
     esp_err_t ret = ota_update_begin();
     if (ret != ESP_OK) {
         if (ret == ESP_ERR_INVALID_ARG) {
-            return send_json_error(req, 500, "版本相同，已拒绝。请编译新版本后再升级。");
+            send_json_error(req, 500, "版本相同，已拒绝。请编译新版本后再升级。");
+        } else {
+            char err_msg[128];
+            snprintf(err_msg, sizeof(err_msg), "OTA 初始化失败: %s", esp_err_to_name(ret));
+            send_json_error(req, 500, err_msg);
         }
-        char err_msg[128];
-        snprintf(err_msg, sizeof(err_msg), "OTA 初始化失败: %s", esp_err_to_name(ret));
-        return send_json_error(req, 500, err_msg);
+        goto cleanup;
     }
 
     // 3. 流式接收，用尾缓冲处理跨 chunk 边界
@@ -1077,21 +1311,49 @@ static esp_err_t ota_update_handler(httpd_req_t *req)
     size_t total_written = 0;  // 累计写入字节数（用于日志）
 
     while (true) {
-        int len = httpd_req_recv(req, buf + tail_len, sizeof(buf) - tail_len);
+        int len = httpd_req_recv(req, buf + tail_len, OTA_BUF_SIZE - tail_len);
+        uint64_t now = esp_timer_get_time();
+
         if (len < 0) {
-            if (len == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            if (len == HTTPD_SOCK_ERR_TIMEOUT) {
+                // 检查总超时和无活动超时
+                uint64_t total_elapsed_ms = (now - start_time) / 1000;
+                uint64_t inactivity_ms = (now - last_recv_time) / 1000;
+
+                if (total_elapsed_ms > OTA_RECV_TIMEOUT_MS) {
+                    ESP_LOGE(TAG, "OTA总接收超时: %llu秒", total_elapsed_ms / 1000);
+                    ota_update_abort();
+                    httpd_resp_set_status(req, "500 Internal Server Error");
+                    httpd_resp_set_type(req, "application/json");
+                    httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"上传总超时(30秒)\"}", HTTPD_RESP_USE_STRLEN);
+                    goto cleanup;
+                }
+
+                if (inactivity_ms > OTA_INACTIVITY_TIMEOUT_MS) {
+                    ESP_LOGE(TAG, "OTA无数据超时: %llu秒", inactivity_ms / 1000);
+                    ota_update_abort();
+                    httpd_resp_set_status(req, "500 Internal Server Error");
+                    httpd_resp_set_type(req, "application/json");
+                    httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"无数据接收超时(5秒)\"}", HTTPD_RESP_USE_STRLEN);
+                    goto cleanup;
+                }
+                continue;  // 继续等待数据
+            }
             ESP_LOGE(TAG, "OTA 接收失败: %d", len);
             ota_update_abort();
             httpd_resp_set_status(req, "500 Internal Server Error");
             httpd_resp_set_type(req, "application/json");
             httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"网络接收失败\"}", HTTPD_RESP_USE_STRLEN);
-            return ESP_FAIL;
+            goto cleanup;
         }
         if (len == 0) {
             // 连接关闭，用已接收数据结束 OTA
             ESP_LOGW(TAG, "OTA 连接提前关闭，已接收 %lu 字节", (unsigned long)total_written);
             break;
         }
+
+        // 成功接收数据，更新最后接收时间
+        last_recv_time = now;
 
         size_t total = tail_len + len;  // 缓冲中总数据量
         tail_len = 0;
@@ -1140,7 +1402,8 @@ static esp_err_t ota_update_handler(httpd_req_t *req)
                     ota_update_abort();
                     char err_buf[128];
                     snprintf(err_buf, sizeof(err_buf), "OTA 写入失败: %s", esp_err_to_name(ret));
-                    return send_json_error(req, 500, err_buf);
+                    send_json_error(req, 500, err_buf);
+                    goto cleanup;
                 }
                 total_written += found;
             }
@@ -1158,7 +1421,8 @@ static esp_err_t ota_update_handler(httpd_req_t *req)
                 ota_update_abort();
                 char err_buf[128];
                 snprintf(err_buf, sizeof(err_buf), "OTA 写入失败: %s", esp_err_to_name(ret));
-                return send_json_error(req, 500, err_buf);
+                send_json_error(req, 500, err_buf);
+                goto cleanup;
             }
             total_written += write_len;
             // 保留最后 cb_len 字节作为尾缓冲
@@ -1181,16 +1445,30 @@ done_receiving:
     if (ret != ESP_OK) {
         char err_buf[128];
         snprintf(err_buf, sizeof(err_buf), "OTA 校验失败: %s", esp_err_to_name(ret));
-        return send_json_error(req, 500, err_buf);
+        send_json_error(req, 500, err_buf);
+        goto cleanup;
     }
 
     // 5. 发送成功响应
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"固件升级成功，系统正在重启\"}");
 
-    // 6. 延迟重启
-    xTaskCreate(ota_reboot_task, "ota_reboot", 2048, NULL, 1, NULL);
-    return ESP_OK;
+    // 6. 延迟重启（HTTP响应已在socket buffer中）
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    result = ESP_OK;  // 成功
+
+cleanup:
+    // 释放动态分配的缓冲区
+    free(buf);
+    free(close_bnd);
+    free(bnd_copy);
+
+    // 释放OTA会话锁
+    taskENTER_CRITICAL(&s_ota_spinlock);
+    s_ota_session_active = false;
+    taskEXIT_CRITICAL(&s_ota_spinlock);
+    return result;
 }
 
 /**
@@ -1232,6 +1510,11 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     }
 
     char *resp = cJSON_PrintUnformatted(root);
+    if (!resp) {
+        cJSON_Delete(root);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, resp);
     free(resp);
@@ -1245,6 +1528,12 @@ esp_err_t web_server_init(void)
 {
     if (ctx.initialized) return ESP_OK;
     ESP_LOGI(TAG, "初始化Web服务器");
+
+    // 在启动时记录boot时间，避免延迟初始化的竞态
+    if (g_boot_time == 0) {
+        g_boot_time = esp_timer_get_time();
+    }
+
     ctx.initialized = true;
     return ESP_OK;
 }

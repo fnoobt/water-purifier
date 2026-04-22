@@ -87,15 +87,9 @@ esp_err_t ota_update_begin(void)
         s_ctx.ota_handle = 0;
     }
 
-    // 如果当前固件处于 PENDING_VERIFY 状态，先标记为有效以取消 rollback 倒计时
-    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-    if (err == ESP_ERR_NOT_SUPPORTED) {
-        // 当前固件不是待验证状态，正常情况
-    } else if (err != ESP_OK) {
-        ESP_LOGW(TAG, "标记当前固件有效失败: %s", esp_err_to_name(err));
-    } else {
-        ESP_LOGI(TAG, "取消 OTA Rollback 倒计时");
-    }
+    // 注意：不在 begin 时调用 esp_ota_mark_app_valid_cancel_rollback
+    // 如果当前固件正在 rollback 倒计时中，提前取消会导致 OTA 失败后失去回滚保护
+    // 该操作应推迟到 ota_update_end() 成功后执行
 
     s_ctx.update_partition = esp_ota_get_next_update_partition(NULL);
     if (!s_ctx.update_partition) {
@@ -142,28 +136,56 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
             ESP_LOGD(TAG, "首次接收: len=%zu, magic=0x%02x, 前64字节=%s", len, data[0], hex);
         }
 
+        // ESP镜像头所需的最小数据量（约280字节）
         size_t need = sizeof(esp_image_header_t) +
                       sizeof(esp_image_segment_header_t) +
                       sizeof(esp_app_desc_t);
 
-        if (s_ctx.init_len + len < need) {
-            // 数据不够，继续累积
-            memcpy(s_ctx.init_buf + s_ctx.init_len, data, len);
-            s_ctx.init_len += len;
-            s_ctx.total_written += len;
-            return ESP_OK;
+        /* 安全检查：need必须小于init_buf容量 */
+        if (need > sizeof(s_ctx.init_buf)) {
+            ESP_LOGE(TAG, "镜像头大小异常: need=%zu > buf=%zu", need, sizeof(s_ctx.init_buf));
+            s_ctx.state = OTA_STATE_FAILED;
+            return ESP_ERR_INVALID_ARG;
         }
 
-        // 累积剩余数据到 init_buf
-        size_t remain = need - s_ctx.init_len;
-        memcpy(s_ctx.init_buf + s_ctx.init_len, data, remain);
-        data += remain;
-        len -= remain;
-        s_ctx.init_len = need;
-        s_ctx.total_written += remain;
+        /* 策略改进：只提取need字节到init_buf，多余数据直接处理
+         * 避免因一次接收大数据块导致缓冲区溢出 */
+        size_t copy_to_buf;
+        size_t remaining_after_buf;
+
+        if (s_ctx.init_len + len < need) {
+            // 当前数据量仍不足need，全部缓存
+            copy_to_buf = len;
+            remaining_after_buf = 0;
+        } else {
+            // 数据量已足够，只提取need - init_len字节到缓冲区
+            copy_to_buf = need - s_ctx.init_len;
+            remaining_after_buf = len - copy_to_buf;
+        }
+
+        // 边界检查：确保不溢出init_buf（copy_to_buf已按need计算，不会溢出）
+        if (copy_to_buf > sizeof(s_ctx.init_buf) - s_ctx.init_len) {
+            ESP_LOGE(TAG, "init_buf 计算错误: copy=%zu > available=%zu",
+                     copy_to_buf, sizeof(s_ctx.init_buf) - s_ctx.init_len);
+            s_ctx.state = OTA_STATE_FAILED;
+            return ESP_ERR_NO_MEM;
+        }
+
+        // 缓存需要的数据到init_buf
+        if (copy_to_buf > 0) {
+            memcpy(s_ctx.init_buf + s_ctx.init_len, data, copy_to_buf);
+            s_ctx.init_len += copy_to_buf;
+            s_ctx.total_written += copy_to_buf;
+            data += copy_to_buf;
+            len -= copy_to_buf;
+        }
+
+        // 检查是否已积累足够数据解析头部
+        if (s_ctx.init_len < need) {
+            return ESP_OK;  // 继续等待更多数据
+        }
 
         // 解析 app descriptor
-        const esp_image_header_t *image_hdr = (const esp_image_header_t *)s_ctx.init_buf;
         const esp_app_desc_t *app_desc =
             (const esp_app_desc_t *)(s_ctx.init_buf + sizeof(esp_image_header_t) +
                                      sizeof(esp_image_segment_header_t));
@@ -178,16 +200,6 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
             return ESP_ERR_INVALID_ARG;
         }
 
-        // 检查分区大小是否足够
-        size_t header_size = image_hdr->spi_size;
-        if (header_size > s_ctx.update_partition->size) {
-            ESP_LOGE(TAG, "固件大小 (%lu KB) 超过 OTA 分区容量 (%lu KB)",
-                     (unsigned long)(header_size / 1024),
-                     (unsigned long)(s_ctx.update_partition->size / 1024));
-            s_ctx.state = OTA_STATE_FAILED;
-            return ESP_ERR_NO_MEM;
-        }
-
         // 启动 OTA 写入
         esp_err_t err = esp_ota_begin(s_ctx.update_partition, OTA_SIZE_UNKNOWN, &s_ctx.ota_handle);
         if (err != ESP_OK) {
@@ -196,28 +208,33 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
             return err;
         }
 
-        // 写入初始缓冲区（包含 ESP 头 + 镜像头 + 后续数据）
+        // 写入初始缓冲区（包含 ESP 头 + 镜像头）
         err = esp_ota_write(s_ctx.ota_handle, s_ctx.init_buf, s_ctx.init_len);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "esp_ota_write (init) 失败: %s", esp_err_to_name(err));
+            esp_ota_abort(s_ctx.ota_handle);
+            s_ctx.ota_handle = 0;
             s_ctx.state = OTA_STATE_FAILED;
             return err;
         }
 
-        // 写入当前调用中剩余的数据
-        if (len > 0) {
-            err = esp_ota_write(s_ctx.ota_handle, data, len);
+        s_ctx.image_header_checked = true;
+        s_ctx.state = OTA_STATE_WRITING;
+        ESP_LOGI(TAG, "OTA Flash 写入开始，头部解析完成");
+
+        // 写入当前调用中剩余的数据（如果有）
+        if (remaining_after_buf > 0) {
+            err = esp_ota_write(s_ctx.ota_handle, data, remaining_after_buf);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_ota_write 失败: %s", esp_err_to_name(err));
+                esp_ota_abort(s_ctx.ota_handle);
+                s_ctx.ota_handle = 0;
                 s_ctx.state = OTA_STATE_FAILED;
                 return err;
             }
-            s_ctx.total_written += len;
+            s_ctx.total_written += remaining_after_buf;
         }
 
-        s_ctx.image_header_checked = true;
-        s_ctx.state = OTA_STATE_WRITING;
-        ESP_LOGI(TAG, "OTA Flash 写入开始");
         return ESP_OK;
     }
 
@@ -225,6 +242,8 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
     esp_err_t err = esp_ota_write(s_ctx.ota_handle, data, len);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_write 失败: %s", esp_err_to_name(err));
+        esp_ota_abort(s_ctx.ota_handle);
+        s_ctx.ota_handle = 0;
         s_ctx.state = OTA_STATE_FAILED;
         return err;
     }
@@ -264,6 +283,17 @@ esp_err_t ota_update_end(void)
     }
 
     s_ctx.state = OTA_STATE_COMPLETE;
+
+    // OTA 成功后才取消回滚倒计时（如果当前固件处于 PENDING_VERIFY 状态）
+    esp_err_t mark_err = esp_ota_mark_app_valid_cancel_rollback();
+    if (mark_err == ESP_ERR_NOT_SUPPORTED) {
+        // 当前固件不是待验证状态，正常情况
+    } else if (mark_err != ESP_OK) {
+        ESP_LOGW(TAG, "标记当前固件有效失败: %s", esp_err_to_name(mark_err));
+    } else {
+        ESP_LOGI(TAG, "取消 OTA Rollback 倒计时");
+    }
+
     ESP_LOGI(TAG, "OTA 升级完成! 写入 %lu 字节, 下次启动将进入新固件", s_ctx.total_written);
     return ESP_OK;
 }
@@ -278,6 +308,7 @@ void ota_update_abort(void)
     s_ctx.total_written = 0;
     s_ctx.init_len = 0;
     s_ctx.image_header_checked = false;
+    s_ctx.update_partition = NULL;  // 清空分区指针，防止下次begin使用旧分区
     ESP_LOGW(TAG, "OTA 会话已中止");
 }
 

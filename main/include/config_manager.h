@@ -195,6 +195,16 @@ esp_err_t config_manager_save_runtime_data(const runtime_data_t *data);
  */
 esp_err_t config_manager_load_runtime_data(runtime_data_t *data);
 
+// ==================== 统一保存接口 ====================
+
+/**
+ * @brief 统一周期保存接口（批量写入优化）
+ * @note 协调所有模块的脏数据保存，减少NVS commit次数
+ * @param min_interval_sec 最小保存间隔（秒），0表示立即保存
+ * @return true 执行了保存
+ */
+bool config_manager_periodic_save_all(uint32_t min_interval_sec);
+
 // ==================== 配置验证 ====================
 
 /**

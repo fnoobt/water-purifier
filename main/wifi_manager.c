@@ -15,7 +15,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"  // 任务看门狗
 #include <string.h>
 #include <time.h>
 
@@ -61,13 +63,10 @@ static struct {
 
     // 重连任务句柄
     TaskHandle_t reconnect_task_handle;
-} ctx = {0};
 
-// 重连参数：在事件 handler 中设置，由重连任务读取
-static struct {
-    int max_retries;
-    bool ap_fallback;  // 是否允许退回到AP模式
-} reconnect_params = {0};
+    // 状态访问互斥锁（保护state、is_ap_mode等字段）
+    SemaphoreHandle_t state_mutex;
+} ctx = {0};
 
 // ==================== 状态名称 ====================
 
@@ -142,9 +141,17 @@ esp_err_t wifi_manager_init(void)
 
     ESP_LOGI(TAG, "初始化WiFi管理器...");
 
+    // 创建状态访问互斥锁
+    ctx.state_mutex = xSemaphoreCreateMutex();
+    if (!ctx.state_mutex) {
+        return ESP_ERR_NO_MEM;
+    }
+
     // 创建事件组
     ctx.event_group = xEventGroupCreate();
     if (!ctx.event_group) {
+        vSemaphoreDelete(ctx.state_mutex);
+        ctx.state_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
 
@@ -200,8 +207,8 @@ esp_err_t wifi_manager_start(void)
         ESP_LOGI(TAG, "使用保存的配置: %s", ctx.ssid);
 
         wifi_config_t wifi_cfg = {0};
-        strncpy((char*)wifi_cfg.sta.ssid, ctx.ssid, sizeof(wifi_cfg.sta.ssid));
-        strncpy((char*)wifi_cfg.sta.password, ctx.password, sizeof(wifi_cfg.sta.password));
+        strncpy((char*)wifi_cfg.sta.ssid, ctx.ssid, sizeof(wifi_cfg.sta.ssid) - 1);
+        strncpy((char*)wifi_cfg.sta.password, ctx.password, sizeof(wifi_cfg.sta.password) - 1);
         wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
         esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
@@ -314,7 +321,14 @@ esp_err_t wifi_manager_stop_ap_mode(void)
 
 wifi_state_t wifi_manager_get_state(void)
 {
-    return ctx.state;
+    wifi_state_t state = WIFI_STATE_IDLE;
+    if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        state = ctx.state;
+        xSemaphoreGive(ctx.state_mutex);
+    } else {
+        state = ctx.state;  // 互斥锁获取失败时仍返回当前值（降级处理）
+    }
+    return state;
 }
 
 const char* wifi_manager_get_state_name(wifi_state_t state)
@@ -327,12 +341,19 @@ const char* wifi_manager_get_state_name(wifi_state_t state)
 
 bool wifi_manager_is_connected(void)
 {
-    return ctx.state == WIFI_STATE_CONNECTED;
+    return wifi_manager_get_state() == WIFI_STATE_CONNECTED;
 }
 
 bool wifi_manager_is_ap_mode(void)
 {
-    return ctx.is_ap_mode;
+    bool is_ap = false;
+    if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        is_ap = ctx.is_ap_mode;
+        xSemaphoreGive(ctx.state_mutex);
+    } else {
+        is_ap = ctx.is_ap_mode;  // 降级处理
+    }
+    return is_ap;
 }
 
 esp_err_t wifi_manager_get_ip(char *ip_str, size_t buffer_size)
@@ -360,21 +381,33 @@ int8_t wifi_manager_get_rssi(void)
 
 const char* wifi_manager_get_ssid(void)
 {
-    return ctx.ssid;
+    // 使用静态缓冲区返回SSID（避免返回可能被修改的内部缓冲区指针）
+    static char ssid_copy[33] = {0};
+    if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        strncpy(ssid_copy, ctx.ssid, sizeof(ssid_copy) - 1);
+        ssid_copy[sizeof(ssid_copy) - 1] = '\0';
+        xSemaphoreGive(ctx.state_mutex);
+    } else {
+        strncpy(ssid_copy, ctx.ssid, sizeof(ssid_copy) - 1);
+        ssid_copy[sizeof(ssid_copy) - 1] = '\0';
+    }
+    return ssid_copy;
 }
 
 // ==================== 存储 ====================
 
 // WiFi配置保存节流：避免每次连接成功都写入Flash
+// 注意：s_last_wifi_save_time_us在事件回调中使用，竞态风险低，无需额外mutex
 static uint64_t s_last_wifi_save_time_us = 0;
 #define WIFI_SAVE_THROTTLE_SEC 60  // 最小保存间隔60秒
 
 esp_err_t wifi_manager_save_config(void)
 {
-    // 节流检查
+    // 节流检查（esp_timer_get_time()是原子操作，竞态风险低）
     uint64_t now_us = esp_timer_get_time();
-    uint64_t elapsed = (now_us - s_last_wifi_save_time_us) / 1000000ULL;
-    if (elapsed < WIFI_SAVE_THROTTLE_SEC && s_last_wifi_save_time_us > 0) {
+    uint64_t last_save = s_last_wifi_save_time_us;  // 读取时可能略有偏差，但不影响节流效果
+    uint64_t elapsed = (now_us - last_save) / 1000000ULL;
+    if (elapsed < WIFI_SAVE_THROTTLE_SEC && last_save > 0) {
         ESP_LOGD(TAG, "WiFi配置保存节流：距上次保存仅%lu秒，跳过", (uint32_t)elapsed);
         return ESP_OK;
     }
@@ -383,13 +416,26 @@ esp_err_t wifi_manager_save_config(void)
     esp_err_t err = nvs_open("wifi", NVS_READWRITE, &handle);
     if (err != ESP_OK) return err;
 
-    nvs_set_str(handle, "ssid", ctx.ssid);
-    nvs_set_str(handle, "pass", ctx.password);
+    // 使用mutex保护ssid/password读取
+    char ssid[33], password[65];
+    if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        strncpy(ssid, ctx.ssid, sizeof(ssid) - 1);
+        strncpy(password, ctx.password, sizeof(password) - 1);
+        xSemaphoreGive(ctx.state_mutex);
+    } else {
+        strncpy(ssid, ctx.ssid, sizeof(ssid) - 1);
+        strncpy(password, ctx.password, sizeof(password) - 1);
+    }
+    ssid[sizeof(ssid) - 1] = '\0';
+    password[sizeof(password) - 1] = '\0';
+
+    nvs_set_str(handle, "ssid", ssid);
+    nvs_set_str(handle, "pass", password);
     err = nvs_commit(handle);
     nvs_close(handle);
 
     if (err == ESP_OK) {
-        s_last_wifi_save_time_us = esp_timer_get_time();
+        s_last_wifi_save_time_us = esp_timer_get_time();  // 更新时间戳（原子操作）
         ESP_LOGI(TAG, "WiFi配置已保存");
     }
     return err;
@@ -405,7 +451,11 @@ esp_err_t wifi_manager_load_config(void)
     err = nvs_get_str(handle, "ssid", ctx.ssid, &len);
     if (err == ESP_OK) {
         len = sizeof(ctx.password);
-        nvs_get_str(handle, "pass", ctx.password, &len);
+        esp_err_t pass_err = nvs_get_str(handle, "pass", ctx.password, &len);
+        if (pass_err != ESP_OK && pass_err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "加载WiFi密码失败: %s", esp_err_to_name(pass_err));
+            ctx.password[0] = '\0';
+        }
     }
     nvs_close(handle);
     return err;
@@ -447,12 +497,28 @@ esp_err_t wifi_manager_register_callback(wifi_state_callback_t callback)
 
 static void set_state(wifi_state_t state)
 {
-    if (ctx.state != state) {
-        ctx.state = state;
-        if (ctx.callback) {
-            ctx.callback(state);
+    // 使用mutex保护状态变更
+    if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (ctx.state != state) {
+            ctx.state = state;
+            wifi_state_callback_t callback = ctx.callback;  // 在锁内复制回调指针
+            xSemaphoreGive(ctx.state_mutex);
+            if (callback) {
+                callback(state);
+            }
+            ESP_LOGI(TAG, "状态: %s", state_names[state]);
+        } else {
+            xSemaphoreGive(ctx.state_mutex);
         }
-        ESP_LOGI(TAG, "状态: %s", state_names[state]);
+    } else {
+        // 互斥锁获取失败时直接更新（降级处理，避免阻塞事件回调）
+        if (ctx.state != state) {
+            ctx.state = state;
+            if (ctx.callback) {
+                ctx.callback(state);
+            }
+            ESP_LOGW(TAG, "状态变更(无锁): %s", state_names[state]);
+        }
     }
 }
 
@@ -464,11 +530,23 @@ static void set_state(wifi_state_t state)
  * 策略：指数退避重连，初始1s，最大30s，失败后回退到AP模式
  * 即使AP模式下，也会周期性尝试STA重连
  */
+
+typedef struct {
+    int max_retries;
+    bool ap_fallback;
+} wifi_reconnect_params_t;
+
 static void wifi_reconnect_task(void *pvParameters)
 {
+    int max_retries = 10;
+    bool ap_fallback = true;
+    if (pvParameters) {
+        wifi_reconnect_params_t *params = (wifi_reconnect_params_t *)pvParameters;
+        max_retries = params->max_retries;
+        ap_fallback = params->ap_fallback;
+        free(params);
+    }
     int retry = 0;
-    const int max_retries = reconnect_params.max_retries;
-    const bool ap_fallback = reconnect_params.ap_fallback;
     const TickType_t delays[] = {
         pdMS_TO_TICKS(1000),   // 第1次：1s
         pdMS_TO_TICKS(2000),   // 第2次：2s
@@ -481,9 +559,13 @@ static void wifi_reconnect_task(void *pvParameters)
 
     ESP_LOGI(TAG, "重连任务启动");
 
+    // 注册看门狗
+    esp_task_wdt_add(NULL);
+
     while (retry < max_retries) {
         TickType_t delay = delays[(retry < delay_count) ? retry : delay_count - 1];
         ESP_LOGI(TAG, "尝试重连 %d/%d，等待 %lums...", retry + 1, max_retries, pdTICKS_TO_MS(delay));
+        esp_task_wdt_reset();  // 重置看门狗（长延迟前）
         vTaskDelay(delay);
 
         // 检查是否已经连接成功（可能被事件处理器抢先连接）
@@ -507,6 +589,7 @@ static void wifi_reconnect_task(void *pvParameters)
 
         // 等待连接结果（最多等15秒，由事件处理器更新状态）
         for (int i = 0; i < 15; i++) {
+            esp_task_wdt_reset();  // 每秒重置看门狗
             vTaskDelay(pdMS_TO_TICKS(1000));
             if (ctx.state == WIFI_STATE_CONNECTED) {
                 ESP_LOGI(TAG, "重连成功");
@@ -523,8 +606,10 @@ static void wifi_reconnect_task(void *pvParameters)
 
         // AP模式下，每隔5分钟尝试一次STA重连
         ESP_LOGI(TAG, "AP模式下将周期性尝试STA重连");
-        while (true) {
+        while (ctx.started) {
+            esp_task_wdt_reset();  // 5分钟延迟前重置看门狗
             vTaskDelay(pdMS_TO_TICKS(300000)); // 5分钟
+            if (!ctx.started) break;
             if (ctx.state == WIFI_STATE_CONNECTED) break;
             ESP_LOGI(TAG, "AP模式周期重连尝试...");
             wifi_manager_stop_ap_mode();
@@ -533,13 +618,14 @@ static void wifi_reconnect_task(void *pvParameters)
             if (ret == ESP_OK) {
                 // 等10秒看是否连接成功
                 for (int i = 0; i < 10; i++) {
+                    esp_task_wdt_reset();  // 每秒重置看门狗
                     vTaskDelay(pdMS_TO_TICKS(1000));
-                    if (ctx.state == WIFI_STATE_CONNECTED) break;
+                    if (ctx.state == WIFI_STATE_CONNECTED || !ctx.started) break;
                 }
             }
-            if (ctx.state == WIFI_STATE_CONNECTED) break;
+            if (ctx.state == WIFI_STATE_CONNECTED || !ctx.started) break;
             // 没成功，恢复AP模式
-            if (!ctx.is_ap_mode) {
+            if (!ctx.is_ap_mode && ctx.started) {
                 wifi_manager_start_ap_mode();
             }
         }
@@ -548,6 +634,7 @@ static void wifi_reconnect_task(void *pvParameters)
     }
 
 exit_task:
+    esp_task_wdt_delete(NULL);  // 任务结束前注销看门狗
     ctx.reconnect_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -595,9 +682,19 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
                 // 如果已有重连任务在运行，不重复创建
                 if (ctx.reconnect_task_handle == NULL) {
                     set_state(WIFI_STATE_RECONNECTING);
-                    reconnect_params.max_retries = 10;
-                    reconnect_params.ap_fallback = true;
-                    xTaskCreate(wifi_reconnect_task, "wifi_reconnect", 4096, NULL, 5, &ctx.reconnect_task_handle);
+                    /* 通过 pvParameters 传递重连参数，避免全局变量竞态 */
+                    wifi_reconnect_params_t *params = malloc(sizeof(wifi_reconnect_params_t));
+                    if (params) {
+                        params->max_retries = 10;
+                        params->ap_fallback = true;
+                        BaseType_t ret = xTaskCreate(wifi_reconnect_task, "wifi_reconnect", 3072, params, 5, &ctx.reconnect_task_handle);
+                        if (ret != pdPASS) {
+                            free(params);
+                            ESP_LOGE(TAG, "创建重连任务失败");
+                        }
+                    } else {
+                        xTaskCreate(wifi_reconnect_task, "wifi_reconnect", 3072, NULL, 5, &ctx.reconnect_task_handle);
+                    }
                 }
                 break;
             }

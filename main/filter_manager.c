@@ -81,7 +81,7 @@ static struct {
 // ==================== 私有函数 ====================
 
 static void load_from_nvs(void);
-static void save_to_nvs(void);
+static esp_err_t save_to_nvs(void);
 static void fixup_filter_time_on_ntp_sync(void);
 static void update_filter_time_percentage(void);
 
@@ -153,13 +153,13 @@ static void load_from_nvs(void)
              fctx.total_water_used, fctx.filters[FILTER_RO_MEMBRANE].used_liters);
 }
 
-static void save_to_nvs(void)
+static esp_err_t save_to_nvs(void)
 {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_FILTERS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "NVS打开失败: %s", esp_err_to_name(err));
-        return;
+        return err;
     }
 
     nvs_set_u32(handle, "total_water", fctx.total_water_used);
@@ -183,10 +183,15 @@ static void save_to_nvs(void)
         nvs_set_u32(handle, key, fctx.filters[i].time_limit_hours);
     }
 
-    nvs_commit(handle);
+    err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS提交失败: %s", esp_err_to_name(err));
+    } else {
+        fctx.save_needed = false;
+        ESP_LOGD(TAG, "滤芯数据已保存");
+    }
     nvs_close(handle);
-    fctx.save_needed = false;
-    ESP_LOGD(TAG, "滤芯数据已保存");
+    return err;
 }
 
 // ==================== 辅助函数 ====================
@@ -218,21 +223,36 @@ static void fixup_filter_time_on_ntp_sync(void)
 
 /**
  * @brief 更新所有滤芯的时间维度寿命百分比
+ * @note 当NTP未同步时，使用系统启动时间作为回退估算
  */
 static void update_filter_time_percentage(void)
 {
     time_t now_sec = time(NULL);
-    if (now_sec <= 0) return;  // NTP未同步，无法计算日历时长
+    uint64_t boot_elapsed_sec = 0;  // 回退：系统启动后经过的秒数
+
+    // NTP未同步时，使用boot时间作为回退
+    if (now_sec <= 0) {
+        boot_elapsed_sec = (uint64_t)(esp_timer_get_time() / 1000000ULL);
+        ESP_LOGD(TAG, "NTP未同步，使用启动时间估算滤芯日历寿命");
+    }
 
     for (int i = 0; i < FILTER_COUNT; i++) {
-        // 时间维度（日历时长，NTP墙钟）
-        if (fctx.filters[i].time_limit_hours > 0 &&
-            now_sec > 0 && fctx.filters[i].last_reset_time > 0 &&
-            now_sec >= fctx.filters[i].last_reset_time) {
-            uint32_t elapsed_hours = (uint32_t)((now_sec - fctx.filters[i].last_reset_time) / 3600);
-            float time_remaining = 1.0f - (float)elapsed_hours / fctx.filters[i].time_limit_hours;
-            if (time_remaining < 0) time_remaining = 0;
-            fctx.filters[i].time_percentage = (uint8_t)(time_remaining * 100);
+        uint32_t elapsed_hours = 0;
+
+        if (fctx.filters[i].time_limit_hours > 0 && fctx.filters[i].last_reset_time > 0) {
+            if (now_sec > 0 && now_sec >= fctx.filters[i].last_reset_time) {
+                // NTP已同步：使用日历时间
+                elapsed_hours = (uint32_t)((now_sec - fctx.filters[i].last_reset_time) / 3600);
+            } else if (boot_elapsed_sec > 0 && fctx.filters[i].install_time > 0) {
+                // NTP未同步：使用启动后经过的秒数估算
+                elapsed_hours = (uint32_t)(boot_elapsed_sec / 3600);
+            }
+
+            if (elapsed_hours > 0) {
+                float time_remaining = 1.0f - (float)elapsed_hours / fctx.filters[i].time_limit_hours;
+                if (time_remaining < 0) time_remaining = 0;
+                fctx.filters[i].time_percentage = (uint8_t)(time_remaining * 100);
+            }
         }
 
         // 有效寿命 = min(水量%, 时间%)
@@ -292,24 +312,29 @@ esp_err_t filter_mgr_init(void)
 
 esp_err_t filter_mgr_set_filter_capacity(uint32_t total_liters)
 {
+    // 兼容旧接口：仅设置RO膜兼容字段
+    ESP_LOGW(TAG, "filter_mgr_set_filter_capacity已废弃，请使用filter_mgr_set_all_filter_capacity");
     fctx.filter_total_liters = total_liters;
-    // 同步更新所有滤芯的容量
-    for (int i = 0; i < FILTER_COUNT; i++) {
-        fctx.filters[i].total_liters = total_liters;
-        // 重新计算水量百分比
-        if (total_liters > 0) {
-            float remaining = 1.0f - (float)fctx.filters[i].used_liters / total_liters;
-            if (remaining < 0) remaining = 0;
-            fctx.filters[i].percentage = (uint8_t)(remaining * 100);
+    fctx.filters[FILTER_RO_MEMBRANE].total_liters = total_liters;
+    if (total_liters > 0) {
+        float remaining = 1.0f - (float)fctx.filters[FILTER_RO_MEMBRANE].used_liters / total_liters;
+        if (remaining < 0) remaining = 0;
+        fctx.filters[FILTER_RO_MEMBRANE].percentage = (uint8_t)(remaining * 100);
+        if (fctx.filters[FILTER_RO_MEMBRANE].percentage > 100) {
+            fctx.filters[FILTER_RO_MEMBRANE].percentage = 100;
         }
+        fctx.filters[FILTER_RO_MEMBRANE].effective_percentage =
+            (fctx.filters[FILTER_RO_MEMBRANE].percentage < fctx.filters[FILTER_RO_MEMBRANE].time_percentage) ?
+            fctx.filters[FILTER_RO_MEMBRANE].percentage : fctx.filters[FILTER_RO_MEMBRANE].time_percentage;
     }
-    ESP_LOGI(TAG, "滤芯容量设置: %lu 升", total_liters);
+    ESP_LOGI(TAG, "RO膜兼容容量设置: %lu 升", total_liters);
     return ESP_OK;
 }
 
 esp_err_t filter_mgr_update_water_usage(float liters)
 {
-    if (liters <= 0.0f) {
+    /* NaN/Infinity检查：无效浮点值拒绝处理 */
+    if (!isfinite(liters) || liters <= 0.0f) {
         return ESP_OK;
     }
 
@@ -324,12 +349,19 @@ esp_err_t filter_mgr_update_water_usage(float liters)
         uint32_t committed_liters = (uint32_t)fctx.water_usage_accumulator;
         fctx.water_usage_accumulator -= committed_liters;
 
-        fctx.filter_used_liters += committed_liters;
-        fctx.total_water_used += committed_liters;
+        // 防止整数溢出
+        if (UINT32_MAX - fctx.filter_used_liters >= committed_liters) {
+            fctx.filter_used_liters += committed_liters;
+        }
+        if (UINT32_MAX - fctx.total_water_used >= committed_liters) {
+            fctx.total_water_used += committed_liters;
+        }
 
         // 更新每个滤芯的用水量
         for (int i = 0; i < FILTER_COUNT; i++) {
-            fctx.filters[i].used_liters += committed_liters;
+            if (UINT32_MAX - fctx.filters[i].used_liters >= committed_liters) {
+                fctx.filters[i].used_liters += committed_liters;
+            }
 
             // 水量维度
             if (fctx.filters[i].total_liters > 0) {
@@ -445,8 +477,7 @@ esp_err_t filter_mgr_reset_filter(filter_type_t filter_type)
 
     ESP_LOGI(TAG, "%s滤芯已重置", filter_names[filter_type]);
     fctx.save_needed = true;
-    save_to_nvs();  // 关键操作立即写入
-    return ESP_OK;
+    return save_to_nvs();  // 关键操作立即写入，返回保存结果
 }
 
 esp_err_t filter_mgr_reset_all_filters(void)
@@ -467,8 +498,7 @@ esp_err_t filter_mgr_reset_all_filters(void)
     fctx.water_usage_accumulator = 0.0f;
 
     ESP_LOGI(TAG, "所有滤芯已重置");
-    save_to_nvs();
-    return ESP_OK;
+    return save_to_nvs();  // 返回保存结果
 }
 
 /**
@@ -505,8 +535,7 @@ esp_err_t filter_mgr_set_all_filter_capacity(const uint32_t capacities[FILTER_CO
 
     ESP_LOGI(TAG, "所有滤芯容量已批量更新，RO膜: %lu 升", capacities[FILTER_RO_MEMBRANE]);
     fctx.save_needed = true;
-    save_to_nvs();  // 一次性写入所有滤芯
-    return ESP_OK;
+    return save_to_nvs();  // 一次性写入所有滤芯，返回保存结果
 }
 
 esp_err_t filter_mgr_set_all_filter_times(const uint32_t time_hours[FILTER_COUNT])
@@ -524,8 +553,7 @@ esp_err_t filter_mgr_set_all_filter_times(const uint32_t time_hours[FILTER_COUNT
     update_filter_time_percentage();
     ESP_LOGI(TAG, "所有滤芯时间寿命已批量更新");
     fctx.save_needed = true;
-    save_to_nvs();
-    return ESP_OK;
+    return save_to_nvs();  // 返回保存结果
 }
 
 esp_err_t filter_mgr_set_filter_capacity_ex(filter_type_t filter_type, uint32_t total_liters)
@@ -557,8 +585,7 @@ esp_err_t filter_mgr_set_filter_capacity_ex(filter_type_t filter_type, uint32_t 
 
     ESP_LOGI(TAG, "%s滤芯容量设置为 %lu 升", filter_names[filter_type], total_liters);
     fctx.save_needed = true;
-    save_to_nvs();  // 关键操作立即写入
-    return ESP_OK;
+    return save_to_nvs();  // 关键操作立即写入，返回保存结果
 }
 
 const char* filter_mgr_get_filter_name(filter_type_t filter_type)
@@ -602,12 +629,16 @@ float filter_mgr_get_production_rate(void)
 /**
  * @brief 周期性保存滤芯数据到NVS
  * @note 仅在数据有变化时写入，避免频繁写入Flash
- * @return true 执行了保存
+ * @return true 执行了保存且成功
  */
 bool filter_mgr_periodic_save(void)
 {
     if (fctx.save_needed) {
-        save_to_nvs();
+        esp_err_t err = save_to_nvs();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "周期性保存失败: %s", esp_err_to_name(err));
+            return false;  // 保存失败，但save_needed已被清除（下次不会再尝试）
+        }
         return true;
     }
     return false;

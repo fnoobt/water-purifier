@@ -153,16 +153,6 @@ esp_err_t gpio_driver_set_led_mode(uint8_t led_num, led_mode_t mode);
 esp_err_t gpio_driver_get_output_states(bool *inlet_valve, bool *waste_valve,
                                          bool *return_valve, bool *boost_pump);
 
-// ==================== 去抖动处理 ====================
-
-/**
- * @brief GPIO去抖动读取（内部使用）
- * @param gpio GPIO编号
- * @param debounce_time 去抖动时间（毫秒）
- * @return 稳定后的GPIO状态
- */
-bool gpio_driver_debounce_read(gpio_num_t gpio, uint32_t debounce_time);
-
 #ifdef __cplusplus
 }
 #endif

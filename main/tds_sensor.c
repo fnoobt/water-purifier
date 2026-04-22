@@ -10,9 +10,9 @@
 #include "esp_timer.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_rom_sys.h"
-#include "esp_adc/adc_oneshot.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -25,12 +25,16 @@ static const char *TAG = "TDS";
 #define ADC_SAMPLE_COUNT    16      // 每次测量采样次数
 #define ADC_SAMPLE_DELAY_US 500     // 采样间隔(微秒)
 
+// 报警迟滞：解除报警需要低于阈值5%，防止阈值附近频繁切换
+#define ALARM_HYSTERESIS_PERCENT 0.05f  // 5%迟滞
+
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
 
 static struct {
     bool initialized;
     bool running;
     TaskHandle_t task_handle;
+    SemaphoreHandle_t data_mutex;  // 保护latest数组的互斥锁
 
     // 报警阈值
     float alarm_threshold[TDS_SENSOR_COUNT];
@@ -131,6 +135,14 @@ esp_err_t tds_sensor_init(void)
         tds_ctx.latest[i].valid = false;
     }
 
+    // 创建数据互斥锁
+    tds_ctx.data_mutex = xSemaphoreCreateMutex();
+    if (!tds_ctx.data_mutex) {
+        ESP_LOGE(TAG, "创建数据互斥锁失败");
+        adc_oneshot_del_unit(adc1_handle);
+        return ESP_ERR_NO_MEM;
+    }
+
     tds_ctx.initialized = true;
     ESP_LOGI(TAG, "TDS传感器初始化完成");
     return ESP_OK;
@@ -143,6 +155,11 @@ esp_err_t tds_sensor_deinit(void)
     }
 
     tds_sensor_stop();
+
+    if (tds_ctx.data_mutex) {
+        vSemaphoreDelete(tds_ctx.data_mutex);
+        tds_ctx.data_mutex = NULL;
+    }
 
     if (adc1_handle) {
         adc_oneshot_del_unit(adc1_handle);
@@ -162,29 +179,43 @@ static void tds_sensor_task(void *arg)
     while (tds_ctx.running) {
         tds_dual_measurement_t dual;
         if (tds_sensor_measure_dual(&dual) == ESP_OK) {
-            // 更新最新测量值
-            memcpy(&tds_ctx.latest[TDS_SENSOR_INLET], &dual.inlet, sizeof(tds_measurement_t));
-            memcpy(&tds_ctx.latest[TDS_SENSOR_OUTLET], &dual.outlet, sizeof(tds_measurement_t));
+            // 更新最新测量值（加锁保护）
+            if (xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                memcpy(&tds_ctx.latest[TDS_SENSOR_INLET], &dual.inlet, sizeof(tds_measurement_t));
+                memcpy(&tds_ctx.latest[TDS_SENSOR_OUTLET], &dual.outlet, sizeof(tds_measurement_t));
+                xSemaphoreGive(tds_ctx.data_mutex);
+            }
 
             ESP_LOGD(TAG, "进水: %.1f ppm, 出水: %.1f ppm, 去除率: %.1f%%",
                      dual.inlet.tds_value, dual.outlet.tds_value, dual.reduction_rate);
 
-            // 检查报警
+            // 检查报警（分别检查进水和出水传感器，带迟滞防止频繁切换）
+            float tds_values[TDS_SENSOR_COUNT] = {dual.inlet.tds_value, dual.outlet.tds_value};
             for (int i = 0; i < TDS_SENSOR_COUNT; i++) {
-                if (tds_ctx.latest[i].tds_value > tds_ctx.alarm_threshold[i]) {
+                float tds_val = tds_values[i];
+                float threshold = tds_ctx.alarm_threshold[i];
+                float clear_threshold = threshold * (1.0f - ALARM_HYSTERESIS_PERCENT);  // 解除阈值=阈值*0.95
+
+                if (tds_val > threshold) {
+                    // 超过报警阈值
                     if (!tds_ctx.alarm_active[i]) {
                         ESP_LOGW(TAG, "%s报警: %.1f > %.1f ppm",
                                  sensor_names[i],
-                                 tds_ctx.latest[i].tds_value,
-                                 tds_ctx.alarm_threshold[i]);
+                                 tds_val,
+                                 threshold);
                         tds_ctx.alarm_active[i] = true;
                     }
-                } else {
+                } else if (tds_val < clear_threshold) {
+                    // 低于解除阈值（比报警阈值低5%），带迟滞
                     if (tds_ctx.alarm_active[i]) {
-                        ESP_LOGI(TAG, "%s报警已解除", sensor_names[i]);
+                        ESP_LOGI(TAG, "%s报警已解除: %.1f < %.1f ppm (迟滞阈值)",
+                                 sensor_names[i],
+                                 tds_val,
+                                 clear_threshold);
                         tds_ctx.alarm_active[i] = false;
                     }
                 }
+                // 介于阈值和解除阈值之间时，保持当前报警状态不变（迟滞区间）
             }
         }
 
@@ -211,7 +242,7 @@ esp_err_t tds_sensor_start(void)
     BaseType_t ret = xTaskCreate(
         tds_sensor_task,
         "tds_task",
-        3072,
+        2048,  // 优化：ADC读取栈需求小，2048字节足够
         NULL,
         4,
         &tds_ctx.task_handle
@@ -264,9 +295,13 @@ static int adc_read_averaged(adc_channel_t channel)
         esp_rom_delay_us(ADC_SAMPLE_DELAY_US);
     }
 
-    // 去掉最大最小值后计算平均
-    sum = sum - min_val - max_val;
-    return sum / (ADC_SAMPLE_COUNT - 2);
+    // 去掉最大最小值后计算平均（防止整数溢出）
+    if (sum >= min_val + max_val) {
+        sum = sum - min_val - max_val;
+        return sum / (ADC_SAMPLE_COUNT - 2);
+    }
+    // 异常情况：sum小于min+max，返回中间值
+    return (min_val + max_val) / 2;
 }
 
 esp_err_t tds_sensor_measure(tds_sensor_id_t sensor_id, tds_measurement_t *measurement)
@@ -335,11 +370,21 @@ esp_err_t tds_sensor_get_latest(tds_sensor_id_t sensor_id, tds_measurement_t *me
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (!tds_ctx.latest[sensor_id].valid) {
+    if (!tds_ctx.data_mutex) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    bool valid = tds_ctx.latest[sensor_id].valid;
     memcpy(measurement, &tds_ctx.latest[sensor_id], sizeof(tds_measurement_t));
+    xSemaphoreGive(tds_ctx.data_mutex);
+
+    if (!valid) {
+        return ESP_ERR_INVALID_STATE;
+    }
     return ESP_OK;
 }
 
@@ -349,11 +394,19 @@ esp_err_t tds_sensor_get_latest_dual(tds_dual_measurement_t *dual_measurement)
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (!tds_ctx.data_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     memcpy(&dual_measurement->inlet, &tds_ctx.latest[TDS_SENSOR_INLET], sizeof(tds_measurement_t));
     memcpy(&dual_measurement->outlet, &tds_ctx.latest[TDS_SENSOR_OUTLET], sizeof(tds_measurement_t));
-
     dual_measurement->both_valid = (tds_ctx.latest[TDS_SENSOR_INLET].valid &&
                                     tds_ctx.latest[TDS_SENSOR_OUTLET].valid);
+    xSemaphoreGive(tds_ctx.data_mutex);
 
     if (dual_measurement->both_valid && dual_measurement->inlet.tds_value > 0) {
         dual_measurement->reduction_rate =
@@ -454,8 +507,17 @@ bool tds_sensor_is_alarm(tds_sensor_id_t sensor_id)
         return false;
     }
 
-    return (tds_ctx.latest[sensor_id].valid &&
-            tds_ctx.latest[sensor_id].tds_value > tds_ctx.alarm_threshold[sensor_id]);
+    if (!tds_ctx.data_mutex) {
+        return false;
+    }
+
+    bool result = false;
+    if (xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        result = (tds_ctx.latest[sensor_id].valid &&
+                  tds_ctx.latest[sensor_id].tds_value > tds_ctx.alarm_threshold[sensor_id]);
+        xSemaphoreGive(tds_ctx.data_mutex);
+    }
+    return result;
 }
 
 // ==================== 温度 ====================
@@ -484,10 +546,14 @@ esp_err_t tds_sensor_get_status_string(char *buffer, size_t buffer_size)
         return ESP_ERR_INVALID_ARG;
     }
 
-    float inlet_tds = tds_ctx.latest[TDS_SENSOR_INLET].valid ?
-                      tds_ctx.latest[TDS_SENSOR_INLET].tds_value : 0;
-    float outlet_tds = tds_ctx.latest[TDS_SENSOR_OUTLET].valid ?
-                       tds_ctx.latest[TDS_SENSOR_OUTLET].tds_value : 0;
+    float inlet_tds = 0, outlet_tds = 0;
+    if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        inlet_tds = tds_ctx.latest[TDS_SENSOR_INLET].valid ?
+                    tds_ctx.latest[TDS_SENSOR_INLET].tds_value : 0;
+        outlet_tds = tds_ctx.latest[TDS_SENSOR_OUTLET].valid ?
+                     tds_ctx.latest[TDS_SENSOR_OUTLET].tds_value : 0;
+        xSemaphoreGive(tds_ctx.data_mutex);
+    }
 
     snprintf(buffer, buffer_size,
              "进水TDS: %.1f ppm (阈值: %.1f)\n"
@@ -522,8 +588,12 @@ static float calculate_tds(float voltage, float temperature)
     // 线性转换: TDS = (voltage_mV / 2300) * 1000
     float tds = voltage * (1000.0f / 2300.0f);
 
-    // 温度补偿 (系数约2%/°C)
-    tds = tds / (1.0f + 0.02f * (temperature - 25.0f));
+    // 温度补偿 (系数约2%/°C)，防止 denominator=0 (temperature=50°C)
+    float denom = 1.0f + 0.02f * (temperature - 25.0f);
+    if (denom < 0.5f) {
+        denom = 0.5f;
+    }
+    tds = tds / denom;
 
     return tds;
 }
@@ -535,8 +605,10 @@ static float voltage_to_ec(float voltage)
     }
     // TDS探针规格: 0~2.3V -> 0~1000ppm
     float tds = voltage * (1000.0f / 2300.0f);
-    // EC ≈ TDS / 0.65 (典型转换系数)
-    return tds / 0.65f;
+    // EC ≈ TDS / 0.65 (典型转换系数)，防止除零
+    float ec_div = 0.65f;
+    if (ec_div < 0.01f) ec_div = 0.01f;
+    return tds / ec_div;
 }
 
 // 温度补偿函数（保留供将来扩展使用）
@@ -545,5 +617,7 @@ static float temperature_compensation(float ec, float temperature)
 {
     // 温度补偿系数约2%/°C
     const float temp_coeff = 0.02f;
-    return ec / (1.0f + temp_coeff * (temperature - 25.0f));
+    float denom = 1.0f + temp_coeff * (temperature - 25.0f);
+    if (denom < 0.5f) denom = 0.5f;
+    return ec / denom;
 }

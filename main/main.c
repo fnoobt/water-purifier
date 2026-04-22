@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_task_wdt.h"  // 任务看门狗
 
 // 模块头文件
 #include "gpio_driver.h"
@@ -100,41 +101,63 @@ static void monitor_task(void *arg)
 {
     ESP_LOGI(TAG, "监控任务启动");
 
+    // 注册监控任务到看门狗（必须在循环reset前注册）
+    esp_err_t wdt_ret = esp_task_wdt_add(NULL);
+    if (wdt_ret == ESP_OK) {
+        ESP_LOGI(TAG, "监控任务已注册到看门狗");
+    } else {
+        ESP_LOGW(TAG, "监控任务看门狗注册失败: %s", esp_err_to_name(wdt_ret));
+    }
+
+    uint32_t loop_count = 0;
+
     while (1) {
-        // 检查漏水
-        if (gpio_driver_read_water_leak() && !fsm_is_stop_state()) {
-            ESP_LOGE(TAG, "检测到漏水！");
-            fsm_send_event(FSM_EVENT_WATER_LEAK);
-        }
+        // 重置看门狗（循环开始时）
+        esp_task_wdt_reset();
 
-        // 打印状态
-        fsm_state_t state = fsm_get_state();
-        tds_dual_measurement_t tds;
-        tds_sensor_get_latest_dual(&tds);
+        // 每30秒执行一次完整检查（避免频繁日志）
+        if (loop_count % 30 == 0) {
+            // 检查漏水
+            if (gpio_driver_read_water_leak() && !fsm_is_stop_state()) {
+                ESP_LOGE(TAG, "检测到漏水！");
+                fsm_send_event(FSM_EVENT_WATER_LEAK);
+            }
 
-        ESP_LOGI(TAG, "状态: %s, TDS: %.0f/%.0f ppm",
-                 fsm_get_state_name(state),
-                 tds.inlet.valid ? tds.inlet.tds_value : 0,
-                 tds.outlet.valid ? tds.outlet.tds_value : 0);
+            // 打印状态
+            fsm_state_t state = fsm_get_state();
+            tds_dual_measurement_t tds;
+            tds_sensor_get_latest_dual(&tds);
 
-        // 堆内存监控
-        pm_manager_check_heap();
+            ESP_LOGI(TAG, "状态: %s, TDS: %.0f/%.0f ppm",
+                     fsm_get_state_name(state),
+                     tds.inlet.valid ? tds.inlet.tds_value : 0,
+                     tds.outlet.valid ? tds.outlet.tds_value : 0);
 
-        // WiFi TX功率动态调整（基于RSSI）
-        if (wifi_manager_is_connected()) {
-            int8_t rssi = wifi_manager_get_rssi();
-            if (rssi != 0) {
-                pm_manager_adjust_wifi_tx_power(rssi);
+            // 堆内存监控
+            pm_manager_check_heap();
+
+            // WiFi TX功率动态调整（基于RSSI）
+            if (wifi_manager_is_connected()) {
+                int8_t rssi = wifi_manager_get_rssi();
+                if (rssi != 0) {
+                    pm_manager_adjust_wifi_tx_power(rssi);
+                }
+            }
+
+            // 发布MQTT状态
+            if (mqtt_client_is_connected()) {
+                mqtt_publish_purifier_status();
+                mqtt_publish_tds_value();
+                // MQTT发布后重置看门狗
+                esp_task_wdt_reset();
             }
         }
 
-        // 发布MQTT状态
-        if (mqtt_client_is_connected()) {
-            mqtt_publish_purifier_status();
-            mqtt_publish_tds_value();
-        }
+        loop_count++;
 
-        vTaskDelay(pdMS_TO_TICKS(30000));  // 30秒
+        // 关键：延迟时间必须小于看门狗超时（5秒）
+        // 使用1秒延迟确保每秒都能reset看门狗
+        vTaskDelay(pdMS_TO_TICKS(1000));  // 1秒
     }
 }
 
@@ -148,13 +171,18 @@ void app_main(void)
     ESP_LOGI(TAG, "  硬件: ESP32-C3");
     ESP_LOGI(TAG, "========================================");
 
+    // 0. 任务看门狗说明
+    // ESP-IDF v6.0系统启动时已初始化看门狗（~5秒超时），无需重复初始化
+    // 我们的monitor和fsm任务会注册到看门狗并定期reset
+    ESP_LOGI(TAG, "[0/10] 任务看门狗由系统配置（~5秒超时）");
+
     // 1. 初始化配置管理器
-    ESP_LOGI(TAG, "[1/7] 初始化配置管理器...");
+    ESP_LOGI(TAG, "[1/10] 初始化配置管理器...");
     config_manager_init();
     config_manager_print_config();
 
     // 2. 初始化GPIO
-    ESP_LOGI(TAG, "[2/7] 初始化GPIO驱动...");
+    ESP_LOGI(TAG, "[2/10] 初始化GPIO驱动...");
     gpio_driver_init_inputs();
     gpio_driver_init_outputs();
     gpio_driver_init_leds();
@@ -164,16 +192,22 @@ void app_main(void)
     config_manager_get_config(&cfg);
     gpio_driver_set_relay_trigger_level(cfg.relay_trigger_level);
 
-    // 3. 初始化TDS传感器
-    ESP_LOGI(TAG, "[3/7] 初始化TDS传感器...");
+    // 3. 初始化电源管理（FSM回调会调用pm_manager_set_cpu_mode，需提前初始化）
+    ESP_LOGI(TAG, "[3/10] 初始化电源管理...");
+    if (pm_manager_init() != ESP_OK) {
+        ESP_LOGW(TAG, "电源管理初始化失败");
+    }
+
+    // 4. 初始化TDS传感器
+    ESP_LOGI(TAG, "[4/10] 初始化TDS传感器...");
     tds_sensor_init();
     tds_sensor_set_alarm_threshold(TDS_SENSOR_INLET, cfg.tds_inlet_threshold);
     tds_sensor_set_alarm_threshold(TDS_SENSOR_OUTLET, cfg.tds_outlet_threshold);
     filter_mgr_init();
     tds_sensor_start();
 
-    // 4. 初始化状态机
-    ESP_LOGI(TAG, "[4/7] 初始化状态机...");
+    // 5. 初始化状态机
+    ESP_LOGI(TAG, "[5/10] 初始化状态机...");
     fsm_init();
     fsm_register_state_callback(fsm_state_callback);
     fsm_set_normal_flush_duration(cfg.normal_flush_duration_sec);
@@ -188,38 +222,36 @@ void app_main(void)
     fsm_set_production_rate_by_membrane(cfg.ro_membrane_type);
     fsm_start();
 
-    // 5. 初始化历史记录模块
-    ESP_LOGI(TAG, "[5/8] 初始化历史记录模块...");
+    // 6. 初始化历史记录模块
+    ESP_LOGI(TAG, "[6/10] 初始化历史记录模块...");
     history_logger_init();
 
-    // 6. 初始化WiFi
-    ESP_LOGI(TAG, "[6/8] 初始化WiFi...");
+    // 7. 初始化WiFi
+    ESP_LOGI(TAG, "[7/10] 初始化WiFi...");
     wifi_manager_init();
     wifi_manager_register_callback(wifi_state_callback);
     wifi_manager_start();
 
-    // 7. 初始化MQTT客户端
-    ESP_LOGI(TAG, "[7/9] 初始化MQTT客户端...");
+    // 8. 初始化MQTT客户端
+    ESP_LOGI(TAG, "[8/10] 初始化MQTT客户端...");
     mqtt_client_init();
 
-    // 8. 初始化OTA模块
-    ESP_LOGI(TAG, "[8/9] 初始化OTA模块...");
+    // 9. 初始化OTA模块
+    ESP_LOGI(TAG, "[9/10] 初始化OTA模块...");
     if (ota_update_init() != ESP_OK) {
         ESP_LOGW(TAG, "OTA模块初始化失败，固件升级功能不可用");
     }
 
-    // 9. 初始化Web服务器
-    ESP_LOGI(TAG, "[9/9] 初始化Web服务器...");
+    // 10. 初始化Web服务器
+    ESP_LOGI(TAG, "[10/10] 初始化Web服务器...");
     web_server_init();
     web_server_start();
 
-    // 创建监控任务
-    xTaskCreate(monitor_task, "monitor", 4096, NULL, 3, NULL);
-
-    // 初始化电源管理
-    ESP_LOGI(TAG, "[10/10] 初始化电源管理...");
-    if (pm_manager_init() != ESP_OK) {
-        ESP_LOGW(TAG, "电源管理初始化失败");
+    // 创建监控任务（高优先级，确保能及时reset看门狗）
+    // 优先级必须高于fsm_task(5)，否则会被阻塞导致看门狗超时
+    BaseType_t ret = xTaskCreate(monitor_task, "monitor", 2048, NULL, 6, NULL);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "监控任务创建失败");
     }
 
     ESP_LOGI(TAG, "");
