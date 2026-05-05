@@ -37,6 +37,13 @@ typedef struct {
 esp_err_t web_server_init(void);
 
 /**
+ * @brief 初始化日志拦截器，将ESP_LOG输出捕获到内存缓冲区
+ * @note 应在web_server_start()之前调用
+ * @return ESP_OK 成功
+ */
+esp_err_t web_server_init_log_interceptor(void);
+
+/**
  * @brief 反初始化Web服务器模块
  * @return ESP_OK 成功
  */

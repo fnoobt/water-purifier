@@ -605,10 +605,8 @@ static float voltage_to_ec(float voltage)
     }
     // TDS探针规格: 0~2.3V -> 0~1000ppm
     float tds = voltage * (1000.0f / 2300.0f);
-    // EC ≈ TDS / 0.65 (典型转换系数)，防止除零
-    float ec_div = 0.65f;
-    if (ec_div < 0.01f) ec_div = 0.01f;
-    return tds / ec_div;
+    // EC ≈ TDS / 0.65 (典型转换系数)
+    return tds / 0.65f;
 }
 
 // 温度补偿函数（保留供将来扩展使用）

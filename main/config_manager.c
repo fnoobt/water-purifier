@@ -32,6 +32,7 @@ static const system_config_t default_config = {
     .ro_membrane_type = 1,               // 75G
     .pump_type = 1,                      // 三角洲75G
     .tank_size = 0,                      // 3G
+    .waste_valve_flow_cc = 300,          // 300CC (18L/h)
     .flush_duration_sec = 30,              // 30秒（默认冲洗时间）
     .production_timeout_sec = 3 * 3600,    // 3小时
     .leak_confirm_time_sec = 5,            // 5秒（漏水确认时间）
@@ -151,9 +152,15 @@ esp_err_t config_manager_load(void)
     // WiFi配置
     len = sizeof(ctx.config.wifi_ssid);
     nvs_get_str(handle, "wifi_ssid", ctx.config.wifi_ssid, &len);
+    if (len >= sizeof(ctx.config.wifi_ssid)) {
+        ESP_LOGW(TAG, "WiFi SSID被NVS截断 (len=%u, buf=%u)", len, (unsigned)sizeof(ctx.config.wifi_ssid));
+    }
     ctx.config.wifi_ssid[sizeof(ctx.config.wifi_ssid) - 1] = '\0';
     len = sizeof(ctx.config.wifi_password);
     nvs_get_str(handle, "wifi_pass", ctx.config.wifi_password, &len);
+    if (len >= sizeof(ctx.config.wifi_password)) {
+        ESP_LOGW(TAG, "WiFi密码被NVS截断 (len=%u, buf=%u)", len, (unsigned)sizeof(ctx.config.wifi_password));
+    }
     ctx.config.wifi_password[sizeof(ctx.config.wifi_password) - 1] = '\0';
 
     // MQTT配置
@@ -171,6 +178,12 @@ esp_err_t config_manager_load(void)
     }
     if (nvs_get_u8(handle, "tank", &u8_val) == ESP_OK) {
         ctx.config.tank_size = u8_val;
+    }
+    {
+        uint16_t wv_val;
+        if (nvs_get_u16(handle, "wv_flow", &wv_val) == ESP_OK) {
+            ctx.config.waste_valve_flow_cc = wv_val;
+        }
     }
 
     char str_buf[128];
@@ -308,6 +321,7 @@ esp_err_t config_manager_save(void)
     nvs_set_u8(handle, "ro_mem", config_copy.ro_membrane_type);
     nvs_set_u8(handle, "pump", config_copy.pump_type);
     nvs_set_u8(handle, "tank", config_copy.tank_size);
+    nvs_set_u16(handle, "wv_flow", config_copy.waste_valve_flow_cc);
     nvs_set_str(handle, "mqtt_broker", config_copy.mqtt_broker);
     nvs_set_str(handle, "mqtt_user", config_copy.mqtt_username);
     nvs_set_str(handle, "mqtt_pass", config_copy.mqtt_password);
@@ -682,6 +696,7 @@ static void update_config_int_from_key(const char *key, int value, bool *changed
     UPDATE_U8_FIELD(ro_membrane_type);
     UPDATE_U8_FIELD(pump_type);
     UPDATE_U8_FIELD(tank_size);
+    UPDATE_U16_FIELD(waste_valve_flow_cc);
     UPDATE_U32_FIELD(flush_duration_sec);
     UPDATE_U32_FIELD(production_timeout_sec);
     UPDATE_U32_FIELD(leak_confirm_time_sec);
@@ -708,17 +723,6 @@ esp_err_t config_manager_set_int(const char *key, int value)
         return ESP_ERR_INVALID_ARG;
     }
 
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
-    if (err == ESP_OK) {
-        int32_t cur_val;
-        if (nvs_get_i32(handle, key, &cur_val) == ESP_OK && cur_val == value) {
-            nvs_close(handle);
-            return ESP_OK;  // 值未变化，不写入
-        }
-        nvs_close(handle);
-    }
-
     // 先更新内存配置（使用mutex保护）
     bool mem_changed = false;
     if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -733,10 +737,17 @@ esp_err_t config_manager_set_int(const char *key, int value)
         return ESP_ERR_TIMEOUT;
     }
 
-    // 再写入NVS
-    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    // 写入NVS（一次打开完成读比较和写操作）
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         return err;
+    }
+
+    int32_t cur_val;
+    if (nvs_get_i32(handle, key, &cur_val) == ESP_OK && cur_val == value) {
+        nvs_close(handle);
+        return ESP_OK;  // 值未变化，不写入
     }
 
     err = nvs_set_i32(handle, key, value);
@@ -852,6 +863,10 @@ bool config_manager_validate(const system_config_t *config)
     if (config->tank_size > 4) {
         return false;
     }
+    // 验证废水阀流量 (100-1000 CC)
+    if (config->waste_valve_flow_cc < 100 || config->waste_valve_flow_cc > 1000) {
+        return false;
+    }
 
     // 验证时间参数
     if (config->flush_duration_sec < 10 || config->flush_duration_sec > 600) {
@@ -907,13 +922,8 @@ bool config_manager_validate(const system_config_t *config)
         return false;
     }
 
-    // 验证运行数据保存间隔 (10分钟/1小时/2小时/6小时/12小时/24小时)
-    if (config->runtime_save_interval_min != 10 &&
-        config->runtime_save_interval_min != 60 &&
-        config->runtime_save_interval_min != 120 &&
-        config->runtime_save_interval_min != 360 &&
-        config->runtime_save_interval_min != 720 &&
-        config->runtime_save_interval_min != 1440) {
+    // 验证运行数据保存间隔 (10分钟~24小时)
+    if (config->runtime_save_interval_min < 10 || config->runtime_save_interval_min > 1440) {
         return false;
     }
 

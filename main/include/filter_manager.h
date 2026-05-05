@@ -203,6 +203,29 @@ esp_err_t filter_mgr_set_production_rate(float lph);
  */
 float filter_mgr_get_production_rate(void);
 
+// ==================== 废水流量配置 ====================
+
+/**
+ * @brief 设置废水阀流量（升/小时），用于计算前三级滤芯实际过水量
+ * @param lph 废水流量
+ * @return ESP_OK 成功
+ */
+esp_err_t filter_mgr_set_waste_flow_lph(float lph);
+
+/**
+ * @brief 获取当前废水阀流量（升/小时）
+ * @return 废水流量
+ */
+float filter_mgr_get_waste_flow_lph(void);
+
+/**
+ * @brief 更新水量（区分泵前后滤芯），前三级和后两分别累计
+ * @param pre_pump_liters 泵前流量（PP棉、颗粒碳、压缩碳）
+ * @param post_pump_liters 泵后流量（RO膜、后置炭）
+ * @return ESP_OK 成功
+ */
+esp_err_t filter_mgr_update_water_usage_dual(float pre_pump_liters, float post_pump_liters);
+
 /**
  * @brief 周期性保存滤芯数据到NVS（检查脏标志，有变化时才写入）
  * @return true 执行了保存

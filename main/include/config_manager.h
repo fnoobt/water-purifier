@@ -36,6 +36,7 @@ typedef struct {
     uint8_t ro_membrane_type;         // RO膜通量类型 (0=50G, 1=75G, 2=100G, 3=200G, 4=400G)
     uint8_t pump_type;                // 增压泵类型 (0=三角洲50G, 1=75G, 2=100G, 3=200G, 4=300G, 5=400G)
     uint8_t tank_size;                // 压力桶大小 (0=3G, 1=3.2G, 2=4G, 3=6G, 4=10G)
+    uint16_t waste_valve_flow_cc;     // 废水阀流量 (CC=mL/min), 默认300
 
     // 系统参数
     uint32_t flush_duration_sec;        // 冲洗持续时间（秒），默认60

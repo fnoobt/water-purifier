@@ -245,6 +245,7 @@ void app_main(void)
     // 10. 初始化Web服务器
     ESP_LOGI(TAG, "[10/10] 初始化Web服务器...");
     web_server_init();
+    web_server_init_log_interceptor();
     web_server_start();
 
     // 创建监控任务（高优先级，确保能及时reset看门狗）

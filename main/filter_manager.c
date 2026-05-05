@@ -55,11 +55,15 @@ static struct {
     filter_info_t filters[FILTER_COUNT];
     uint32_t total_water_used;
 
-    // 用水量累积器（避免短时间制水被丢弃）
-    float water_usage_accumulator;
+    // 用水量累积器（区分泵前后滤芯，避免短时间制水被丢弃）
+    float pre_pump_accumulator;   // 前三级（PP棉、颗粒碳、压缩碳）
+    float post_pump_accumulator;  // 后两级（RO膜、后置炭）
 
     // RO制水速率（升/小时）
     float production_rate_lph;
+
+    // 废水流量（升/小时），用于计算前三级实际过水量
+    float waste_flow_lph;
 
     // 兼容旧接口的单滤芯状态
     uint32_t filter_total_liters;
@@ -72,6 +76,7 @@ static struct {
     .initialized = false,
     .total_water_used = 0,
     .production_rate_lph = 12.0f,  // 默认汇通75G
+    .waste_flow_lph = 18.0f,       // 默认300CC (300*60/1000)
     .filter_total_liters = 3000,
     .filter_used_liters = 0,
     .filter_install_time = 0,
@@ -118,8 +123,11 @@ static void load_from_nvs(void)
         snprintf(key, sizeof(key), "f%d_reset", i);
         uint32_t reset_time = (uint32_t)now_sec;
         if (nvs_get_u32(handle, key, &reset_time) == ESP_OK) {
-            fctx.filters[i].last_reset_time = reset_time;
-            fctx.filters[i].install_time = reset_time;
+            // 验证时间戳有效性（> 2020-01-01），防止NTP未同步时保存的无效值
+            if (reset_time > 1577836800UL) {
+                fctx.filters[i].last_reset_time = reset_time;
+                fctx.filters[i].install_time = reset_time;
+            }
         }
 
         // 自定义容量
@@ -147,6 +155,10 @@ static void load_from_nvs(void)
     // 兼容旧接口数据
     fctx.filter_used_liters = fctx.filters[FILTER_RO_MEMBRANE].used_liters;
     fctx.filter_install_time = fctx.filters[FILTER_RO_MEMBRANE].last_reset_time;
+    // 如果RO膜的时间戳无效，兼容字段也置0（等待fixup修正）
+    if (fctx.filters[FILTER_RO_MEMBRANE].last_reset_time <= 1577836800UL) {
+        fctx.filter_install_time = 0;
+    }
 
     nvs_close(handle);
     ESP_LOGI(TAG, "滤芯数据已加载: 总用水%luL, RO已用%luL",
@@ -333,43 +345,69 @@ esp_err_t filter_mgr_set_filter_capacity(uint32_t total_liters)
 
 esp_err_t filter_mgr_update_water_usage(float liters)
 {
-    /* NaN/Infinity检查：无效浮点值拒绝处理 */
-    if (!isfinite(liters) || liters <= 0.0f) {
+    return filter_mgr_update_water_usage_dual(liters, liters);
+}
+
+esp_err_t filter_mgr_update_water_usage_dual(float pre_liters, float post_liters)
+{
+    // 独立校验每个参数，NaN/Inf 会污染累加器
+    if (!isfinite(pre_liters)) pre_liters = 0.0f;
+    if (!isfinite(post_liters)) post_liters = 0.0f;
+    if (pre_liters <= 0.0f && post_liters <= 0.0f) {
         return ESP_OK;
     }
 
     // 如果NTP刚同步，回补滤芯时间戳
     fixup_filter_time_on_ntp_sync();
 
-    // 累积小数水量
-    fctx.water_usage_accumulator += liters;
+    uint32_t pre_committed = 0, post_committed = 0;
 
-    // 当累积达到1升时，更新总量
-    if (fctx.water_usage_accumulator >= 1.0f) {
-        uint32_t committed_liters = (uint32_t)fctx.water_usage_accumulator;
-        fctx.water_usage_accumulator -= committed_liters;
+    // 前三级: PP棉(0), 颗粒碳(1), 压缩碳(2)
+    if (pre_liters > 0.0f && isfinite(pre_liters)) {
+        fctx.pre_pump_accumulator += pre_liters;
+        if (fctx.pre_pump_accumulator >= 1.0f) {
+            pre_committed = (uint32_t)fctx.pre_pump_accumulator;
+            fctx.pre_pump_accumulator -= pre_committed;
 
-        // 防止整数溢出
-        if (UINT32_MAX - fctx.filter_used_liters >= committed_liters) {
-            fctx.filter_used_liters += committed_liters;
-        }
-        if (UINT32_MAX - fctx.total_water_used >= committed_liters) {
-            fctx.total_water_used += committed_liters;
-        }
-
-        // 更新每个滤芯的用水量
-        for (int i = 0; i < FILTER_COUNT; i++) {
-            if (UINT32_MAX - fctx.filters[i].used_liters >= committed_liters) {
-                fctx.filters[i].used_liters += committed_liters;
-            }
-
-            // 水量维度
-            if (fctx.filters[i].total_liters > 0) {
-                float remaining = 1.0f - (float)fctx.filters[i].used_liters / fctx.filters[i].total_liters;
-                if (remaining < 0) remaining = 0;
-                fctx.filters[i].percentage = (uint8_t)(remaining * 100);
+            for (int i = 0; i <= 2; i++) {
+                if (UINT32_MAX - fctx.filters[i].used_liters >= pre_committed) {
+                    fctx.filters[i].used_liters += pre_committed;
+                }
+                if (fctx.filters[i].total_liters > 0) {
+                    float remaining = 1.0f - (float)fctx.filters[i].used_liters / fctx.filters[i].total_liters;
+                    fctx.filters[i].percentage = (uint8_t)(remaining < 0 ? 0 : remaining * 100);
+                }
             }
         }
+    }
+
+    // 后两级: RO膜(3), 后置炭(4)
+    if (post_liters > 0.0f && isfinite(post_liters)) {
+        fctx.post_pump_accumulator += post_liters;
+        if (fctx.post_pump_accumulator >= 1.0f) {
+            post_committed = (uint32_t)fctx.post_pump_accumulator;
+            fctx.post_pump_accumulator -= post_committed;
+
+            for (int i = 3; i <= 4; i++) {
+                if (UINT32_MAX - fctx.filters[i].used_liters >= post_committed) {
+                    fctx.filters[i].used_liters += post_committed;
+                }
+                if (fctx.filters[i].total_liters > 0) {
+                    float remaining = 1.0f - (float)fctx.filters[i].used_liters / fctx.filters[i].total_liters;
+                    fctx.filters[i].percentage = (uint8_t)(remaining < 0 ? 0 : remaining * 100);
+                }
+            }
+        }
+    }
+
+    // 总用水量 = 前三级过水量（系统从进水源抽取的总量，后两级是其中的子集）
+    if (pre_committed > 0 && UINT32_MAX - fctx.total_water_used >= pre_committed) {
+        fctx.total_water_used += pre_committed;
+    }
+
+    // 兼容旧接口字段：仅累计RO膜实际过水量（post_liters，不含冲洗水）
+    if (post_committed > 0 && UINT32_MAX - fctx.filter_used_liters >= post_committed) {
+        fctx.filter_used_liters += post_committed;
     }
 
     // 统一更新所有滤芯的时间维度寿命、有效寿命、更换标志
@@ -379,6 +417,17 @@ esp_err_t filter_mgr_update_water_usage(float liters)
     fctx.save_needed = true;
 
     return ESP_OK;
+}
+
+esp_err_t filter_mgr_set_waste_flow_lph(float lph)
+{
+    fctx.waste_flow_lph = lph;
+    return ESP_OK;
+}
+
+float filter_mgr_get_waste_flow_lph(void)
+{
+    return fctx.waste_flow_lph;
 }
 
 uint32_t filter_mgr_get_total_water_usage(void)
@@ -475,6 +524,10 @@ esp_err_t filter_mgr_reset_filter(filter_type_t filter_type)
         fctx.filter_install_time = (uint32_t)now_sec;
     }
 
+    // 清除累加器，避免残留水量计入新滤芯
+    fctx.pre_pump_accumulator = 0.0f;
+    fctx.post_pump_accumulator = 0.0f;
+
     ESP_LOGI(TAG, "%s滤芯已重置", filter_names[filter_type]);
     fctx.save_needed = true;
     return save_to_nvs();  // 关键操作立即写入，返回保存结果
@@ -495,7 +548,10 @@ esp_err_t filter_mgr_reset_all_filters(void)
     }
     fctx.total_water_used = 0;
     fctx.filter_used_liters = 0;
-    fctx.water_usage_accumulator = 0.0f;
+    fctx.filter_install_time = (uint32_t)now_sec;
+    fctx.filter_total_liters = fctx.filters[FILTER_RO_MEMBRANE].total_liters;
+    fctx.pre_pump_accumulator = 0.0f;
+    fctx.post_pump_accumulator = 0.0f;
 
     ESP_LOGI(TAG, "所有滤芯已重置");
     return save_to_nvs();  // 返回保存结果

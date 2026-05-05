@@ -23,6 +23,7 @@
 #include "cJSON.h"
 #include <string.h>
 #include <time.h>
+#include <stdbool.h>
 
 static const char *TAG = "WEB";
 
@@ -57,6 +58,50 @@ static uint64_t s_last_control_time = 0;     // 上次控制操作时间
 static uint64_t s_last_wifi_scan_time = 0;   // 上次WiFi扫描时间
 #define CONTROL_DEBOUNCE_MS 1000             // 控制按钮防抖间隔（1秒）
 #define WIFI_SCAN_DEBOUNCE_MS 5000           // WiFi扫描防抖间隔（5秒）
+
+// ==================== 日志拦截器 ====================
+
+#define LOG_BUF_SIZE 4096
+static char s_log_buf[LOG_BUF_SIZE];
+static volatile uint32_t s_log_head = 0;
+static volatile uint32_t s_log_tail = 0;
+static portMUX_TYPE s_log_lock = portMUX_INITIALIZER_UNLOCKED;
+static vprintf_like_t s_original_vprintf = NULL;
+
+static void log_buf_write(const char *data, size_t len)
+{
+    taskENTER_CRITICAL(&s_log_lock);
+    for (size_t i = 0; i < len; i++) {
+        s_log_buf[s_log_head] = data[i];
+        s_log_head = (s_log_head + 1) % LOG_BUF_SIZE;
+        if (s_log_head == s_log_tail) {
+            s_log_tail = (s_log_tail + 1) % LOG_BUF_SIZE;
+        }
+    }
+    taskEXIT_CRITICAL(&s_log_lock);
+}
+
+static int log_vprintf_hook(const char *fmt, va_list args)
+{
+    char buf[256];
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    if (len > 0) {
+        if (len > (int)sizeof(buf)) len = (int)sizeof(buf);
+        log_buf_write(buf, len);
+    }
+    if (s_original_vprintf) {
+        return s_original_vprintf(fmt, args);
+    }
+    return 0;
+}
+
+esp_err_t web_server_init_log_interceptor(void)
+{
+    if (s_original_vprintf != NULL) return ESP_OK; // 已初始化
+    s_original_vprintf = esp_log_set_vprintf(log_vprintf_hook);
+    ESP_LOGI("WEB", "日志拦截器已启动");
+    return ESP_OK;
+}
 
 // ==================== HTML页面 ====================
 
@@ -206,6 +251,7 @@ static const char html_admin_page[] =
 "<div class='container'>"
 "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>"
 "<button class='back-btn' onclick=\"location.href='/'\" style='margin:0'>← 返回首页</button>"
+"<button class='back-btn' onclick=\"location.href='/logs'\" style='margin:0'>日志 →</button>"
 "<button class='back-btn' onclick=\"location.href='/ota'\" style='margin:0'>固件升级 →</button>"
 "</div>"
 "<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>管理页面</h1>"
@@ -251,6 +297,7 @@ static const char html_admin_page[] =
 "<div class='form-row'><label>RO膜通量</label><select id='roMem'><option value='0'>汇通50G (7.8L/h)</option><option value='1'>汇通75G (12.0L/h)</option><option value='2'>汇通100G (15.6L/h)</option><option value='3'>汇通200G (31.2L/h)</option><option value='4'>汇通400G (62.4L/h)</option></select></div>"
 "<div class='form-row'><label>增压泵</label><select id='pumpType'><option value='0'>三角洲50G 70psi 0.55L/min</option><option value='1'>三角洲75G 70psi 0.85L/min</option><option value='2'>三角洲100G 70psi 1.1L/min</option><option value='3'>三角洲200G 70psi 1.6L/min</option><option value='4'>三角洲300G 70psi 2.0L/min</option><option value='5'>三角洲400G 70psi 2.5L/min</option></select></div>"
 "<div class='form-row'><label>压力桶大小</label><select id='tankSize'><option value='0'>3G (11.4L)</option><option value='1'>3.2G (12.1L)</option><option value='2'>4G (15.1L)</option><option value='3'>6G (22.7L)</option><option value='4'>10G (37.9L)</option></select></div>"
+"<div class='form-row'><label>废水阀流量</label><select id='wasteFlow'><option value='200'>200CC (12L/h)</option><option value='300'>300CC (18L/h)</option><option value='450'>450CC (27L/h)</option><option value='550'>550CC (33L/h)</option></select></div>"
 "<div class='btn-group'><button class='btn btn-success' onclick='saveHardware()'>保存硬件配置</button></div>"
 "</div>"
 
@@ -331,6 +378,7 @@ static const char html_admin_page[] =
 "$('roMem').value=d.roMem;"
 "$('pumpType').value=d.pumpType;"
 "$('tankSize').value=d.tankSize;"
+"$('wasteFlow').value=d.wasteFlow;"
 "$('whValveOpen').value=d.whValveOpen||1000;"
 "$('whPumpStop').value=d.whPumpStop||1000;"
 "$('whValveClose').value=d.whValveClose||500;"
@@ -351,9 +399,9 @@ static const char html_admin_page[] =
 "function resetFilter(i){if(confirm('确认重置该滤芯？')){api('/api/filter/reset',{filter:i}).then(d=>{alert(d.filter_name+' 已重置');loadFilters()})}}"
 "function saveFilterCaps(){api('/api/filter/capacity',{caps:[parseInt($('cap0').value),parseInt($('cap1').value),parseInt($('cap2').value),parseInt($('cap3').value),parseInt($('cap4').value)],times:[parseInt($('time0').value),parseInt($('time1').value),parseInt($('time2').value),parseInt($('time3').value),parseInt($('time4').value)]}).then(d=>alert(d.status||'已保存'))}"
 "function saveConfig(){api('/api/config',{normalFlushDur:parseInt($('normalFlushDur').value),pureFlushDur:parseInt($('pureFlushDur').value),filterFlushDur:parseInt($('filterFlushDur').value)*60,prodTimeout:parseInt($('prodTimeout').value)*60,leakConfirm:parseInt($('leakConfirm').value),saveInterval:parseInt($('saveInterval').value),relayLevel:parseInt($('relayLevel').value),tdsInTh:parseFloat($('tdsInTh').value),tdsOutTh:parseFloat($('tdsOutTh').value),whValveOpen:parseInt($('whValveOpen').value),whPumpStop:parseInt($('whPumpStop').value),whValveClose:parseInt($('whValveClose').value)}).then(d=>alert(d.status||'已保存'))}"
-"function saveHardware(){api('/api/config/hardware',{roMem:parseInt($('roMem').value),pumpType:parseInt($('pumpType').value),tankSize:parseInt($('tankSize').value)}).then(d=>alert(d.status||'已保存'))}"
-"function scanWiFi(){$('wifiList').innerHTML='扫描中...';fetch('/api/wifi/scan').then(r=>r.json()).then(d=>{let h='';if(d.networks)d.networks.forEach(function(n){h+='<div class=\"wifi-item\" data-ssid=\"'+n.ssid.replace(/\"/g,'&quot;')+'\">'+n.ssid+' ('+n.rssi+'dBm)</div>'});$('wifiList').innerHTML=h||'未找到网络'})}"
-"$('wifiList').addEventListener('click',function(e){var item=e.target.closest('.wifi-item');if(item){$('ssid').value=item.getAttribute('data-ssid')}});"
+"function saveHardware(){api('/api/config/hardware',{roMem:parseInt($('roMem').value),pumpType:parseInt($('pumpType').value),tankSize:parseInt($('tankSize').value),wasteFlow:parseInt($('wasteFlow').value)}).then(d=>alert(d.status||'已保存'))}"
+"function scanWiFi(){$('wifiList').innerHTML='扫描中...';fetch('/api/wifi/scan').then(r=>r.json()).then(d=>{let h='';if(d.networks)d.networks.forEach(function(n){let s=encodeURIComponent(n.ssid);h+='<div class=\"wifi-item\" data-ssid=\"'+s+'\">'+n.ssid+' ('+n.rssi+'dBm)</div>'});$('wifiList').innerHTML=h||'未找到网络'})}"
+"$('wifiList').addEventListener('click',function(e){var item=e.target.closest('.wifi-item');if(item){$('ssid').value=decodeURIComponent(item.getAttribute('data-ssid'))}});"
 "function saveWiFi(){api('/api/wifi',{ssid:$('ssid').value,password:$('pass').value}).then(d=>alert(d.status))}"
 "function calibrateTDS(sensor){const v=sensor===0?$('tdsInCal').value:$('tdsOutCal').value;if(!v)return alert('请输入标准值');api('/api/tds/calibrate',{sensor:parseInt(sensor),value:parseFloat(v)}).then(d=>alert(d.status||'校准完成'))}"
 "function loadMQTT(){fetch('/api/mqtt/config').then(r=>r.json()).then(d=>{$('mqttEn').value=d.enabled?1:0;$('mqttBroker').value=d.broker||'';$('mqttUser').value=d.user||'';$('mqttPass').value='';$('mqttPrefix').value=d.prefix||'water-purifier'})}"
@@ -431,6 +479,182 @@ static const char html_ota_page[] =
 "function uploadFirmware(){var f=$('fwFile').files[0];if(!f)return alert('请选择固件文件');if(!f.name.endsWith('.bin'))return alert('只支持 .bin 文件');if(!confirm('确认升级固件？设备将自动重启。'))return;var fd=new FormData();fd.append('firmware',f);$('otaProgress').style.display='block';$('otaState').textContent='上传中...';$('otaState').className='stat-value warn';var xhr=new XMLHttpRequest();xhr.open('POST','/api/ota/update');xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('otaProgressText').textContent='上传中 '+formatSize(e.loaded)+'/'+formatSize(e.total);$('otaProgressPct').textContent=p+'%';$('otaProgressBar').style.width=p+'%';}};xhr.onload=function(){if(xhr.status===200){$('otaState').textContent='升级成功，重启中...';$('otaState').className='stat-value good';$('otaProgressText').textContent='升级完成，设备正在重启';$('otaProgressBar').style.width='100%';}else{try{var e=JSON.parse(xhr.responseText);alert(e.message||'升级失败');}catch(e){alert('升级失败: '+xhr.responseText);}$('otaState').textContent='升级失败';$('otaState').className='stat-value error';}};xhr.onerror=function(){$('otaState').textContent='网络错误';$('otaState').className='stat-value error';};xhr.send(fd);}"
 "loadOTA();"
 "</script></body></html>";
+
+// ==================== 日志查看器 ====================
+
+static const char html_log_page[] =
+"<!DOCTYPE html><html><head>"
+"<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>系统日志</title>"
+"<style>"
+"*{box-sizing:border-box}"
+"body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh}"
+".container{max-width:900px;margin:0 auto}"
+"h1{color:#fff;text-align:center;margin-bottom:20px;text-shadow:0 2px 4px rgba(0,0,0,0.2)}"
+".back-btn{background:rgba(255,255,255,0.2);color:#fff;padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:10px}"
+".back-btn:hover{background:rgba(255,255,255,0.3)}"
+".card{background:rgba(255,255,255,0.95);padding:10px;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}"
+"iframe{width:100%;height:70vh;border:none;border-radius:8px;background:#1e1e1e}"
+"</style></head><body>"
+"<div class='container'>"
+"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>"
+"<button class='back-btn' onclick=\"location.href='/admin'\" style='margin:0'>← 返回管理</button>"
+"<button class='back-btn' onclick=\"location.href='/'\" style='margin:0'>首页 →</button>"
+"</div>"
+"<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>系统日志</h1>"
+"<div class='card'>"
+"<iframe src='/api/logs/debug'></iframe>"
+"</div>"
+"</div>"
+"<script>"
+"setInterval(function(){document.querySelector('iframe').src='/api/logs/debug'},10000);"
+"</script></body></html>";
+
+static esp_err_t handle_log_page(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    return httpd_resp_send(req, html_log_page, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t handle_log_api(httpd_req_t *req)
+{
+    // 使用静态缓冲区避免HTTP服务器任务栈溢出(默认栈仅4KB)
+    static char buf[4096];
+    int pos = 0;
+    uint32_t read_pos = s_log_tail;
+    uint32_t tail = s_log_head;
+    int first = 1;
+
+    pos = snprintf(buf, sizeof(buf), "{\"lines\":[");
+
+    while (read_pos != tail) {
+        // 预留足够空间: 一行最多 ~300 字节(含转义+逗号+引号)
+        if (pos > (int)sizeof(buf) - 350) break;
+
+        char line[300];
+        int ln = 0;
+        int slen = 0;
+        while (read_pos != tail && slen < 290) {
+            char c = s_log_buf[read_pos];
+            if (c == '\n' || c == '\r') break;
+            line[ln++] = c;
+            read_pos = (read_pos + 1) % LOG_BUF_SIZE;
+            slen++;
+        }
+        if (slen == 0) {
+            read_pos = (read_pos + 1) % LOG_BUF_SIZE;
+            continue;
+        }
+        line[ln] = '\0';
+
+        if (!first) buf[pos++] = ',';
+        first = 0;
+
+        // JSON 字符串转义
+        buf[pos++] = '"';
+        for (int i = 0; i < ln && pos < (int)sizeof(buf) - 10; i++) {
+            char ch = line[i];
+            if (ch == '"') { buf[pos++] = '\\'; buf[pos++] = '"'; }
+            else if (ch == '\\') { buf[pos++] = '\\'; buf[pos++] = '\\'; }
+            else buf[pos++] = ch;
+        }
+        buf[pos++] = '"';
+
+        // 跳过换行
+        while (read_pos != tail && (s_log_buf[read_pos] == '\n' || s_log_buf[read_pos] == '\r')) {
+            read_pos = (read_pos + 1) % LOG_BUF_SIZE;
+        }
+    }
+
+    buf[pos++] = ']';
+    // 手动写 nextPos，避免 snprintf
+    const char *suffix = ",\"nextPos\":";
+    for (const char *p = suffix; *p; p++) buf[pos++] = *p;
+    // 写数字
+    uint32_t np = read_pos;
+    char numbuf[12];
+    int ni = 0;
+    do { numbuf[ni++] = '0' + (np % 10); np /= 10; } while (np > 0);
+    for (int i = ni - 1; i >= 0; i--) buf[pos++] = numbuf[i];
+    buf[pos++] = '}';
+    buf[pos] = '\0';
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    esp_err_t ret = httpd_resp_send(req, buf, pos);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "日志API发送失败: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+/**
+ * @brief 日志端点：以HTML形式返回日志缓冲区内容（嵌入iframe使用）
+ */
+static esp_err_t handle_log_debug(httpd_req_t *req)
+{
+    static char buf[LOG_BUF_SIZE + 512];
+    int pos = 0;
+
+    pos = snprintf(buf, sizeof(buf),
+        "<style>body{margin:0;background:#1e1e1e;color:#d4d4d4;font-family:'Cascadia Code','Fira Code',monospace;font-size:11px;"
+        "white-space:pre-wrap;word-break:break-all;line-height:1.5;overflow-y:auto}"
+        ".E{color:#f44747}.W{color:#dcdcaa}.I{color:#6a9955}.D{color:#569cd6}"
+        "</style>"
+        "<div style='color:#888;padding:4px 8px;border-bottom:1px solid #333;font-size:10px'>缓冲区 %lu/%lu 字节日志</div>",
+        (unsigned long)(s_log_head >= s_log_tail ? s_log_head - s_log_tail : LOG_BUF_SIZE - s_log_tail + s_log_head),
+        (unsigned long)LOG_BUF_SIZE);
+
+    // 逐行读取并输出
+    uint32_t read_pos = s_log_tail;
+    char line_buf[300];
+    int line_len = 0;
+
+    while (read_pos != s_log_head) {
+        char c = s_log_buf[read_pos];
+        read_pos = (read_pos + 1) % LOG_BUF_SIZE;
+
+        if (c == '\n' || c == '\r') {
+            if (line_len > 0) {
+                line_buf[line_len] = '\0';
+                char lvl = 0;
+                if (line_len >= 5 && line_buf[0] == ' ' &&
+                    (line_buf[1] == 'E' || line_buf[1] == 'W' || line_buf[1] == 'I' || line_buf[1] == 'D')) {
+                    lvl = line_buf[1];
+                }
+                int cls = 0;
+                if (lvl) { pos += snprintf(buf + pos, sizeof(buf) - pos, "<span class='%c'>", lvl); cls = 1; }
+                for (int i = 0; i < line_len && pos < (int)sizeof(buf) - 20; i++) {
+                    char ch = line_buf[i];
+                    if (ch == '<') { buf[pos++] = '&'; buf[pos++] = 'l'; buf[pos++] = 't'; }
+                    else if (ch == '>') { buf[pos++] = '&'; buf[pos++] = 'g'; buf[pos++] = 't'; }
+                    else if (ch == '&') { buf[pos++] = '&'; buf[pos++] = 'a'; buf[pos++] = 'm'; buf[pos++] = 'p'; buf[pos++] = ';'; }
+                    else buf[pos++] = ch;
+                }
+                if (cls) { pos += snprintf(buf + pos, sizeof(buf) - pos, "</span>"); }
+                buf[pos++] = '\n';
+                line_len = 0;
+            }
+        } else if (line_len < 299) {
+            line_buf[line_len++] = c;
+        }
+    }
+
+    buf[pos] = '\0';
+
+    // 自动滚动到最新
+    const char *scroll_js = "<script>window.scrollTo(0,document.body.scrollHeight)</script>";
+    int slen = strlen(scroll_js);
+    if (pos + slen < (int)sizeof(buf)) {
+        memcpy(buf + pos, scroll_js, slen);
+        pos += slen;
+    }
+
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, buf, pos);
+}
 
 // ==================== 辅助函数 ====================
 
@@ -675,6 +899,7 @@ static esp_err_t handle_config_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "roMem", cfg.ro_membrane_type);
     cJSON_AddNumberToObject(root, "pumpType", cfg.pump_type);
     cJSON_AddNumberToObject(root, "tankSize", cfg.tank_size);
+    cJSON_AddNumberToObject(root, "wasteFlow", cfg.waste_valve_flow_cc);
     cJSON_AddNumberToObject(root, "whValveOpen", cfg.water_hammer_valve_open_delay_ms);
     cJSON_AddNumberToObject(root, "whPumpStop", cfg.water_hammer_pump_stop_delay_ms);
     cJSON_AddNumberToObject(root, "whValveClose", cfg.water_hammer_valve_close_delay_ms);
@@ -782,11 +1007,14 @@ static esp_err_t handle_hardware_config_set(httpd_req_t *req)
     if ((v = cJSON_GetObjectItem(root, "roMem"))) cfg.ro_membrane_type = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "pumpType"))) cfg.pump_type = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "tankSize"))) cfg.tank_size = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "wasteFlow"))) cfg.waste_valve_flow_cc = v->valueint;
 
     config_manager_set_config(&cfg);
 
     // 先应用硬件配置，成功后再保存NVS
     fsm_set_production_rate_by_membrane(cfg.ro_membrane_type);
+    float waste_lph = cfg.waste_valve_flow_cc * 60.0f / 1000.0f;
+    filter_mgr_set_waste_flow_lph(waste_lph);
 
     config_manager_save();
 
@@ -1453,10 +1681,9 @@ done_receiving:
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"固件升级成功，系统正在重启\"}");
 
-    // 6. 延迟重启（HTTP响应已在socket buffer中）
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
-    result = ESP_OK;  // 成功
+    // 6. 释放资源后重启（必须在响应发送完成后释放锁和缓冲区）
+    result = ESP_OK;
+    goto cleanup_restart;
 
 cleanup:
     // 释放动态分配的缓冲区
@@ -1469,6 +1696,17 @@ cleanup:
     s_ota_session_active = false;
     taskEXIT_CRITICAL(&s_ota_spinlock);
     return result;
+
+cleanup_restart:
+    free(buf);
+    free(close_bnd);
+    free(bnd_copy);
+    taskENTER_CRITICAL(&s_ota_spinlock);
+    s_ota_session_active = false;
+    taskEXIT_CRITICAL(&s_ota_spinlock);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return result;  // 不可达，保留以消除编译器警告
 }
 
 /**
@@ -1555,7 +1793,8 @@ esp_err_t web_server_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = ctx.config.port;
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 18;
+    cfg.max_uri_handlers = 26;
+    cfg.stack_size = 8192;  // 默认4KB不够用
 
     if (httpd_start(&ctx.server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "启动失败");
@@ -1618,6 +1857,15 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(ctx.server, &uri);
 
     uri.uri = "/ota", uri.method = HTTP_GET, uri.handler = handle_ota;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/logs", uri.method = HTTP_GET, uri.handler = handle_log_page;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/logs", uri.method = HTTP_GET, uri.handler = handle_log_api;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/logs/debug", uri.method = HTTP_GET, uri.handler = handle_log_debug;
     httpd_register_uri_handler(ctx.server, &uri);
 
     ctx.running = true;
