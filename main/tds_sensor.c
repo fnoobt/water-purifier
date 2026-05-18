@@ -352,11 +352,14 @@ esp_err_t tds_sensor_measure_dual(tds_dual_measurement_t *dual_measurement)
 
     dual_measurement->both_valid = (ret1 == ESP_OK && ret2 == ESP_OK);
 
-    // 计算去除率
+    // 计算去除率（防止除零）
     if (dual_measurement->both_valid &&
-        dual_measurement->inlet.tds_value > 0) {
+        dual_measurement->inlet.tds_value > 1.0f) {  // 使用阈值避免极小值导致的精度问题
         dual_measurement->reduction_rate =
             (1.0f - dual_measurement->outlet.tds_value / dual_measurement->inlet.tds_value) * 100.0f;
+        // 去除率范围限制：0~100%
+        if (dual_measurement->reduction_rate < 0) dual_measurement->reduction_rate = 0;
+        if (dual_measurement->reduction_rate > 100) dual_measurement->reduction_rate = 100;
     } else {
         dual_measurement->reduction_rate = 0;
     }
@@ -408,9 +411,12 @@ esp_err_t tds_sensor_get_latest_dual(tds_dual_measurement_t *dual_measurement)
                                     tds_ctx.latest[TDS_SENSOR_OUTLET].valid);
     xSemaphoreGive(tds_ctx.data_mutex);
 
-    if (dual_measurement->both_valid && dual_measurement->inlet.tds_value > 0) {
+    if (dual_measurement->both_valid && dual_measurement->inlet.tds_value > 1.0f) {
         dual_measurement->reduction_rate =
             (1.0f - dual_measurement->outlet.tds_value / dual_measurement->inlet.tds_value) * 100.0f;
+        // 去除率范围限制：0~100%
+        if (dual_measurement->reduction_rate < 0) dual_measurement->reduction_rate = 0;
+        if (dual_measurement->reduction_rate > 100) dual_measurement->reduction_rate = 100;
     } else {
         dual_measurement->reduction_rate = 0;
     }
@@ -513,8 +519,8 @@ bool tds_sensor_is_alarm(tds_sensor_id_t sensor_id)
 
     bool result = false;
     if (xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        result = (tds_ctx.latest[sensor_id].valid &&
-                  tds_ctx.latest[sensor_id].tds_value > tds_ctx.alarm_threshold[sensor_id]);
+        // 使用alarm_active状态（带迟滞机制），与任务内部状态一致
+        result = tds_ctx.alarm_active[sensor_id];
         xSemaphoreGive(tds_ctx.data_mutex);
     }
     return result;
@@ -588,12 +594,14 @@ static float calculate_tds(float voltage, float temperature)
     // 线性转换: TDS = (voltage_mV / 2300) * 1000
     float tds = voltage * (1000.0f / 2300.0f);
 
-    // 温度补偿 (系数约2%/°C)，防止 denominator=0 (temperature=50°C)
-    float denom = 1.0f + 0.02f * (temperature - 25.0f);
-    if (denom < 0.5f) {
-        denom = 0.5f;
+    // 温度补偿 (系数约2%/°C)：温度升高时电导率增加
+    // 将实测值补偿到25°C参考值（乘法而非除法）
+    // denom > 1 表示温度高于25°C，实测值偏大，需乘以系数补偿到25°C等效值
+    float temp_coeff = 1.0f + 0.02f * (temperature - 25.0f);
+    if (temp_coeff < 0.5f) {
+        temp_coeff = 0.5f;  // 防止极低温度导致系数过小
     }
-    tds = tds / denom;
+    tds = tds * temp_coeff;  // 正确：乘以系数，温度高于25°C时TDS值增加
 
     return tds;
 }

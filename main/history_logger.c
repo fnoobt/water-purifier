@@ -286,12 +286,12 @@ esp_err_t history_add_record(history_event_type_t type, uint8_t state_from,
         ctx.record_count++;
     }
 
+    // 在mutex内标记脏数据，避免与周期保存任务竞态
+    ctx.history_dirty = true;
+
     xSemaphoreGive(ctx.mutex);
 
     ESP_LOGI(TAG, "记录事件: %s", event_names[type]);
-
-    // 标记脏数据，由周期任务统一写入
-    ctx.history_dirty = true;
 
     return ESP_OK;
 }
@@ -337,7 +337,14 @@ esp_err_t history_log_leak_alarm(void)
 
 uint32_t history_get_count(void)
 {
-    return ctx.record_count;
+    uint32_t count = 0;
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        count = ctx.record_count;
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        count = ctx.record_count;  // 降级处理
+    }
+    return count;
 }
 
 uint32_t history_get_records(history_record_t *records, uint32_t max_count)
@@ -400,6 +407,10 @@ esp_err_t history_update_daily_production(uint32_t seconds)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     // 检查日期变化：只重置，不写入（由周期任务统一处理）
     uint32_t today = get_today_date();
     if (ctx.today.date != today) {
@@ -411,6 +422,7 @@ esp_err_t history_update_daily_production(uint32_t seconds)
     ctx.today.production_sec += seconds;
     ctx.daily_stats_dirty = true;
 
+    xSemaphoreGive(ctx.mutex);
     return ESP_OK;
 }
 
@@ -418,6 +430,10 @@ esp_err_t history_increment_daily_flush(void)
 {
     if (!ctx.initialized) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
 
     // 检查日期变化：只重置，不写入
@@ -431,6 +447,7 @@ esp_err_t history_increment_daily_flush(void)
     ctx.today.flush_count++;
     ctx.daily_stats_dirty = true;
 
+    xSemaphoreGive(ctx.mutex);
     return ESP_OK;
 }
 
@@ -438,6 +455,10 @@ esp_err_t history_update_daily_tds(float tds_in, float tds_out)
 {
     if (!ctx.initialized) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
 
     // 检查日期变化：只重置，不写入
@@ -461,6 +482,7 @@ esp_err_t history_update_daily_tds(float tds_in, float tds_out)
     ctx.today.tds_in_avg = ctx.today.tds_in_avg * (1 - alpha) + tds_in * alpha;
     ctx.today.tds_out_avg = ctx.today.tds_out_avg * (1 - alpha) + tds_out * alpha;
 
+    xSemaphoreGive(ctx.mutex);
     return ESP_OK;
 }
 
@@ -480,24 +502,42 @@ bool history_periodic_save(uint32_t min_interval_sec)
 
     // 检查日期变化
     uint32_t today = get_today_date();
-    bool date_changed = (ctx.today.date != today);
 
     bool did_save = false;
+    bool history_dirty = false;
+    bool daily_stats_dirty = false;
+    bool date_changed = false;
+    daily_stats_t today_copy;
 
-    // 保存历史记录
-    if (ctx.history_dirty && (date_changed || elapsed_sec >= min_interval_sec)) {
-        save_to_nvs();
-        ctx.history_dirty = false;
+    // 先在mutex内读取状态和脏标志
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        history_dirty = ctx.history_dirty;
+        daily_stats_dirty = ctx.daily_stats_dirty;
+        date_changed = (ctx.today.date != today);
+        memcpy(&today_copy, &ctx.today, sizeof(daily_stats_t));
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        return false;  // mutex获取失败，跳过本次保存
+    }
+
+    // 保存历史记录（在mutex外执行NVS操作）
+    if (history_dirty && (date_changed || elapsed_sec >= min_interval_sec)) {
+        // 需要在mutex内读取records数据进行保存
+        if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            save_to_nvs();
+            ctx.history_dirty = false;
+            xSemaphoreGive(ctx.mutex);
+        }
         did_save = true;
         ESP_LOGD(TAG, "历史记录已保存（节流间隔%lu秒）", min_interval_sec);
     }
 
     // 保存每日统计：仅在脏标志为真且有数据时保存
-    if (ctx.daily_stats_dirty) {
+    if (daily_stats_dirty) {
         // 判断是否有实际数据
-        bool has_data = (ctx.today.production_sec > 0 ||
-                         ctx.today.flush_count > 0 ||
-                         ctx.today.tds_sample_count > 0);
+        bool has_data = (today_copy.production_sec > 0 ||
+                         today_copy.flush_count > 0 ||
+                         today_copy.tds_sample_count > 0);
 
         bool should_save = false;
         if (date_changed) {
@@ -511,32 +551,33 @@ bool history_periodic_save(uint32_t min_interval_sec)
         if (should_save) {
             if (date_changed) {
                 ESP_LOGI(TAG, "跨天保存昨日统计: 制水%lu秒, 冲洗%lu次",
-                         ctx.today.production_sec, ctx.today.flush_count);
+                         today_copy.production_sec, today_copy.flush_count);
             }
-            save_daily_to_nvs();
-            // 跨天时重置今日数据
-            if (date_changed) {
-                // 清除旧格式的假日期key（兼容旧固件）
-                // 旧固件使用 d20260101+days 格式，新固件使用 b%03u 格式
-                uint32_t yesterday = ctx.today.date;
-                char old_key[12];
-                // 清除boot_day格式的旧key
-                make_date_key(yesterday, old_key, sizeof(old_key));
-                nvs_handle_t erase_handle;
-                if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &erase_handle) == ESP_OK) {
-                    nvs_erase_key(erase_handle, old_key);
-                    nvs_commit(erase_handle);
-                    nvs_close(erase_handle);
-                    ESP_LOGI(TAG, "已清除昨日key: %s", old_key);
+            // 在mutex内保存并更新状态
+            if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                save_daily_to_nvs();
+                // 跨天时重置今日数据
+                if (date_changed) {
+                    uint32_t yesterday = ctx.today.date;
+                    char old_key[12];
+                    make_date_key(yesterday, old_key, sizeof(old_key));
+                    nvs_handle_t erase_handle;
+                    if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &erase_handle) == ESP_OK) {
+                        nvs_erase_key(erase_handle, old_key);
+                        nvs_commit(erase_handle);
+                        nvs_close(erase_handle);
+                        ESP_LOGI(TAG, "已清除昨日key: %s", old_key);
+                    }
+                    memset(&ctx.today, 0, sizeof(daily_stats_t));
+                    ctx.today.date = today;
                 }
-                memset(&ctx.today, 0, sizeof(daily_stats_t));
-                ctx.today.date = today;
+                ctx.daily_stats_dirty = false;
+                xSemaphoreGive(ctx.mutex);
             }
-            ctx.daily_stats_dirty = false;
             did_save = true;
         } else if (date_changed && !has_data) {
             // 昨天没有数据，跳过保存但清除旧key
-            uint32_t yesterday = ctx.today.date;
+            uint32_t yesterday = today_copy.date;
             char old_key[12];
             make_date_key(yesterday, old_key, sizeof(old_key));
             nvs_handle_t erase_handle;
@@ -546,14 +587,21 @@ bool history_periodic_save(uint32_t min_interval_sec)
                 nvs_close(erase_handle);
                 ESP_LOGD(TAG, "已清除无数据key: %s", old_key);
             }
-            memset(&ctx.today, 0, sizeof(daily_stats_t));
-            ctx.today.date = today;
-            ctx.daily_stats_dirty = false;
+            // 重置今日数据
+            if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                memset(&ctx.today, 0, sizeof(daily_stats_t));
+                ctx.today.date = today;
+                ctx.daily_stats_dirty = false;
+                xSemaphoreGive(ctx.mutex);
+            }
         }
     }
 
     if (did_save) {
-        ctx.last_save_time = now_us;
+        if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            ctx.last_save_time = now_us;
+            xSemaphoreGive(ctx.mutex);
+        }
     }
 
     return did_save;

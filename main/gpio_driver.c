@@ -189,6 +189,29 @@ esp_err_t gpio_driver_init_leds(void)
     return ESP_OK;
 }
 
+// ==================== 反初始化 ====================
+
+esp_err_t gpio_driver_deinit(void)
+{
+    ESP_LOGI(TAG, "反初始化GPIO驱动...");
+
+    // 释放输出状态互斥锁
+    if (output_mutex) {
+        vSemaphoreDelete(output_mutex);
+        output_mutex = NULL;
+    }
+
+    // 重置防抖状态
+    memset(&debounce_ctx, 0, sizeof(debounce_ctx));
+
+    // 重置输出状态
+    memset(&output_state, 0, sizeof(output_state));
+    output_state.relay_trigger_level = RELAY_TRIGGER_LEVEL_DEFAULT;
+
+    ESP_LOGI(TAG, "GPIO驱动已反初始化");
+    return ESP_OK;
+}
+
 // ==================== 输入读取函数 ====================
 
 /**
@@ -291,23 +314,33 @@ static inline int calc_output_level_with_trigger(bool state, uint8_t trigger_lev
 /**
  * @brief 安全获取继电器触发电平（用于输出计算）
  * @return 当前触发电平
+ * @note 触发电平可能在运行时被修改（通过网页配置），修改频率很低。
+ *       无锁读取可接受轻微竞态：极端情况下同一时刻的不同GPIO可能使用新旧值，
+ *       但不会导致安全问题，最多一次操作使用旧配置后下次使用新配置。
  */
 static inline uint8_t safe_get_trigger_level(void)
 {
-    /* 快速路径：无锁读取（relay_trigger_level只在初始化时设置，运行期间不变）
-     * 如果严格需要一致性，可以在调用前获取mutex */
-    return output_state.relay_trigger_level;
+    uint8_t level = RELAY_TRIGGER_LEVEL_DEFAULT;  // 默认值作为fallback
+    if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        level = output_state.relay_trigger_level;
+        xSemaphoreGive(output_mutex);
+    }
+    return level;
 }
 
 esp_err_t gpio_driver_set_inlet_valve(bool state)
 {
     uint8_t trigger = safe_get_trigger_level();
     int level = calc_output_level_with_trigger(state, trigger);
-    output_state.inlet_valve = state;  // 先更新状态，确保一致性
     esp_err_t ret = gpio_set_level(GPIO_INLET_VALVE, level);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "进水阀GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
+        // 使用mutex保护状态更新
+        if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            output_state.inlet_valve = state;
+            xSemaphoreGive(output_mutex);
+        }
         ESP_LOGD(TAG, "进水阀: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
     return ret;
@@ -317,11 +350,14 @@ esp_err_t gpio_driver_set_waste_valve(bool state)
 {
     uint8_t trigger = safe_get_trigger_level();
     int level = calc_output_level_with_trigger(state, trigger);
-    output_state.waste_valve = state;  // 先更新状态，确保一致性
     esp_err_t ret = gpio_set_level(GPIO_WASTE_VALVE, level);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "废水阀GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
+        if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            output_state.waste_valve = state;
+            xSemaphoreGive(output_mutex);
+        }
         ESP_LOGD(TAG, "废水阀: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
     return ret;
@@ -331,11 +367,14 @@ esp_err_t gpio_driver_set_return_valve(bool state)
 {
     uint8_t trigger = safe_get_trigger_level();
     int level = calc_output_level_with_trigger(state, trigger);
-    output_state.return_valve = state;  // 先更新状态，确保一致性
     esp_err_t ret = gpio_set_level(GPIO_RETURN_VALVE, level);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "回水阀GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
+        if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            output_state.return_valve = state;
+            xSemaphoreGive(output_mutex);
+        }
         ESP_LOGD(TAG, "回水阀: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
     return ret;
@@ -345,11 +384,14 @@ esp_err_t gpio_driver_set_boost_pump(bool state)
 {
     uint8_t trigger = safe_get_trigger_level();
     int level = calc_output_level_with_trigger(state, trigger);
-    output_state.boost_pump = state;  // 先更新状态，确保一致性
     esp_err_t ret = gpio_set_level(GPIO_BOOST_PUMP, level);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "增压泵GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
+        if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            output_state.boost_pump = state;
+            xSemaphoreGive(output_mutex);
+        }
         ESP_LOGD(TAG, "增压泵: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
     return ret;

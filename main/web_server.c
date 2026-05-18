@@ -61,7 +61,7 @@ static uint64_t s_last_wifi_scan_time = 0;   // 上次WiFi扫描时间
 
 // ==================== 日志拦截器 ====================
 
-#define LOG_BUF_SIZE 4096
+#define LOG_BUF_SIZE 8192
 static char s_log_buf[LOG_BUF_SIZE];
 static volatile uint32_t s_log_head = 0;
 static volatile uint32_t s_log_tail = 0;
@@ -156,7 +156,10 @@ static const char html_page[] =
 "<div style='margin:10px 0'><div style='display:flex;justify-content:space-between;font-size:13px'><span>RO膜</span><span id='f3'>-</span></div><div class='filter-bar'><div id='b3' class='filter-bar-fill good' style='width:100%'></div></div></div>"
 "<div style='margin:10px 0'><div style='display:flex;justify-content:space-between;font-size:13px'><span>后置活性炭</span><span id='f4'>-</span></div><div class='filter-bar'><div id='b4' class='filter-bar-fill good' style='width:100%'></div></div></div>"
 "</div>"
-"<div style='text-align:center;color:#666;font-size:12px;margin-top:10px'>总用水量: <span id='totalWater'>0</span> 升</div>"
+"<div style='display:flex;justify-content:space-between;color:#666;font-size:12px;margin-top:10px;padding:0 10px'>"
+"<span>总用水量: <span id='totalWater'>0</span> 升</span>"
+"<span>总制水量: <span id='prodWater'>0</span> 升</span>"
+"</div>"
 "</div>"
 
 "<div class='card'><h3>运行统计</h3>"
@@ -192,6 +195,7 @@ static const char html_page[] =
 "$('sntpTime').style.color=d.sntpTime?'#28a745':'#ffc107';"
 "if(d.filters){for(let i=0;i<5;i++){const f=d.filters[i];if(f){$('f'+i).textContent=f.effPct+'%';$('b'+i).style.width=f.effPct+'%';$('b'+i).className='filter-bar-fill '+(f.effPct>50?'good':f.effPct>20?'warn':'error');}}}"
 "$('totalWater').textContent=d.totalWater||0;"
+"$('prodWater').textContent=d.prodWater||0;"
 "$('cycles').textContent=d.cycles||0;"
 "$('flushCycles').textContent=d.flushes||0;"
 "$('prodTime').textContent=d.prodTime?(d.prodTime/3600).toFixed(1)+'h':'0h';"
@@ -752,6 +756,9 @@ static esp_err_t handle_status(httpd_req_t *req)
                  tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
     }
 
+    // 制水量从filter_manager获取（仅PRODUCTION状态累计，不含冲洗）
+    uint32_t prod_water_l = filter_mgr_get_total_production_water();
+
     // 构建JSON响应（使用snprintf避免cJSON堆分配）
     char buf[2048];
     int pos = 0;
@@ -762,6 +769,7 @@ static esp_err_t handle_status(httpd_req_t *req)
         "\"prodTime\":%llu,"
         "\"uptime\":%lu,"
         "\"todayProd\":%lu,"
+        "\"prodWater\":%lu,"
         "\"tds_in\":%.1f,"
         "\"tds_out\":%.1f,"
         "\"rate\":%.1f,"
@@ -774,21 +782,29 @@ static esp_err_t handle_status(httpd_req_t *req)
         (unsigned long long)data.total_production_time_sec,
         (unsigned long)get_uptime_sec(),
         (unsigned long)today_prod_min,
+        (unsigned long)prod_water_l,
         tds.inlet.valid ? tds.inlet.tds_value : 0.0,
         tds.outlet.valid ? tds.outlet.tds_value : 0.0,
         tds.both_valid ? tds.reduction_rate : 0.0,
         gpio_driver_read_water_leak() ? "true" : "false",
         sntp_time);
 
-    // 边界检查：确保有足够空间继续写入
-    if (pos >= sizeof(buf) - 400) {
+    // 边界检查：确保有足够空间继续写入（每次snprintf前检查）
+    if (pos >= sizeof(buf) - 500) {
         ESP_LOGW(TAG, "JSON响应接近溢出，中止写入");
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
         return ESP_FAIL;
     }
 
     for (int i = 0; i < FILTER_COUNT; i++) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
+        // 每次写入前检查剩余空间（单个滤芯JSON约150字节）
+        if (pos >= sizeof(buf) - 200) {
+            ESP_LOGW(TAG, "JSON滤芯数据溢出，中止写入");
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
+            return ESP_FAIL;
+        }
+
+        int written = snprintf(buf + pos, sizeof(buf) - pos,
             "%s{\"waterPct\":%u,\"timePct\":%u,\"effPct\":%u,\"used\":%lu,\"total\":%lu,\"timeLimit\":%lu,\"needReplace\":%s}",
             i > 0 ? "," : "",
             filters_status.filters[i].percentage,
@@ -799,12 +815,20 @@ static esp_err_t handle_status(httpd_req_t *req)
             (unsigned long)filters_status.filters[i].time_limit_hours,
             filters_status.filters[i].replacement_needed ? "true" : "false");
 
-        // 边界检查：确保有足够空间继续写入
-        if (pos >= sizeof(buf) - 200) {
-            ESP_LOGW(TAG, "JSON响应接近溢出，中止写入");
+        // 验证snprintf返回值：如果written >= 剩余空间，说明截断
+        if (written < 0 || written >= sizeof(buf) - pos) {
+            ESP_LOGW(TAG, "JSON滤芯数据写入失败/截断");
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
             return ESP_FAIL;
         }
+        pos += written;
+    }
+
+    // 最终字段写入前检查
+    if (pos >= sizeof(buf) - 150) {
+        ESP_LOGW(TAG, "JSON最终数据溢出");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
+        return ESP_FAIL;
     }
 
     pos += snprintf(buf + pos, sizeof(buf) - pos,
@@ -1766,6 +1790,10 @@ esp_err_t web_server_init(void)
 {
     if (ctx.initialized) return ESP_OK;
     ESP_LOGI(TAG, "初始化Web服务器");
+
+    // 抑制httpd_txrx模块的socket连接重置警告(error in recv: 104)
+    // 这是浏览器关闭连接时的正常现象，无需警告
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
 
     // 在启动时记录boot时间，避免延迟初始化的竞态
     if (g_boot_time == 0) {

@@ -36,6 +36,12 @@ esp_err_t gpio_driver_init_outputs(void);
  */
 esp_err_t gpio_driver_init_leds(void);
 
+/**
+ * @brief 反初始化GPIO驱动，释放资源
+ * @return ESP_OK 成功
+ */
+esp_err_t gpio_driver_deinit(void);
+
 // ==================== 继电器触发电平配置 ====================
 
 /**

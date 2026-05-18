@@ -10,11 +10,16 @@
 #include "esp_app_format.h"
 #include "esp_app_desc.h"
 #include "esp_partition.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 
 static const char *TAG = "OTA";
 
 // ==================== 私有状态 ====================
+
+// 临界保护 spinlock（用于多任务并发访问）
+static portMUX_TYPE ota_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 static struct {
     ota_state_t state;
@@ -76,8 +81,11 @@ esp_err_t ota_update_init(void)
 
 esp_err_t ota_update_begin(void)
 {
-    if (s_ctx.state != OTA_STATE_IDLE && s_ctx.state != OTA_STATE_FAILED) {
-        ESP_LOGW(TAG, "OTA 会话正在进行中，状态: %d", s_ctx.state);
+    taskENTER_CRITICAL(&ota_spinlock);
+    ota_state_t current_state = s_ctx.state;
+    if (current_state != OTA_STATE_IDLE && current_state != OTA_STATE_FAILED) {
+        taskEXIT_CRITICAL(&ota_spinlock);
+        ESP_LOGW(TAG, "OTA 会话正在进行中，状态: %d", current_state);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -86,6 +94,7 @@ esp_err_t ota_update_begin(void)
         esp_ota_abort(s_ctx.ota_handle);
         s_ctx.ota_handle = 0;
     }
+    taskEXIT_CRITICAL(&ota_spinlock);
 
     // 注意：不在 begin 时调用 esp_ota_mark_app_valid_cancel_rollback
     // 如果当前固件正在 rollback 倒计时中，提前取消会导致 OTA 失败后失去回滚保护
@@ -94,15 +103,19 @@ esp_err_t ota_update_begin(void)
     s_ctx.update_partition = esp_ota_get_next_update_partition(NULL);
     if (!s_ctx.update_partition) {
         ESP_LOGE(TAG, "未找到可用的 OTA 分区");
+        taskENTER_CRITICAL(&ota_spinlock);
         s_ctx.state = OTA_STATE_FAILED;
+        taskEXIT_CRITICAL(&ota_spinlock);
         return ESP_ERR_NOT_FOUND;
     }
 
+    taskENTER_CRITICAL(&ota_spinlock);
     s_ctx.total_written = 0;
     s_ctx.init_len = 0;
     s_ctx.image_header_checked = false;
     s_ctx.ota_handle = 0;
     s_ctx.state = OTA_STATE_UPLOADING;
+    taskEXIT_CRITICAL(&ota_spinlock);
 
     ESP_LOGI(TAG, "OTA 会话开始，目标分区: %s (0x%lx, %lu KB)",
              s_ctx.update_partition->label,
@@ -193,8 +206,8 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
         ESP_LOGI(TAG, "新固件: 版本=%s, 编译=%s %s",
                  app_desc->version, app_desc->date, app_desc->time);
 
-        // 同版本检测
-        if (strncmp(app_desc->version, s_ctx.running_version, sizeof(s_ctx.running_version)) == 0) {
+        // 同版本检测（使用strcmp比较完整版本字符串，避免strncmp截断误判）
+        if (strcmp(app_desc->version, s_ctx.running_version) == 0) {
             ESP_LOGW(TAG, "上传的固件版本与当前运行版本相同，拒绝升级");
             s_ctx.state = OTA_STATE_FAILED;
             return ESP_ERR_INVALID_ARG;
@@ -239,6 +252,17 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
     }
 
     // 后续调用：直接写入
+    // 安全检查：确保写入总量不超过分区容量
+    if (s_ctx.update_partition != NULL &&
+        s_ctx.total_written + len > s_ctx.update_partition->size) {
+        ESP_LOGE(TAG, "固件超出分区容量: 已写入%lu + 新数据%zu > 分区%lu",
+                 s_ctx.total_written, len, s_ctx.update_partition->size);
+        esp_ota_abort(s_ctx.ota_handle);
+        s_ctx.ota_handle = 0;
+        s_ctx.state = OTA_STATE_FAILED;
+        return ESP_ERR_NO_MEM;
+    }
+
     esp_err_t err = esp_ota_write(s_ctx.ota_handle, data, len);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_write 失败: %s", esp_err_to_name(err));
@@ -254,15 +278,24 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
 
 esp_err_t ota_update_end(void)
 {
-    if (s_ctx.state != OTA_STATE_WRITING) {
-        ESP_LOGW(TAG, "OTA 未处于写入完成状态，当前: %d", s_ctx.state);
+    taskENTER_CRITICAL(&ota_spinlock);
+    ota_state_t current_state = s_ctx.state;
+    uint32_t written = s_ctx.total_written;
+    taskEXIT_CRITICAL(&ota_spinlock);
+
+    if (current_state != OTA_STATE_WRITING) {
+        ESP_LOGW(TAG, "OTA 未处于写入完成状态，当前: %d", current_state);
+        taskENTER_CRITICAL(&ota_spinlock);
         s_ctx.state = OTA_STATE_FAILED;
+        taskEXIT_CRITICAL(&ota_spinlock);
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_ctx.total_written == 0) {
+    if (written == 0) {
         ESP_LOGE(TAG, "未接收到任何固件数据");
+        taskENTER_CRITICAL(&ota_spinlock);
         s_ctx.state = OTA_STATE_FAILED;
+        taskEXIT_CRITICAL(&ota_spinlock);
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -270,45 +303,58 @@ esp_err_t ota_update_end(void)
     esp_err_t err = esp_ota_end(s_ctx.ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end 验证失败: %s", esp_err_to_name(err));
+        taskENTER_CRITICAL(&ota_spinlock);
         s_ctx.state = OTA_STATE_FAILED;
+        taskEXIT_CRITICAL(&ota_spinlock);
         return err;
+    }
+
+    // 关键：在设置启动分区前取消当前固件的回滚倒计时
+    // 如果当前固件处于 PENDING_VERIFY 状态，必须先取消才能安全切换
+    esp_err_t mark_err = esp_ota_mark_app_valid_cancel_rollback();
+    if (mark_err == ESP_OK) {
+        ESP_LOGI(TAG, "取消当前固件的 OTA Rollback 倒计时");
+    } else if (mark_err == ESP_ERR_NOT_SUPPORTED) {
+        // 当前固件不是待验证状态，正常情况
+        ESP_LOGD(TAG, "当前固件非待验证状态，无需取消回滚");
+    } else {
+        ESP_LOGW(TAG, "标记当前固件有效失败: %s（继续升级）", esp_err_to_name(mark_err));
     }
 
     // 设置启动分区
     err = esp_ota_set_boot_partition(s_ctx.update_partition);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition 失败: %s", esp_err_to_name(err));
+        taskENTER_CRITICAL(&ota_spinlock);
         s_ctx.state = OTA_STATE_FAILED;
+        taskEXIT_CRITICAL(&ota_spinlock);
         return err;
     }
 
+    taskENTER_CRITICAL(&ota_spinlock);
     s_ctx.state = OTA_STATE_COMPLETE;
+    written = s_ctx.total_written;
+    taskEXIT_CRITICAL(&ota_spinlock);
 
-    // OTA 成功后才取消回滚倒计时（如果当前固件处于 PENDING_VERIFY 状态）
-    esp_err_t mark_err = esp_ota_mark_app_valid_cancel_rollback();
-    if (mark_err == ESP_ERR_NOT_SUPPORTED) {
-        // 当前固件不是待验证状态，正常情况
-    } else if (mark_err != ESP_OK) {
-        ESP_LOGW(TAG, "标记当前固件有效失败: %s", esp_err_to_name(mark_err));
-    } else {
-        ESP_LOGI(TAG, "取消 OTA Rollback 倒计时");
-    }
-
-    ESP_LOGI(TAG, "OTA 升级完成! 写入 %lu 字节, 下次启动将进入新固件", s_ctx.total_written);
+    ESP_LOGI(TAG, "OTA 升级完成! 写入 %lu 字节, 下次启动将进入新固件", written);
     return ESP_OK;
 }
 
 void ota_update_abort(void)
 {
+    taskENTER_CRITICAL(&ota_spinlock);
     if (s_ctx.ota_handle != 0) {
         esp_ota_abort(s_ctx.ota_handle);
         s_ctx.ota_handle = 0;
     }
+    // 清除init_buf残留数据（安全整洁）
+    memset(s_ctx.init_buf, 0, sizeof(s_ctx.init_buf));
     s_ctx.state = OTA_STATE_FAILED;
     s_ctx.total_written = 0;
     s_ctx.init_len = 0;
     s_ctx.image_header_checked = false;
     s_ctx.update_partition = NULL;  // 清空分区指针，防止下次begin使用旧分区
+    taskEXIT_CRITICAL(&ota_spinlock);
     ESP_LOGW(TAG, "OTA 会话已中止");
 }
 
@@ -316,15 +362,22 @@ void ota_update_abort(void)
 
 ota_state_t ota_update_get_state(void)
 {
-    return s_ctx.state;
+    taskENTER_CRITICAL(&ota_spinlock);
+    ota_state_t state = s_ctx.state;
+    taskEXIT_CRITICAL(&ota_spinlock);
+    return state;
 }
 
 uint32_t ota_update_get_bytes_written(void)
 {
-    return s_ctx.total_written;
+    taskENTER_CRITICAL(&ota_spinlock);
+    uint32_t written = s_ctx.total_written;
+    taskEXIT_CRITICAL(&ota_spinlock);
+    return written;
 }
 
 const char *ota_update_get_running_version(void)
 {
+    // running_version在初始化后不变，无需锁保护
     return s_ctx.running_version;
 }

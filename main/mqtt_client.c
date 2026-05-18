@@ -83,6 +83,7 @@ static const char* const app_state_names[] = {
 static struct {
     bool initialized;
     bool started;
+    bool stop_requested;         // 停止请求标志（通知重连任务退出）
     app_mqtt_state_t state;
     app_mqtt_config_t config;
 
@@ -98,6 +99,7 @@ static struct {
 } mqtt_ctx = {
     .initialized = false,
     .started = false,
+    .stop_requested = false,
     .state = APP_MQTT_STATE_DISCONNECTED,
     .mqtt_client = NULL,
     .message_callback = NULL,
@@ -127,9 +129,16 @@ esp_err_t mqtt_client_init(void)
 
     ESP_LOGI(TAG, "初始化MQTT客户端...");
 
-    // 生成随机客户端ID
-    snprintf(mqtt_ctx.config.client_id, sizeof(mqtt_ctx.config.client_id),
-             "water_purifier_%08lx", (unsigned long)esp_random());
+    // 尝试从NVS加载配置
+    if (mqtt_client_load_config() != ESP_OK) {
+        ESP_LOGI(TAG, "无保存的MQTT配置，使用默认值");
+    }
+
+    // 如果未加载client_id，生成随机ID
+    if (strlen(mqtt_ctx.config.client_id) == 0) {
+        snprintf(mqtt_ctx.config.client_id, sizeof(mqtt_ctx.config.client_id),
+                 "water_purifier_%08lx", (unsigned long)esp_random());
+    }
 
     mqtt_ctx.initialized = true;
     ESP_LOGI(TAG, "MQTT客户端初始化完成");
@@ -149,13 +158,26 @@ esp_err_t mqtt_client_deinit(void)
 
 esp_err_t mqtt_client_start(void)
 {
+    taskENTER_CRITICAL(&mqtt_spinlock);
     if (mqtt_ctx.started) {
+        taskEXIT_CRITICAL(&mqtt_spinlock);
         return ESP_OK;
     }
+    mqtt_ctx.started = true;
+    mqtt_ctx.stop_requested = false;  // 清除停止请求标志
+    mqtt_ctx.state = APP_MQTT_STATE_CONNECTING;
+    taskEXIT_CRITICAL(&mqtt_spinlock);
 
     ESP_LOGI(TAG, "启动MQTT客户端...");
-    mqtt_ctx.started = true;
-    mqtt_ctx.state = APP_MQTT_STATE_CONNECTING;
+
+    // 实际发起连接（如果配置已设置）
+    if (strlen(mqtt_ctx.config.broker_uri) > 0) {
+        esp_err_t ret = mqtt_client_connect();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "MQTT连接发起失败: %s", esp_err_to_name(ret));
+        }
+    }
+
     return ESP_OK;
 }
 
@@ -167,6 +189,32 @@ esp_err_t mqtt_client_stop(void)
 
     ESP_LOGI(TAG, "停止MQTT客户端...");
 
+    // 设置停止请求标志，通知重连任务退出
+    taskENTER_CRITICAL(&mqtt_spinlock);
+    mqtt_ctx.stop_requested = true;
+    taskEXIT_CRITICAL(&mqtt_spinlock);
+
+    // 等待重连任务自行退出（最多500ms）
+    int wait_count = 0;
+    while (mqtt_ctx.reconnect_task != NULL && wait_count < 10) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        wait_count++;
+    }
+
+    // 如果任务未退出，强制删除
+    if (mqtt_ctx.reconnect_task) {
+        ESP_LOGW(TAG, "重连任务未响应停止请求，强制删除");
+        taskENTER_CRITICAL(&mqtt_spinlock);
+        vTaskDelete(mqtt_ctx.reconnect_task);
+        mqtt_ctx.reconnect_task = NULL;
+        taskEXIT_CRITICAL(&mqtt_spinlock);
+    }
+
+    // 清除停止标志
+    taskENTER_CRITICAL(&mqtt_spinlock);
+    mqtt_ctx.stop_requested = false;
+    taskEXIT_CRITICAL(&mqtt_spinlock);
+
     if (mqtt_ctx.mqtt_client != NULL) {
         esp_mqtt_client_disconnect(mqtt_ctx.mqtt_client);
         vTaskDelay(pdMS_TO_TICKS(100));  // 等待断开完成
@@ -175,13 +223,12 @@ esp_err_t mqtt_client_stop(void)
         esp_mqtt_client_destroy(mqtt_ctx.mqtt_client);
         mqtt_ctx.mqtt_client = NULL;
     }
-    if (mqtt_ctx.reconnect_task) {
-        vTaskDelete(mqtt_ctx.reconnect_task);
-        mqtt_ctx.reconnect_task = NULL;
-    }
 
+    taskENTER_CRITICAL(&mqtt_spinlock);
     mqtt_ctx.started = false;
     mqtt_ctx.state = APP_MQTT_STATE_DISCONNECTED;
+    taskEXIT_CRITICAL(&mqtt_spinlock);
+
     ESP_LOGI(TAG, "MQTT客户端已完全停止");
     return ESP_OK;
 }
@@ -267,9 +314,25 @@ esp_err_t mqtt_client_get_config(mqtt_config_t *config)
 
 esp_err_t mqtt_client_connect(void)
 {
+    // 检查是否已连接（状态+客户端对象）
     if (mqtt_ctx.mqtt_client != NULL) {
-        ESP_LOGW(TAG, "MQTT已经连接");
-        return ESP_OK;
+        if (mqtt_client_is_connected()) {
+            ESP_LOGW(TAG, "MQTT已经连接");
+            return ESP_OK;
+        }
+        // 客户端存在但未连接，尝试重新启动
+        ESP_LOGI(TAG, "MQTT客户端已存在但未连接，尝试重启");
+        esp_err_t ret = esp_mqtt_client_start(mqtt_ctx.mqtt_client);
+        if (ret == ESP_OK) {
+            taskENTER_CRITICAL(&mqtt_spinlock);
+            mqtt_ctx.state = APP_MQTT_STATE_CONNECTING;
+            taskEXIT_CRITICAL(&mqtt_spinlock);
+            return ESP_OK;
+        }
+        // 重启失败，销毁旧客户端重新创建
+        ESP_LOGW(TAG, "MQTT客户端重启失败，重新创建");
+        esp_mqtt_client_destroy(mqtt_ctx.mqtt_client);
+        mqtt_ctx.mqtt_client = NULL;
     }
 
     ESP_LOGI(TAG, "连接到MQTT Broker: %s", mqtt_ctx.config.broker_uri);
@@ -361,7 +424,10 @@ esp_err_t mqtt_publish_purifier_status(void)
              has_tds ? dual_tds.outlet.tds_value : 0,
              has_tds ? dual_tds.reduction_rate : 0);
 
-    return mqtt_client_publish("purifier/status", json_buf, strlen(json_buf), 0, true);
+    // 使用配置的topic_prefix
+    char topic[128];
+    mqtt_get_topic("status", topic, sizeof(topic));
+    return mqtt_client_publish(topic, json_buf, strlen(json_buf), 0, true);
 }
 
 esp_err_t mqtt_publish_tds_value(void)
@@ -376,7 +442,9 @@ esp_err_t mqtt_publish_tds_value(void)
              "{\"tds_in\":%.1f,\"tds_out\":%.1f,\"tds_reduction_rate\":%.1f}",
              dual_tds.inlet.tds_value, dual_tds.outlet.tds_value, dual_tds.reduction_rate);
 
-    return mqtt_client_publish("sensor/tds", json_buf, strlen(json_buf), 0, true);
+    char topic[128];
+    mqtt_get_topic("tds", topic, sizeof(topic));
+    return mqtt_client_publish(topic, json_buf, strlen(json_buf), 0, true);
 }
 
 esp_err_t mqtt_publish_system_status(void)
@@ -451,7 +519,12 @@ const char* mqtt_client_get_state_name(mqtt_state_t state)
 
 bool mqtt_client_is_connected(void)
 {
-    return mqtt_ctx.state == APP_MQTT_STATE_CONNECTED && mqtt_ctx.mqtt_client != NULL;
+    if (mqtt_ctx.mqtt_client == NULL) {
+        return false;
+    }
+    // ESP-IDF v6.0中没有esp_mqtt_client_is_connected函数，使用内部状态判断
+    bool state_connected = (mqtt_ctx.state == APP_MQTT_STATE_CONNECTED);
+    return state_connected;
 }
 
 // ==================== 回调接口 ====================
@@ -487,6 +560,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 mqtt_ctx.connection_callback(true);
             }
             mqtt_subscribe_control_topics();
+            // 发送Home Assistant发现配置（首次连接时，有retain标志会持久化）
+            mqtt_send_ha_discovery();
             break;
 
         case MQTT_EVENT_DISCONNECTED:
@@ -524,21 +599,23 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 // 处理控制消息
                 if (strstr(topic, "/set/state")) {
                     cJSON *root = cJSON_Parse(data);
-                    if (root) {
-                        cJSON *state = cJSON_GetObjectItem(root, "state");
-                        if (state && cJSON_IsString(state)) {
-                            if (strcmp(state->valuestring, "producing") == 0) {
-                                fsm_send_event(FSM_EVENT_FORCE_PRODUCTION);
-                            } else if (strcmp(state->valuestring, "idle") == 0) {
-                                fsm_force_standby();
-                            } else if (strcmp(state->valuestring, "flushing") == 0) {
-                                fsm_send_event(FSM_EVENT_FORCE_FLUSH);
-                            } else if (strcmp(state->valuestring, "reset") == 0) {
-                                fsm_clear_stop();
-                            }
-                        }
-                        cJSON_Delete(root);
+                    if (root == NULL) {
+                        ESP_LOGW(TAG, "MQTT消息JSON解析失败: %s", data);
+                        break;
                     }
+                    cJSON *state = cJSON_GetObjectItem(root, "state");
+                    if (state && cJSON_IsString(state)) {
+                        if (strcmp(state->valuestring, "producing") == 0) {
+                            fsm_send_event(FSM_EVENT_FORCE_PRODUCTION);
+                        } else if (strcmp(state->valuestring, "idle") == 0) {
+                            fsm_force_standby();
+                        } else if (strcmp(state->valuestring, "flushing") == 0) {
+                            fsm_send_event(FSM_EVENT_FORCE_FLUSH);
+                        } else if (strcmp(state->valuestring, "reset") == 0) {
+                            fsm_clear_stop();
+                        }
+                    }
+                    cJSON_Delete(root);
                 } else if (strstr(topic, "/set/flush")) {
                     fsm_send_event(FSM_EVENT_FORCE_FLUSH);
                 }
@@ -552,6 +629,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         case MQTT_EVENT_ERROR:
             ESP_LOGE(TAG, "MQTT错误");
             mqtt_ctx.state = APP_MQTT_STATE_ERROR;
+            if (mqtt_ctx.connection_callback) {
+                mqtt_ctx.connection_callback(false);
+            }
+            /* 与断开事件一样启动重连任务 */
+            taskENTER_CRITICAL(&mqtt_spinlock);
+            if (mqtt_ctx.reconnect_task == NULL && mqtt_ctx.started) {
+                BaseType_t ret = xTaskCreate(mqtt_reconnect_task, "mqtt_recon", 3072, NULL, 4, &mqtt_ctx.reconnect_task);
+                if (ret != pdPASS) {
+                    ESP_LOGE(TAG, "创建MQTT重连任务失败");
+                }
+            }
+            taskEXIT_CRITICAL(&mqtt_spinlock);
             break;
 
         case MQTT_EVENT_PUBLISHED:
@@ -728,9 +817,14 @@ esp_err_t mqtt_send_ha_sensor_config(const char *sensor_name, const char *sensor
     cJSON_AddItemToObject(root, "device_class", cJSON_CreateString("sensor"));
 
     char *json_str = cJSON_PrintUnformatted(root);
-    snprintf(discovery_msg, sizeof(discovery_msg), "%s", json_str);
-    free(json_str);
-    cJSON_Delete(root);
+    if (json_str) {
+        snprintf(discovery_msg, sizeof(discovery_msg), "%s", json_str);
+        cJSON_Delete(root);  // 先删除cJSON对象
+        free(json_str);      // 再释放Print分配的内存
+    } else {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
 
     return mqtt_client_publish(topic, discovery_msg, strlen(discovery_msg), 0, true);
 }
@@ -754,9 +848,14 @@ esp_err_t mqtt_send_ha_switch_config(const char *switch_name)
     cJSON_AddItemToObject(root, "payload_off", cJSON_CreateString("idle"));
 
     char *json_str = cJSON_PrintUnformatted(root);
-    snprintf(discovery_msg, sizeof(discovery_msg), "%s", json_str);
-    free(json_str);
-    cJSON_Delete(root);
+    if (json_str) {
+        snprintf(discovery_msg, sizeof(discovery_msg), "%s", json_str);
+        cJSON_Delete(root);  // 先删除cJSON对象
+        free(json_str);      // 再释放Print分配的内存
+    } else {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
 
     return mqtt_client_publish(topic, discovery_msg, strlen(discovery_msg), 0, true);
 }
@@ -788,6 +887,7 @@ void mqtt_client_print_info(void)
  * @brief MQTT自动重连任务
  *
  * 策略：指数退避重连（1s→2s→4s→8s→16s→30s），连接成功后自动退出
+ * 收到stop_requested信号时安全退出
  */
 static void mqtt_reconnect_task(void *pvParameters)
 {
@@ -812,21 +912,51 @@ static void mqtt_reconnect_task(void *pvParameters)
     if (!wifi_manager_is_connected()) {
         ESP_LOGW(TAG, "WiFi未连接，MQTT重连任务提前退出");
         esp_task_wdt_delete(NULL);
+        taskENTER_CRITICAL(&mqtt_spinlock);
         mqtt_ctx.reconnect_task = NULL;
+        taskEXIT_CRITICAL(&mqtt_spinlock);
         vTaskDelete(NULL);
         return;
     }
 
     while (retry < max_retries) {
+        // 检查停止请求（优先检查）
+        taskENTER_CRITICAL(&mqtt_spinlock);
+        bool should_stop = mqtt_ctx.stop_requested;
+        taskEXIT_CRITICAL(&mqtt_spinlock);
+        if (should_stop) {
+            ESP_LOGI(TAG, "收到停止请求，MQTT重连任务退出");
+            break;
+        }
+
         TickType_t delay = delays[(retry < delay_count) ? retry : delay_count - 1];
         esp_task_wdt_reset();  // 长延迟前重置看门狗
-        vTaskDelay(delay);
+
+        // 分段延迟，每100ms检查一次停止请求
+        TickType_t remaining = delay;
+        while (remaining > 0) {
+            TickType_t chunk = (remaining > pdMS_TO_TICKS(100)) ? pdMS_TO_TICKS(100) : remaining;
+            vTaskDelay(chunk);
+            remaining -= chunk;
+            esp_task_wdt_reset();
+
+            taskENTER_CRITICAL(&mqtt_spinlock);
+            should_stop = mqtt_ctx.stop_requested;
+            taskEXIT_CRITICAL(&mqtt_spinlock);
+            if (should_stop) {
+                ESP_LOGI(TAG, "延迟期间收到停止请求，MQTT重连任务退出");
+                break;
+            }
+        }
+        if (should_stop) break;
 
         // 每次重试前检查WiFi状态
         if (!wifi_manager_is_connected()) {
             ESP_LOGW(TAG, "WiFi连接断开，暂停MQTT重连");
             esp_task_wdt_delete(NULL);
+            taskENTER_CRITICAL(&mqtt_spinlock);
             mqtt_ctx.reconnect_task = NULL;
+            taskEXIT_CRITICAL(&mqtt_spinlock);
             vTaskDelete(NULL);
             return;
         }
@@ -836,7 +966,10 @@ static void mqtt_reconnect_task(void *pvParameters)
             break;
         }
 
-        if (!mqtt_ctx.started) {
+        taskENTER_CRITICAL(&mqtt_spinlock);
+        bool is_started = mqtt_ctx.started;
+        taskEXIT_CRITICAL(&mqtt_spinlock);
+        if (!is_started) {
             ESP_LOGI(TAG, "MQTT已停止，取消重连任务");
             break;
         }
@@ -857,11 +990,22 @@ static void mqtt_reconnect_task(void *pvParameters)
                 for (int wait = 0; wait < 50; wait++) {
                     esp_task_wdt_reset();  // 每100ms重置看门狗
                     vTaskDelay(pdMS_TO_TICKS(100));
+
+                    // 检查停止请求
+                    taskENTER_CRITICAL(&mqtt_spinlock);
+                    should_stop = mqtt_ctx.stop_requested;
+                    taskEXIT_CRITICAL(&mqtt_spinlock);
+                    if (should_stop) {
+                        ESP_LOGI(TAG, "等待连接期间收到停止请求，退出");
+                        break;
+                    }
+
                     if (mqtt_client_is_connected()) {
                         ESP_LOGI(TAG, "MQTT重连成功");
                         break;
                     }
                 }
+                if (should_stop) break;
                 if (!mqtt_client_is_connected()) {
                     esp_mqtt_client_disconnect(mqtt_ctx.mqtt_client);
                 }
@@ -876,6 +1020,8 @@ static void mqtt_reconnect_task(void *pvParameters)
     }
 
     esp_task_wdt_delete(NULL);  // 任务结束前注销看门狗
+    taskENTER_CRITICAL(&mqtt_spinlock);
     mqtt_ctx.reconnect_task = NULL;
+    taskEXIT_CRITICAL(&mqtt_spinlock);
     vTaskDelete(NULL);
 }

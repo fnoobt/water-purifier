@@ -31,6 +31,9 @@ static const char *TAG = "WIFI";
 // mDNS是否已初始化标志
 static bool s_mdns_initialized = false;
 
+// SNTP是否已初始化标志
+static bool s_sntp_initialized = false;
+
 // ==================== 事件位定义 ====================
 
 #define WIFI_CONNECTED_BIT    BIT0
@@ -66,6 +69,10 @@ static struct {
 
     // 状态访问互斥锁（保护state、is_ap_mode等字段）
     SemaphoreHandle_t state_mutex;
+
+    // 事件处理器实例句柄（用于注销）
+    esp_event_handler_instance_t wifi_event_handler_instance;
+    esp_event_handler_instance_t ip_event_handler_instance;
 } ctx = {0};
 
 // ==================== 状态名称 ====================
@@ -119,12 +126,18 @@ static void init_mdns(void)
 
 static void init_sntp(void)
 {
+    if (s_sntp_initialized) {
+        ESP_LOGD(TAG, "SNTP已初始化，跳过");
+        return;
+    }
+
     ESP_LOGI(TAG, "启动SNTP时间同步...");
 
     // 配置NTP服务器
     sntp_setoperatingmode(SNTP_OPMODE_POLL);
     sntp_setservername(0, "ntp.aliyun.com");
     sntp_init();
+    s_sntp_initialized = true;
 
     // 设置时区（中国标准时间 UTC+8）
     setenv("TZ", "CST-8", 1);
@@ -164,9 +177,9 @@ esp_err_t wifi_manager_init(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
 
-    // 注册事件处理器
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+    // 注册事件处理器（保存实例句柄用于注销）
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &ctx.wifi_event_handler_instance);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &ctx.ip_event_handler_instance);
 
     // 生成AP SSID
     uint8_t mac[6] = {0};
@@ -185,12 +198,41 @@ esp_err_t wifi_manager_deinit(void)
     if (!ctx.initialized) return ESP_OK;
 
     wifi_manager_stop();
+
+    // 注销事件处理器（防止内存泄漏和野指针）
+    if (ctx.wifi_event_handler_instance != NULL) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, ctx.wifi_event_handler_instance);
+        ctx.wifi_event_handler_instance = NULL;
+    }
+    if (ctx.ip_event_handler_instance != NULL) {
+        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, ctx.ip_event_handler_instance);
+        ctx.ip_event_handler_instance = NULL;
+    }
+
+    // 删除事件组
     if (ctx.event_group) {
         vEventGroupDelete(ctx.event_group);
         ctx.event_group = NULL;
     }
 
+    // 删除互斥锁
+    if (ctx.state_mutex) {
+        vSemaphoreDelete(ctx.state_mutex);
+        ctx.state_mutex = NULL;
+    }
+
+    // 销毁网络接口
+    if (ctx.sta_netif) {
+        esp_netif_destroy(ctx.sta_netif);
+        ctx.sta_netif = NULL;
+    }
+    if (ctx.ap_netif) {
+        esp_netif_destroy(ctx.ap_netif);
+        ctx.ap_netif = NULL;
+    }
+
     ctx.initialized = false;
+    ESP_LOGI(TAG, "WiFi管理器已反初始化");
     return ESP_OK;
 }
 
@@ -292,7 +334,12 @@ esp_err_t wifi_manager_start_ap_mode(void)
 
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    esp_wifi_start();
+
+    // WiFi可能已启动（STA模式），esp_wifi_start在ESP-IDF v6.0中如果已启动返回ESP_OK
+    esp_err_t start_ret = esp_wifi_start();
+    if (start_ret != ESP_OK) {
+        ESP_LOGW(TAG, "AP模式启动失败: %s", esp_err_to_name(start_ret));
+    }
 
     ctx.is_ap_mode = true;
     set_state(WIFI_STATE_AP_MODE);
@@ -527,26 +574,14 @@ static void set_state(wifi_state_t state)
 /**
  * @brief WiFi重连任务（独立FreeRTOS任务，不在事件回调中延时）
  *
- * 策略：指数退避重连，初始1s，最大30s，失败后回退到AP模式
- * 即使AP模式下，也会周期性尝试STA重连
+ * 策略：指数退避重连，初始1s，最大30s，总计约5分钟
+ * 失败后进入AP模式并退出任务，下次断开时自动重建重连任务
  */
 
-typedef struct {
-    int max_retries;
-    bool ap_fallback;
-} wifi_reconnect_params_t;
-
-static void wifi_reconnect_task(void *pvParameters)
+static void wifi_reconnect_task(void *arg)
 {
-    int max_retries = 10;
-    bool ap_fallback = true;
-    if (pvParameters) {
-        wifi_reconnect_params_t *params = (wifi_reconnect_params_t *)pvParameters;
-        max_retries = params->max_retries;
-        ap_fallback = params->ap_fallback;
-        free(params);
-    }
     int retry = 0;
+    const int max_retries = 20;
     const TickType_t delays[] = {
         pdMS_TO_TICKS(1000),   // 第1次：1s
         pdMS_TO_TICKS(2000),   // 第2次：2s
@@ -557,7 +592,7 @@ static void wifi_reconnect_task(void *pvParameters)
     };
     const int delay_count = sizeof(delays) / sizeof(delays[0]);
 
-    ESP_LOGI(TAG, "重连任务启动");
+    ESP_LOGI(TAG, "重连任务启动（最多%d次，约5分钟）", max_retries);
 
     // 注册看门狗
     esp_task_wdt_add(NULL);
@@ -565,7 +600,7 @@ static void wifi_reconnect_task(void *pvParameters)
     while (retry < max_retries) {
         TickType_t delay = delays[(retry < delay_count) ? retry : delay_count - 1];
         ESP_LOGI(TAG, "尝试重连 %d/%d，等待 %lums...", retry + 1, max_retries, pdTICKS_TO_MS(delay));
-        esp_task_wdt_reset();  // 重置看门狗（长延迟前）
+        esp_task_wdt_reset();
         vTaskDelay(delay);
 
         // 检查是否已经连接成功（可能被事件处理器抢先连接）
@@ -574,22 +609,15 @@ static void wifi_reconnect_task(void *pvParameters)
             break;
         }
 
-        // 如果当前在AP模式，先切回STA再连接
-        if (ctx.is_ap_mode) {
-            ESP_LOGI(TAG, "从AP模式切换回STA重连...");
-            wifi_manager_stop_ap_mode();
-            esp_wifi_start();
-        }
-
         esp_err_t ret = esp_wifi_connect();
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "重连发起失败: %s", esp_err_to_name(ret));
         }
         retry++;
 
-        // 等待连接结果（最多等15秒，由事件处理器更新状态）
-        for (int i = 0; i < 15; i++) {
-            esp_task_wdt_reset();  // 每秒重置看门狗
+        // 等待连接结果（最多等10秒，路由器重启通常需几秒到十几秒）
+        for (int i = 0; i < 10; i++) {
+            esp_task_wdt_reset();
             vTaskDelay(pdMS_TO_TICKS(1000));
             if (ctx.state == WIFI_STATE_CONNECTED) {
                 ESP_LOGI(TAG, "重连成功");
@@ -598,43 +626,14 @@ static void wifi_reconnect_task(void *pvParameters)
         }
     }
 
-    // 超过最大重试次数
-    if (ap_fallback && !ctx.is_ap_mode) {
-        ESP_LOGW(TAG, "重连失败%d次，启动AP模式", max_retries);
-        set_state(WIFI_STATE_DISCONNECTED);
-        wifi_manager_start_ap_mode();
-
-        // AP模式下，每隔5分钟尝试一次STA重连
-        ESP_LOGI(TAG, "AP模式下将周期性尝试STA重连");
-        while (ctx.started) {
-            esp_task_wdt_reset();  // 5分钟延迟前重置看门狗
-            vTaskDelay(pdMS_TO_TICKS(300000)); // 5分钟
-            if (!ctx.started) break;
-            if (ctx.state == WIFI_STATE_CONNECTED) break;
-            ESP_LOGI(TAG, "AP模式周期重连尝试...");
-            wifi_manager_stop_ap_mode();
-            esp_wifi_start();
-            esp_err_t ret = esp_wifi_connect();
-            if (ret == ESP_OK) {
-                // 等10秒看是否连接成功
-                for (int i = 0; i < 10; i++) {
-                    esp_task_wdt_reset();  // 每秒重置看门狗
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    if (ctx.state == WIFI_STATE_CONNECTED || !ctx.started) break;
-                }
-            }
-            if (ctx.state == WIFI_STATE_CONNECTED || !ctx.started) break;
-            // 没成功，恢复AP模式
-            if (!ctx.is_ap_mode && ctx.started) {
-                wifi_manager_start_ap_mode();
-            }
-        }
-    } else {
-        set_state(WIFI_STATE_DISCONNECTED);
-    }
+    // 约5分钟后重连失败，进入AP模式并退出任务
+    ESP_LOGW(TAG, "重连失败%d次（约5分钟），进入AP模式", retry);
+    set_state(WIFI_STATE_DISCONNECTED);
+    wifi_manager_start_ap_mode();
+    ESP_LOGI(TAG, "重连任务退出，等待WiFi再次断开时自动重建重连任务");
 
 exit_task:
-    esp_task_wdt_delete(NULL);  // 任务结束前注销看门狗
+    esp_task_wdt_delete(NULL);
     ctx.reconnect_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -682,18 +681,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
                 // 如果已有重连任务在运行，不重复创建
                 if (ctx.reconnect_task_handle == NULL) {
                     set_state(WIFI_STATE_RECONNECTING);
-                    /* 通过 pvParameters 传递重连参数，避免全局变量竞态 */
-                    wifi_reconnect_params_t *params = malloc(sizeof(wifi_reconnect_params_t));
-                    if (params) {
-                        params->max_retries = 10;
-                        params->ap_fallback = true;
-                        BaseType_t ret = xTaskCreate(wifi_reconnect_task, "wifi_reconnect", 3072, params, 5, &ctx.reconnect_task_handle);
-                        if (ret != pdPASS) {
-                            free(params);
-                            ESP_LOGE(TAG, "创建重连任务失败");
-                        }
-                    } else {
-                        xTaskCreate(wifi_reconnect_task, "wifi_reconnect", 3072, NULL, 5, &ctx.reconnect_task_handle);
+                    BaseType_t ret = xTaskCreate(wifi_reconnect_task, "wifi_reconnect", 3072, NULL, 5, &ctx.reconnect_task_handle);
+                    if (ret != pdPASS) {
+                        ESP_LOGE(TAG, "创建重连任务失败");
                     }
                 }
                 break;
@@ -717,7 +707,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
             ctx.retry_count = 0;
             set_state(WIFI_STATE_CONNECTED);
             xEventGroupSetBits(ctx.event_group, WIFI_CONNECTED_BIT);
-            wifi_manager_save_config();
+            // WiFi配置仅在用户设置时保存，不在每次重连后重复保存（减少NVS磨损）
 
             // 初始化mDNS，支持域名访问
             init_mdns();

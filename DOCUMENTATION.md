@@ -254,6 +254,17 @@ typedef struct {
 
 **寿命计算**: `effective_percentage = min(water_pct, time_pct)`，低于10%触发更换提醒。
 
+**水量计量（区分制水/冲洗状态，分两组累计）**:
+
+| 滤芯组 | 成员 | 计量来源 | 状态依赖 |
+|--------|------|---------|---------|
+| 前三级（泵前） | PP棉、颗粒碳、压缩碳 | 系统总进水量 | 制水=RO通量+废水流量，冲洗=泵流量 |
+| 后两级（泵后） | RO膜、后置炭 | 纯水产量 | 仅制水=RO通量，冲洗/纯水=0 |
+
+**首页显示**：
+- **总用水量**：前三级过水量（含制水+冲洗，系统从水源抽取的总量）
+- **总制水量**：后两级纯水量（仅PRODUCTION状态产出，不含冲洗）
+
 **Flash写入策略**:
 - `filter_mgr_update_water_usage()` — 仅标记脏，不调用NVS
 - `filter_mgr_periodic_save()` — FSM周期任务调用，检查脏标志后写入
@@ -425,8 +436,9 @@ typedef struct {
 
 **自动重连机制**:
 - WiFi断开后启动独立FreeRTOS任务执行指数退避重连（1s→2s→4s→8s→16s→30s）
-- 10次重连失败后进入AP模式，AP模式下每5分钟自动尝试STA重连
-- 重连成功后自动停止AP模式
+- 约5分钟（20次尝试）后仍失败则进入AP模式并退出任务
+- 路由器恢复后下次WiFi断开时自动重建重连任务，避免无限循环导致设备不稳定
+- 重连任务不阻塞事件处理系统，重连成功后自动停止AP模式
 
 **主要函数**:
 ```c
@@ -508,6 +520,7 @@ water-purifier/set/flush           # 冲洗控制
 **主要功能**:
 - 首页（只读监控，30秒自动刷新）
 - 管理页（配置控制）
+- 日志页（实时串口日志，SSE推送）
 - RESTful API接口
 
 **API接口**:
@@ -528,6 +541,9 @@ water-purifier/set/flush           # 冲洗控制
 | `/api/mqtt/config` | GET/POST | MQTT配置 |
 | `/api/ota/status` | GET | OTA升级状态 |
 | `/api/ota/update` | POST | 上传固件OTA升级 |
+| `/logs` | GET | 实时串口日志页面 |
+| `/api/logs/debug` | GET | 日志缓冲区内容（HTML格式） |
+| `/api/logs` | GET | 日志缓冲区内容（JSON数组） |
 
 **控制命令**:
 ```json
@@ -549,7 +565,7 @@ water-purifier/set/flush           # 冲洗控制
     {"name":"PP棉","waterPct":85,"timePct":90,"effPct":85,"total":3000},
     {"name":"RO膜","waterPct":91,"timePct":88,"effPct":88,"total":8000}
   ],
-  "totalWater": 1523, "leak": false,
+  "totalWater": 1523, "prodWater": 432, "leak": false,
   "wifiState": "已连接", "ssid": "MyWiFi", "ip": "192.168.1.100",
   "cycles": 156, "flushes": 156, "prodTime": 46800, "uptime": 86400
 }
@@ -561,11 +577,13 @@ water-purifier/set/flush           # 冲洗控制
 |------|------|------|
 | 首页 | `/` | 只读监控，30秒自动刷新 |
 | 管理页 | `/admin` | 配置控制 |
+| 日志页 | `/logs` | 实时串口日志（SSE流式推送） |
 
 **首页功能**:
 - 系统状态（待机/制水中/冲洗中等）
 - 进出水TDS值（1位小数）及去除率
 - 五级滤芯寿命
+- 总用水量 + 总制水量（分两行显示）
 - 漏水状态
 - WiFi信号强度
 
@@ -581,6 +599,7 @@ water-purifier/set/flush           # 冲洗控制
 | WiFi配置 | 扫描网络、保存配置 |
 | MQTT配置 | Broker地址、用户名、密码 |
 | OTA升级 | 固件上传、进度显示 |
+| 日志查看 | 实时串口日志，远程监控设备状态 |
 
 **访问方式**: `http://<设备IP>` 或 `http://waterpurifier.local`（mDNS）
 
@@ -826,7 +845,8 @@ POST /api/mqtt/config
 | `prod_cycles` | u32 | wp_rt | 制水次数 |
 | `flush_cycles` | u32 | wp_rt | 冲洗次数 |
 | `prod_time` | u64 | wp_rt | 总制水时间（秒） |
-| `total_water` | u32 | wp_rt | 总用水量（升） |
+| `total_water` | u32 | wp_rt | 总用水量（升，含冲洗） |
+| `prod_water` | u32 | wp_rt | 总制水量（升，仅纯水） |
 | `f%d_used` | u32 | wp_filters | 各级滤芯已用水量 |
 | `f%d_reset` | u32 | wp_filters | 各级滤芯重置时间 |
 | `f%d_cap` | u32 | wp_filters | 各级滤芯自定义容量 |
@@ -853,11 +873,12 @@ POST /api/mqtt/config
 |------|------|
 | WiFi协议栈 | ~100KB |
 | HTTP服务器 | ~30KB |
+| 日志环形缓冲区 | 8KB |
 | MQTT客户端 | ~20KB |
 | 状态机任务 | ~16KB |
 | TDS传感器任务 | ~12KB |
-| **总计** | ~182KB |
-| **可用** | ~218KB |
+| **总计** | ~190KB |
+| **可用** | ~210KB |
 
 ---
 
@@ -924,6 +945,8 @@ POST /api/mqtt/config
 | 1.1.1 | 2026-04 | 换芯冲洗20分钟，standby_manual清除优化，FLUSH_PHASE_RUNNING守卫 |
 | 1.1.2 | 2026-04 | 滤芯默认容量修正，网页双维度设置，WiFi TX滞回窗口，fsm_force_standby修复 |
 | 1.2.0 | 2026-04 | ESP-IDF v6.0.0适配，ADC驱动重构，WiFi/MQTT API更新 |
+| 1.2.1 | 2026-05 | 滤芯水量精确计量（制水/冲洗分离），总用水量+制水量双显示，Web日志页，WiFi重连稳定性 |
+| 1.2.2 | 2026-05-17 | **代码审查修复**：TDS温度补偿方向修正、水锤控制竞态修复、线程安全增强（config/GPIO/MQTT）、NVS错误处理完善、OTA回滚时序修正、总制水量NVS持久化补全 |
 
 ---
 

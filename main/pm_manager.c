@@ -9,21 +9,22 @@
 #include "esp_pm.h"
 #include "esp_wifi.h"
 #include "esp_system.h"
-
-// 外部模块声明（用于重启前同步NVS）
-extern esp_err_t config_manager_save(void);
-extern bool config_manager_periodic_save_all(uint32_t min_interval_sec);
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "config_manager.h"
 
 static const char *TAG = "PM";
 
 // ==================== 状态 ====================
 
+// 临界保护 spinlock（用于多任务并发访问）
+static portMUX_TYPE pm_spinlock = portMUX_INITIALIZER_UNLOCKED;
+
 static struct {
     bool initialized;
-    bool cpu_low_power;          // 当前CPU模式
-    int8_t last_rssi;            // 上次RSSI
+    bool cpu_lock_acquired;       // CPU频率锁当前是否持有（避免无效操作）
     uint8_t current_wifi_tx_power; // 当前WiFi TX功率(0.25dBm单位)
-    bool wifi_tx_adjusted;       // 是否已调整过WiFi功率
+    bool wifi_tx_adjusted;       // 是否已调整过WiFi功率（用于日志）
     esp_pm_lock_handle_t cpu_freq_lock; // CPU频率锁
 } s_ctx = {0};
 
@@ -52,48 +53,64 @@ esp_err_t pm_manager_init(void)
 
     // 创建CPU频率锁（用于强制保持160MHz）
     // ESP32-C3使用ESP_PM_APB_FREQ_MAX锁保持高频
-    ret = esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "cpu_freq", &s_ctx.cpu_freq_lock);
+    esp_pm_lock_handle_t lock_handle = NULL;
+    ret = esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "cpu_freq", &lock_handle);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "CPU频率锁创建失败: %s", esp_err_to_name(ret));
         // 继续初始化，频率锁可选
     }
 
-    // 初始不持有锁，让DFS自动管理（空闲时会降到80MHz）
-    s_ctx.cpu_low_power = true;
-
-    // WiFi TX功率初始为默认值（~19.5dBm = 78 * 0.25dBm）
-    s_ctx.current_wifi_tx_power = 78;  // 19.5dBm
+    taskENTER_CRITICAL(&pm_spinlock);
+    s_ctx.cpu_freq_lock = lock_handle;
+    s_ctx.cpu_lock_acquired = false;  // 初始不持有锁，让DFS自动管理
+    // WiFi TX功率初始为20dBm（表中最高档位，避免首次调整匹配失败）
+    s_ctx.current_wifi_tx_power = 80;  // 20dBm = 80 * 0.25dBm
     s_ctx.wifi_tx_adjusted = false;
-
-    ESP_LOGI(TAG, "电源管理已启用: DFS 80MHz~160MHz (C3无light sleep)");
     s_ctx.initialized = true;
+    taskEXIT_CRITICAL(&pm_spinlock);
+
+    ESP_LOGI(TAG, "电源管理已启用: DFS 80MHz~160MHz, WiFi TX初始20dBm");
     return ESP_OK;
 }
 
 esp_err_t pm_manager_set_cpu_mode(bool low_power)
 {
+    taskENTER_CRITICAL(&pm_spinlock);
     if (!s_ctx.initialized || s_ctx.cpu_freq_lock == NULL) {
+        taskEXIT_CRITICAL(&pm_spinlock);
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_ctx.cpu_low_power == low_power) {
-        return ESP_OK;  // 模式未变，无需切换
-    }
+    // 检查当前锁状态，避免无效操作
+    bool need_acquire = (!low_power && !s_ctx.cpu_lock_acquired);
+    bool need_release = (low_power && s_ctx.cpu_lock_acquired);
 
+    if (!need_acquire && !need_release) {
+        // 当前状态已符合目标，无需切换
+        taskEXIT_CRITICAL(&pm_spinlock);
+        return ESP_OK;
+    }
+    taskEXIT_CRITICAL(&pm_spinlock);
+
+    // 在临界区外执行锁操作（PM锁API可能阻塞）
     esp_err_t ret;
-    if (low_power) {
-        // 释放锁，让DFS自动降到80MHz
-        ret = esp_pm_lock_release(s_ctx.cpu_freq_lock);
-        if (ret == ESP_OK) {
-            s_ctx.cpu_low_power = true;
-            ESP_LOGD(TAG, "CPU频率降至80MHz（低功耗模式）");
-        }
-    } else {
+    if (need_acquire) {
         // 持有锁，强制保持160MHz
         ret = esp_pm_lock_acquire(s_ctx.cpu_freq_lock);
         if (ret == ESP_OK) {
-            s_ctx.cpu_low_power = false;
-            ESP_LOGD(TAG, "CPU频率恢复至160MHz（高性能模式）");
+            taskENTER_CRITICAL(&pm_spinlock);
+            s_ctx.cpu_lock_acquired = true;
+            taskEXIT_CRITICAL(&pm_spinlock);
+            ESP_LOGD(TAG, "CPU频率升至160MHz（高性能模式）");
+        }
+    } else {
+        // 释放锁，让DFS自动降到80MHz
+        ret = esp_pm_lock_release(s_ctx.cpu_freq_lock);
+        if (ret == ESP_OK) {
+            taskENTER_CRITICAL(&pm_spinlock);
+            s_ctx.cpu_lock_acquired = false;
+            taskEXIT_CRITICAL(&pm_spinlock);
+            ESP_LOGD(TAG, "CPU频率降至80MHz（低功耗模式）");
         }
     }
 
@@ -128,12 +145,16 @@ static const struct {
 
 esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
 {
+    taskENTER_CRITICAL(&pm_spinlock);
     if (!s_ctx.initialized) {
+        taskEXIT_CRITICAL(&pm_spinlock);
         return ESP_ERR_INVALID_STATE;
     }
 
     // 根据当前功率档位，用滞回判断是否切换
     int8_t current_dbm = s_ctx.current_wifi_tx_power / 4;
+    taskEXIT_CRITICAL(&pm_spinlock);
+
     int8_t new_dbm = current_dbm;
 
     for (int i = 0; i < PWR_TABLE_SIZE; i++) {
@@ -159,11 +180,14 @@ esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
         ESP_LOGW(TAG, "WiFi TX功率设置失败: %s", esp_err_to_name(ret));
         return ret;
     }
-    ESP_LOGI(TAG, "WiFi TX功率调整: RSSI=%ddBm -> %d.%ddBm",
-             rssi, tx_power_qdbm / 4, (tx_power_qdbm % 4) * 25);
+
+    // 更新状态
+    taskENTER_CRITICAL(&pm_spinlock);
     s_ctx.current_wifi_tx_power = tx_power_qdbm;
     s_ctx.wifi_tx_adjusted = true;
-    s_ctx.last_rssi = rssi;
+    taskEXIT_CRITICAL(&pm_spinlock);
+
+    ESP_LOGD(TAG, "WiFi TX功率调整: RSSI=%ddBm -> %ddBm", rssi, new_dbm);
     return ESP_OK;
 }
 
@@ -174,13 +198,11 @@ esp_err_t pm_manager_check_heap(void)
     size_t free_heap = esp_get_free_heap_size();
     size_t min_ever_heap = esp_get_minimum_free_heap_size();
 
-    // 低于15KB立即重启
+    // 低于15KB立即重启（跳过NVS保存，避免进一步消耗内存）
     if (free_heap < 15360) {
         ESP_LOGE(TAG, "堆内存严重不足! 可用=%u bytes, 历史最低=%u bytes, 即将重启",
                  (unsigned)free_heap, (unsigned)min_ever_heap);
-        // 重启前尝试保存待写入的NVS数据（统一保存）
-        config_manager_save();  // 系统配置
-        config_manager_periodic_save_all(0);  // 滤芯+历史记录
+        // 内存过低时跳过NVS保存，直接重启（避免保存操作进一步消耗内存）
         esp_restart();
         // 不会执行到这里
         return ESP_ERR_NO_MEM;

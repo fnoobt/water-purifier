@@ -7,6 +7,7 @@
 - **8 状态 FSM**: 智能制水、双阶段冲洗、水锤控制
 - **双 TDS 监测**: 进水/出水实时监测 + 自动校准
 - **5 级滤芯管理**: 水量 + 时间双维度寿命追踪
+- **Web 日志**: 8KB 环形缓冲区，远程实时查看串口日志
 - **OTA 升级**: Web 界面一键升级，版本检测 + 回滚保护
 - **Home Assistant**: MQTT 自动发现集成
 
@@ -44,8 +45,8 @@ WATER_SHORTAGE  ←────────  (任意状态 → LEAK_ALARM/STOP �
 | TDS | ADC 采集 + 校准 |
 | Filter | 滤芯寿命管理 |
 | GPIO | 输入防抖 + 继电器 |
-| WiFi | STA/AP + 重连 |
-| Web | 双页 UI + 14 API |
+| WiFi | STA/AP + 指数退避重连 + AP回退 |
+| Web | 首页+管理页+日志页+OTA |
 | MQTT | HA 自动发现 |
 | Config | NVS 持久化 |
 | OTA | 固件升级 |

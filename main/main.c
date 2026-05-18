@@ -31,10 +31,6 @@ static const char *TAG = "MAIN";
 
 static void fsm_state_callback(fsm_state_t old_state, fsm_state_t new_state)
 {
-    ESP_LOGI(TAG, "状态变化: %s -> %s",
-             fsm_get_state_name(old_state),
-             fsm_get_state_name(new_state));
-
     // 根据状态切换CPU频率
     if (new_state == FSM_STATE_PRODUCTION ||
         new_state == FSM_STATE_NORMAL_FLUSH ||
@@ -58,11 +54,7 @@ static void wifi_state_callback(wifi_state_t state)
     ESP_LOGI(TAG, "WiFi状态: %s", wifi_manager_get_state_name(state));
 
     if (state == WIFI_STATE_CONNECTED) {
-        char ip[16] = "";
-        wifi_manager_get_ip(ip, sizeof(ip));
-        ESP_LOGI(TAG, "获取IP: %s", ip);
-
-        // WiFi连接成功后启动MQTT
+        // WiFi连接成功后启动MQTT（IP已在wifi_manager中打印）
         system_config_t cfg;
         config_manager_get_config(&cfg);
 
@@ -86,11 +78,13 @@ static void wifi_state_callback(wifi_state_t state)
 
             mqtt_client_set_config(&mqtt_cfg);
             mqtt_client_start();
-
-            // 发送Home Assistant发现配置
-            if (mqtt_client_is_connected()) {
-                mqtt_send_ha_discovery();
-            }
+            // Home Assistant发现配置在MQTT_EVENT_CONNECTED事件中自动发送
+        }
+    } else if (state == WIFI_STATE_DISCONNECTED || state == WIFI_STATE_RECONNECTING) {
+        // WiFi断开/重连时停止MQTT（避免无WiFi时MQTT重连浪费资源）
+        if (mqtt_client_is_connected()) {
+            ESP_LOGI(TAG, "WiFi断开，停止MQTT客户端...");
+            mqtt_client_stop();
         }
     }
 }
@@ -115,7 +109,7 @@ static void monitor_task(void *arg)
         // 重置看门狗（循环开始时）
         esp_task_wdt_reset();
 
-        // 每30秒执行一次完整检查（避免频繁日志）
+        // 每30秒执行一次完整检查
         if (loop_count % 30 == 0) {
             // 检查漏水
             if (gpio_driver_read_water_leak() && !fsm_is_stop_state()) {
@@ -123,17 +117,17 @@ static void monitor_task(void *arg)
                 fsm_send_event(FSM_EVENT_WATER_LEAK);
             }
 
-            // 打印状态
+            // 状态日志改为DEBUG级别，减少刷屏
             fsm_state_t state = fsm_get_state();
             tds_dual_measurement_t tds;
             tds_sensor_get_latest_dual(&tds);
 
-            ESP_LOGI(TAG, "状态: %s, TDS: %.0f/%.0f ppm",
+            ESP_LOGD(TAG, "状态: %s, TDS: %.0f/%.0f ppm",
                      fsm_get_state_name(state),
                      tds.inlet.valid ? tds.inlet.tds_value : 0,
                      tds.outlet.valid ? tds.outlet.tds_value : 0);
 
-            // 堆内存监控
+            // 堆内存监控（仅异常时输出）
             pm_manager_check_heap();
 
             // WiFi TX功率动态调整（基于RSSI）
@@ -203,6 +197,14 @@ void app_main(void)
     tds_sensor_init();
     tds_sensor_set_alarm_threshold(TDS_SENSOR_INLET, cfg.tds_inlet_threshold);
     tds_sensor_set_alarm_threshold(TDS_SENSOR_OUTLET, cfg.tds_outlet_threshold);
+    // 加载TDS校准参数（从config_manager持久化数据恢复）
+    tds_calibration_t cal;
+    cal.offset = cfg.tds_calibration_offset[TDS_SENSOR_INLET];
+    cal.scale = cfg.tds_calibration_scale[TDS_SENSOR_INLET];
+    tds_sensor_set_calibration(TDS_SENSOR_INLET, &cal);
+    cal.offset = cfg.tds_calibration_offset[TDS_SENSOR_OUTLET];
+    cal.scale = cfg.tds_calibration_scale[TDS_SENSOR_OUTLET];
+    tds_sensor_set_calibration(TDS_SENSOR_OUTLET, &cal);
     filter_mgr_init();
     tds_sensor_start();
 

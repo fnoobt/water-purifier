@@ -39,10 +39,10 @@ typedef struct {
     uint16_t waste_valve_flow_cc;     // 废水阀流量 (CC=mL/min), 默认300
 
     // 系统参数
-    uint32_t flush_duration_sec;        // 冲洗持续时间（秒），默认60
+    uint32_t flush_duration_sec;        // @deprecated 遗留字段，请使用 normal_flush_duration_sec
     uint32_t production_timeout_sec;    // 制水超时时间（秒），默认3小时
     uint32_t leak_confirm_time_sec;     // 漏水确认时间（秒），默认5秒
-    uint16_t runtime_save_interval_min;  // 运行数据保存间隔（分钟），10/60/120/360/720/1440
+    uint16_t runtime_save_interval_min;  // 运行数据保存间隔（分钟），默认120
 
     // 冲洗参数
     uint32_t normal_flush_duration_sec;  // 常规冲洗持续时间（秒），默认20
@@ -184,6 +184,7 @@ typedef struct {
     uint64_t total_production_time_sec;
     uint64_t total_flush_time_sec;
     uint32_t total_water_used;
+    uint32_t total_production_water;
 } runtime_data_t;
 
 /**

@@ -82,6 +82,12 @@ typedef struct {
  */
 esp_err_t filter_mgr_init(void);
 
+/**
+ * @brief 反初始化滤芯管理模块
+ * @return ESP_OK 成功
+ */
+esp_err_t filter_mgr_deinit(void);
+
 // ==================== 用水量统计 ====================
 
 /**
@@ -109,6 +115,31 @@ uint32_t filter_mgr_get_total_water_usage(void);
  * @param liters 总用水量（升）
  */
 void filter_mgr_set_total_water_usage(uint32_t liters);
+
+/**
+ * @brief 获取总制水量（仅PRODUCTION状态产出的纯水，升）
+ * @return 总制水量（升）
+ */
+uint32_t filter_mgr_get_total_production_water(void);
+
+/**
+ * @brief 设置总制水量（用于从NVS恢复）
+ * @param liters 总制水量（升）
+ */
+void filter_mgr_set_total_production_water(uint32_t liters);
+
+/**
+ * @brief 设置增压泵流量（升/小时），用于冲洗状态前三级过水量计算
+ * @param lph 泵流量
+ * @return ESP_OK 成功
+ */
+esp_err_t filter_mgr_set_pump_flow_lph(float lph);
+
+/**
+ * @brief 获取增压泵流量（升/小时）
+ * @return 泵流量
+ */
+float filter_mgr_get_pump_flow_lph(void);
 
 // ==================== 滤芯寿命管理 ====================
 

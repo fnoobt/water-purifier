@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <string.h>
+#include <math.h>
 
 static const char *TAG = "CONFIG";
 
@@ -18,6 +19,73 @@ static const char *TAG = "CONFIG";
 
 #define NVS_NAMESPACE "water_purifier"
 #define NVS_RUNTIME_NAMESPACE "wp_rt"
+
+// ==================== 辅助函数 ====================
+
+/**
+ * @brief 比较两个配置是否相同（逐字段比较，避免padding问题）
+ * @param a 配置A
+ * @param b 配置B
+ * @return true 相同
+ */
+static bool config_equal(const system_config_t *a, const system_config_t *b)
+{
+    if (!a || !b) return false;
+
+    // WiFi配置
+    if (strcmp(a->wifi_ssid, b->wifi_ssid) != 0) return false;
+    if (strcmp(a->wifi_password, b->wifi_password) != 0) return false;
+
+    // MQTT配置
+    if (a->mqtt_enabled != b->mqtt_enabled) return false;
+    if (strcmp(a->mqtt_broker, b->mqtt_broker) != 0) return false;
+    if (strcmp(a->mqtt_username, b->mqtt_username) != 0) return false;
+    if (strcmp(a->mqtt_password, b->mqtt_password) != 0) return false;
+    if (strcmp(a->mqtt_topic_prefix, b->mqtt_topic_prefix) != 0) return false;
+
+    // 硬件配置
+    if (a->ro_membrane_type != b->ro_membrane_type) return false;
+    if (a->pump_type != b->pump_type) return false;
+    if (a->tank_size != b->tank_size) return false;
+    if (a->waste_valve_flow_cc != b->waste_valve_flow_cc) return false;
+
+    // 系统参数
+    if (a->flush_duration_sec != b->flush_duration_sec) return false;
+    if (a->production_timeout_sec != b->production_timeout_sec) return false;
+    if (a->leak_confirm_time_sec != b->leak_confirm_time_sec) return false;
+    if (a->runtime_save_interval_min != b->runtime_save_interval_min) return false;
+
+    // 冲洗参数
+    if (a->normal_flush_duration_sec != b->normal_flush_duration_sec) return false;
+    if (a->pure_flush_duration_sec != b->pure_flush_duration_sec) return false;
+    if (a->filter_flush_duration_sec != b->filter_flush_duration_sec) return false;
+    if (a->short_prod_threshold_sec != b->short_prod_threshold_sec) return false;
+    if (a->water_hammer_valve_open_delay_ms != b->water_hammer_valve_open_delay_ms) return false;
+    if (a->water_hammer_pump_stop_delay_ms != b->water_hammer_pump_stop_delay_ms) return false;
+    if (a->water_hammer_valve_close_delay_ms != b->water_hammer_valve_close_delay_ms) return false;
+
+    // 继电器配置
+    if (a->relay_trigger_level != b->relay_trigger_level) return false;
+
+    // TDS配置（浮点数使用epsilon比较）
+    if (fabs(a->tds_inlet_threshold - b->tds_inlet_threshold) > 0.01f) return false;
+    if (fabs(a->tds_outlet_threshold - b->tds_outlet_threshold) > 0.01f) return false;
+    if (fabs(a->tds_calibration_offset[0] - b->tds_calibration_offset[0]) > 0.001f) return false;
+    if (fabs(a->tds_calibration_offset[1] - b->tds_calibration_offset[1]) > 0.001f) return false;
+    if (fabs(a->tds_calibration_scale[0] - b->tds_calibration_scale[0]) > 0.0001f) return false;
+    if (fabs(a->tds_calibration_scale[1] - b->tds_calibration_scale[1]) > 0.0001f) return false;
+
+    // 滤芯配置
+    if (a->filter_capacity_liters != b->filter_capacity_liters) return false;
+
+    // Web配置
+    if (a->web_port != b->web_port) return false;
+    if (a->web_auth_enabled != b->web_auth_enabled) return false;
+    if (strcmp(a->web_username, b->web_username) != 0) return false;
+    if (strcmp(a->web_password, b->web_password) != 0) return false;
+
+    return true;
+}
 
 // ==================== 默认配置 ====================
 
@@ -33,7 +101,7 @@ static const system_config_t default_config = {
     .pump_type = 1,                      // 三角洲75G
     .tank_size = 0,                      // 3G
     .waste_valve_flow_cc = 300,          // 300CC (18L/h)
-    .flush_duration_sec = 30,              // 30秒（默认冲洗时间）
+    .flush_duration_sec = 30,              // @deprecated 遗留字段，请使用 normal_flush_duration_sec
     .production_timeout_sec = 3 * 3600,    // 3小时
     .leak_confirm_time_sec = 5,            // 5秒（漏水确认时间）
     .runtime_save_interval_min = 120,      // 2小时（默认保存间隔）
@@ -131,7 +199,19 @@ esp_err_t config_manager_init(void)
 
 esp_err_t config_manager_deinit(void)
 {
+    if (!ctx.initialized) {
+        return ESP_OK;
+    }
+
     ctx.initialized = false;
+
+    // 释放mutex资源
+    if (ctx.mutex) {
+        vSemaphoreDelete(ctx.mutex);
+        ctx.mutex = NULL;
+    }
+
+    ESP_LOGI(TAG, "配置管理器已反初始化");
     return ESP_OK;
 }
 
@@ -139,6 +219,9 @@ esp_err_t config_manager_deinit(void)
 
 esp_err_t config_manager_load(void)
 {
+    /* 注意：此函数主要在init中调用（单线程环境），此时mutex已创建但多任务未启动。
+     * 如果从多任务环境调用，建议先调用save()确保数据一致性。 */
+
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
 
@@ -151,15 +234,22 @@ esp_err_t config_manager_load(void)
 
     // WiFi配置
     len = sizeof(ctx.config.wifi_ssid);
-    nvs_get_str(handle, "wifi_ssid", ctx.config.wifi_ssid, &len);
-    if (len >= sizeof(ctx.config.wifi_ssid)) {
-        ESP_LOGW(TAG, "WiFi SSID被NVS截断 (len=%u, buf=%u)", len, (unsigned)sizeof(ctx.config.wifi_ssid));
+    err = nvs_get_str(handle, "wifi_ssid", ctx.config.wifi_ssid, &len);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取wifi_ssid失败: %s", esp_err_to_name(err));
+    }
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ctx.config.wifi_ssid[0] = '\0';
     }
     ctx.config.wifi_ssid[sizeof(ctx.config.wifi_ssid) - 1] = '\0';
+
     len = sizeof(ctx.config.wifi_password);
-    nvs_get_str(handle, "wifi_pass", ctx.config.wifi_password, &len);
-    if (len >= sizeof(ctx.config.wifi_password)) {
-        ESP_LOGW(TAG, "WiFi密码被NVS截断 (len=%u, buf=%u)", len, (unsigned)sizeof(ctx.config.wifi_password));
+    err = nvs_get_str(handle, "wifi_pass", ctx.config.wifi_password, &len);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取wifi_password失败: %s", esp_err_to_name(err));
+    }
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ctx.config.wifi_password[0] = '\0';
     }
     ctx.config.wifi_password[sizeof(ctx.config.wifi_password) - 1] = '\0';
 
@@ -205,19 +295,49 @@ esp_err_t config_manager_load(void)
         strlcpy(ctx.config.mqtt_topic_prefix, str_buf, sizeof(ctx.config.mqtt_topic_prefix));
     }
 
-    // 系统参数
-    nvs_get_u32(handle, "flush_dur", &ctx.config.flush_duration_sec);
-    nvs_get_u32(handle, "prod_timeout", &ctx.config.production_timeout_sec);
-    nvs_get_u32(handle, "leak_confirm", &ctx.config.leak_confirm_time_sec);
+    // 系统参数（添加错误检查，失败时保留默认值）
+    err = nvs_get_u32(handle, "flush_dur", &ctx.config.flush_duration_sec);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取flush_dur失败: %s", esp_err_to_name(err));
+    }
+    err = nvs_get_u32(handle, "prod_timeout", &ctx.config.production_timeout_sec);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取prod_timeout失败: %s", esp_err_to_name(err));
+    }
+    err = nvs_get_u32(handle, "leak_confirm", &ctx.config.leak_confirm_time_sec);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取leak_confirm失败: %s", esp_err_to_name(err));
+    }
 
-    // 冲洗参数
-    nvs_get_u32(handle, "nflush_dur", &ctx.config.normal_flush_duration_sec);
-    nvs_get_u32(handle, "pflush_dur", &ctx.config.pure_flush_duration_sec);
-    nvs_get_u32(handle, "fflush_dur", &ctx.config.filter_flush_duration_sec);
-    nvs_get_u32(handle, "short_prod", &ctx.config.short_prod_threshold_sec);
-    nvs_get_u32(handle, "wh_vopn", &ctx.config.water_hammer_valve_open_delay_ms);
-    nvs_get_u32(handle, "wh_pstp", &ctx.config.water_hammer_pump_stop_delay_ms);
-    nvs_get_u32(handle, "wh_vcls", &ctx.config.water_hammer_valve_close_delay_ms);
+    // 冲洗参数（添加错误检查）
+    err = nvs_get_u32(handle, "nflush_dur", &ctx.config.normal_flush_duration_sec);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取nflush_dur失败: %s", esp_err_to_name(err));
+    }
+    err = nvs_get_u32(handle, "pflush_dur", &ctx.config.pure_flush_duration_sec);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取pflush_dur失败: %s", esp_err_to_name(err));
+    }
+    err = nvs_get_u32(handle, "fflush_dur", &ctx.config.filter_flush_duration_sec);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取fflush_dur失败: %s", esp_err_to_name(err));
+    }
+    err = nvs_get_u32(handle, "short_prod", &ctx.config.short_prod_threshold_sec);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取short_prod失败: %s", esp_err_to_name(err));
+    }
+    err = nvs_get_u32(handle, "wh_vopn", &ctx.config.water_hammer_valve_open_delay_ms);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取wh_vopn失败: %s", esp_err_to_name(err));
+    }
+    err = nvs_get_u32(handle, "wh_pstp", &ctx.config.water_hammer_pump_stop_delay_ms);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取wh_pstp失败: %s", esp_err_to_name(err));
+    }
+    err = nvs_get_u32(handle, "wh_vcls", &ctx.config.water_hammer_valve_close_delay_ms);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取wh_vcls失败: %s", esp_err_to_name(err));
+    }
 
     // 继电器配置
     if (nvs_get_u8(handle, "relay_lvl", &u8_val) == ESP_OK) {
@@ -230,17 +350,28 @@ esp_err_t config_manager_load(void)
         ctx.config.runtime_save_interval_min = u16_val2;
     }
 
-    // TDS配置
-    uint32_t u32_val;
-    if (nvs_get_u32(handle, "tds_in_th", &u32_val) == ESP_OK) {
-        ctx.config.tds_inlet_threshold = (float)u32_val;
+    // TDS配置（优先读取定点数格式，向后兼容旧的整数格式）
+    int32_t i32_val;
+    if (nvs_get_i32(handle, "tds_in_th", &i32_val) == ESP_OK) {
+        ctx.config.tds_inlet_threshold = i32_val / 100.0f;
+    } else {
+        // 兼容旧版本：u32格式（整数）
+        uint32_t u32_val;
+        if (nvs_get_u32(handle, "tds_in_th", &u32_val) == ESP_OK) {
+            ctx.config.tds_inlet_threshold = (float)u32_val;
+        }
     }
-    if (nvs_get_u32(handle, "tds_out_th", &u32_val) == ESP_OK) {
-        ctx.config.tds_outlet_threshold = (float)u32_val;
+    if (nvs_get_i32(handle, "tds_out_th", &i32_val) == ESP_OK) {
+        ctx.config.tds_outlet_threshold = i32_val / 100.0f;
+    } else {
+        // 兼容旧版本：u32格式（整数）
+        uint32_t u32_val;
+        if (nvs_get_u32(handle, "tds_out_th", &u32_val) == ESP_OK) {
+            ctx.config.tds_outlet_threshold = (float)u32_val;
+        }
     }
 
-    // TDS校准
-    int32_t i32_val;
+    // TDS校准（定点数存储：offset乘100，scale乘10000）
     if (nvs_get_i32(handle, "tds_in_off", &i32_val) == ESP_OK) {
         ctx.config.tds_calibration_offset[0] = i32_val / 100.0f;
     }
@@ -255,25 +386,47 @@ esp_err_t config_manager_load(void)
     }
 
     // 滤芯容量
-    nvs_get_u32(handle, "filter_cap", &ctx.config.filter_capacity_liters);
-
-    // Web配置
-    uint16_t u16_val;
-    if (nvs_get_u16(handle, "web_port", &u16_val) == ESP_OK) {
-        ctx.config.web_port = u16_val;
+    err = nvs_get_u32(handle, "filter_cap", &ctx.config.filter_capacity_liters);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取filter_cap失败: %s", esp_err_to_name(err));
     }
-    if (nvs_get_u8(handle, "web_auth", &u8_val) == ESP_OK) {
+
+    // Web配置（添加错误检查）
+    err = nvs_get_u16(handle, "web_port", &u16_val2);
+    if (err == ESP_OK) {
+        ctx.config.web_port = u16_val2;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取web_port失败: %s", esp_err_to_name(err));
+    }
+    err = nvs_get_u8(handle, "web_auth", &u8_val);
+    if (err == ESP_OK) {
         ctx.config.web_auth_enabled = u8_val;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取web_auth失败: %s", esp_err_to_name(err));
     }
     len = sizeof(ctx.config.web_username);
-    nvs_get_str(handle, "web_user", ctx.config.web_username, &len);
+    err = nvs_get_str(handle, "web_user", ctx.config.web_username, &len);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取web_user失败: %s", esp_err_to_name(err));
+    }
     ctx.config.web_username[sizeof(ctx.config.web_username) - 1] = '\0';
     len = sizeof(ctx.config.web_password);
-    nvs_get_str(handle, "web_pass", ctx.config.web_password, &len);
+    err = nvs_get_str(handle, "web_pass", ctx.config.web_password, &len);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取web_pass失败: %s", esp_err_to_name(err));
+    }
     ctx.config.web_password[sizeof(ctx.config.web_password) - 1] = '\0';
 
     nvs_close(handle);
-    ctx.config_dirty = false;
+
+    // 使用mutex保护dirty标志清除
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        ctx.config_dirty = false;
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        ctx.config_dirty = false;  // 降级处理
+    }
+
     ESP_LOGI(TAG, "配置已加载");
     return ESP_OK;
 }
@@ -347,15 +500,15 @@ esp_err_t config_manager_save(void)
     // 运行数据保存间隔
     nvs_set_u16(handle, "save_intv", config_copy.runtime_save_interval_min);
 
-    // TDS配置
-    nvs_set_u32(handle, "tds_in_th", (uint32_t)config_copy.tds_inlet_threshold);
-    nvs_set_u32(handle, "tds_out_th", (uint32_t)config_copy.tds_outlet_threshold);
+    // TDS配置（定点数存储：乘100保留2位小数精度）
+    nvs_set_i32(handle, "tds_in_th", (int32_t)(config_copy.tds_inlet_threshold * 100.0f));
+    nvs_set_i32(handle, "tds_out_th", (int32_t)(config_copy.tds_outlet_threshold * 100.0f));
 
-    // TDS校准
-    nvs_set_i32(handle, "tds_in_off", (int32_t)(config_copy.tds_calibration_offset[0] * 100));
-    nvs_set_i32(handle, "tds_out_off", (int32_t)(config_copy.tds_calibration_offset[1] * 100));
-    nvs_set_i32(handle, "tds_in_scale", (int32_t)(config_copy.tds_calibration_scale[0] * 10000));
-    nvs_set_i32(handle, "tds_out_scale", (int32_t)(config_copy.tds_calibration_scale[1] * 10000));
+    // TDS校准（定点数存储：offset乘100，scale乘10000）
+    nvs_set_i32(handle, "tds_in_off", (int32_t)(config_copy.tds_calibration_offset[0] * 100.0f));
+    nvs_set_i32(handle, "tds_out_off", (int32_t)(config_copy.tds_calibration_offset[1] * 100.0f));
+    nvs_set_i32(handle, "tds_in_scale", (int32_t)(config_copy.tds_calibration_scale[0] * 10000.0f));
+    nvs_set_i32(handle, "tds_out_scale", (int32_t)(config_copy.tds_calibration_scale[1] * 10000.0f));
 
     // 滤芯容量
     nvs_set_u32(handle, "filter_cap", config_copy.filter_capacity_liters);
@@ -458,6 +611,7 @@ esp_err_t config_manager_save_runtime_data(const runtime_data_t *data)
     nvs_set_u64(handle, "prod_time", data->total_production_time_sec);
     nvs_set_u64(handle, "flush_time", data->total_flush_time_sec);
     nvs_set_u32(handle, "total_water", data->total_water_used);
+    nvs_set_u32(handle, "prod_water", data->total_production_water);
 
     err = nvs_commit(handle);
     nvs_close(handle);
@@ -485,11 +639,13 @@ esp_err_t config_manager_load_runtime_data(runtime_data_t *data)
     nvs_get_u64(handle, "prod_time", &data->total_production_time_sec);
     nvs_get_u64(handle, "flush_time", &data->total_flush_time_sec);
     nvs_get_u32(handle, "total_water", &data->total_water_used);
+    nvs_get_u32(handle, "prod_water", &data->total_production_water);
 
     nvs_close(handle);
 
-    ESP_LOGI(TAG, "运行数据已加载: 制水%lu次, 冲洗%lu次, 总水%luL",
-             data->total_production_cycles, data->total_flush_cycles, data->total_water_used);
+    ESP_LOGI(TAG, "运行数据已加载: 制水%lu次, 冲洗%lu次, 总水%luL, 制水%luL",
+             data->total_production_cycles, data->total_flush_cycles,
+             data->total_water_used, data->total_production_water);
     return ESP_OK;
 }
 
@@ -528,8 +684,8 @@ esp_err_t config_manager_set_config(const system_config_t *config)
 
     // 使用mutex保护配置更新
     if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        // 仅在值发生变化时标记为脏
-        if (memcmp(&ctx.config, config, sizeof(system_config_t)) != 0) {
+        // 使用逐字段比较，避免padding问题
+        if (!config_equal(&ctx.config, config)) {
             memcpy(&ctx.config, config, sizeof(system_config_t));
             ctx.config_dirty = true;
         }
@@ -538,7 +694,7 @@ esp_err_t config_manager_set_config(const system_config_t *config)
     }
 
     // 互斥锁获取失败时降级处理
-    if (memcmp(&ctx.config, config, sizeof(system_config_t)) != 0) {
+    if (!config_equal(&ctx.config, config)) {
         memcpy(&ctx.config, config, sizeof(system_config_t));
         ctx.config_dirty = true;
     }
@@ -932,17 +1088,39 @@ bool config_manager_validate(const system_config_t *config)
 
 bool config_manager_is_dirty(void)
 {
-    return ctx.config_dirty;
+    bool is_dirty = false;
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        is_dirty = ctx.config_dirty;
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        // 降级处理（返回值可能不准确但不会崩溃）
+        is_dirty = ctx.config_dirty;
+    }
+    return is_dirty;
 }
 
 bool config_manager_has_wifi_config(void)
 {
-    return (strlen(ctx.config.wifi_ssid) > 0);
+    bool has_config = false;
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        has_config = (strlen(ctx.config.wifi_ssid) > 0);
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        has_config = (strlen(ctx.config.wifi_ssid) > 0);
+    }
+    return has_config;
 }
 
 bool config_manager_has_mqtt_config(void)
 {
-    return (strlen(ctx.config.mqtt_broker) > 0);
+    bool has_config = false;
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        has_config = (strlen(ctx.config.mqtt_broker) > 0);
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        has_config = (strlen(ctx.config.mqtt_broker) > 0);
+    }
+    return has_config;
 }
 
 // ==================== 统一周期保存 ====================
