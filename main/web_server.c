@@ -429,10 +429,14 @@ static const char html_ota_page[] =
 ".stat{background:#f8f9fa;padding:15px;border-radius:12px;text-align:center}"
 ".stat-label{color:#666;font-size:12px;margin-bottom:5px}"
 ".stat-value{color:#333;font-size:20px;font-weight:600}"
+".stat-value.good{color:#28a745}"
+".stat-value.warn{color:#ffc107}"
+".stat-value.error{color:#dc3545}"
 ".btn{padding:12px 20px;margin:5px;border:none;border-radius:10px;cursor:pointer;color:#fff;font-size:14px;font-weight:500;transition:all .2s}"
 ".btn:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.2)}"
 ".btn-success{background:linear-gradient(135deg,#28a745,#20c997)}"
 ".btn-primary{background:linear-gradient(135deg,#667eea,#764ba2)}"
+".btn-danger{background:linear-gradient(135deg,#dc3545,#c82333)}"
 ".btn-group{display:flex;flex-wrap:wrap;gap:8px}"
 "input,select{padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:14px;transition:border-color .2s;width:100%}"
 "input:focus,select:focus{outline:none;border-color:#667eea}"
@@ -453,7 +457,15 @@ static const char html_ota_page[] =
 "<div class='grid'>"
 "<div class='stat'><div class='stat-label'>当前版本</div><div id='fwVer' class='stat-value'>-</div></div>"
 "<div class='stat'><div class='stat-label'>编译时间</div><div id='compileTime' class='stat-value' style='font-size:14px'>-</div></div>"
+"<div class='stat'><div class='stat-label'>运行分区</div><div id='partition' class='stat-value' style='font-size:14px'>-</div></div>"
+"</div>"
+"</div>"
+
+"<div class='card'><h3>固件状态</h3>"
+"<div class='grid'>"
+"<div class='stat'><div class='stat-label'>固件状态</div><div id='rollbackStatus' class='stat-value'>-</div></div>"
 "<div class='stat'><div class='stat-label'>升级状态</div><div id='otaState' class='stat-value'>就绪</div></div>"
+"<div class='stat'><div class='stat-label'>可升级</div><div id='canOta' class='stat-value'>-</div></div>"
 "</div>"
 "</div>"
 
@@ -475,12 +487,24 @@ static const char html_ota_page[] =
 "<p style='font-size:11px;color:#999;margin-top:8px'>升级过程中设备将自动重启，请勿断电</p>"
 "</div>"
 
+"<div class='card'><h3>恢复出厂固件</h3>"
+"<p style='font-size:13px;color:#666;margin-bottom:10px'>恢复到出厂固件（factory分区），设备将自动重启。</p>"
+"<div class='btn-group'><button class='btn btn-primary' onclick='revertFactory()'>恢复出厂固件</button></div>"
+"</div>"
+
+"<div class='card'><h3>回滚到上一OTA固件</h3>"
+"<p style='font-size:13px;color:#666;margin-bottom:10px'>切换到另一个OTA分区（ota_0↔ota_1），设备将自动重启。仅当目标分区有有效固件时可用。</p>"
+"<div class='btn-group'><button class='btn btn-danger' onclick='rollbackOTA()'>回滚到上一版本</button></div>"
+"</div>"
+
 "</div>"
 "<script>"
 "function $(id){return document.getElementById(id)}"
 "function formatSize(b){if(!b||b<=0)return'-';return b<1024?b+'B':b<1048576?(b/1024).toFixed(1)+'KB':(b/1048576).toFixed(2)+'MB';}"
-"function loadOTA(){fetch('/api/ota/status').then(r=>r.json()).then(d=>{$('fwVer').textContent=d.running_version||'-';$('compileTime').textContent=(d.compile_time||'')+' '+(d.compile_date||'')||'-';$('otaState').textContent=d.state==='idle'?'就绪':d.state})}"
+"function loadOTA(){fetch('/api/ota/status').then(r=>r.json()).then(d=>{$('fwVer').textContent=d.running_version||'-';$('compileTime').textContent=(d.compile_time||'')+' '+d.compile_date||'-';$('partition').textContent=d.partition||'-';$('rollbackStatus').textContent=d.rollback_status||'-';$('rollbackStatus').className=d.rollback_status=='出厂固件'||d.rollback_status=='有效'?'stat-value good':'stat-value';$('otaState').textContent=d.state==='idle'?'就绪':d.state;$('otaState').className=d.state==='idle'?'stat-value good':'stat-value';$('canOta').textContent=d.can_ota?'是':'否';$('canOta').className=d.can_ota?'stat-value good':'stat-value error'})}"
 "function uploadFirmware(){var f=$('fwFile').files[0];if(!f)return alert('请选择固件文件');if(!f.name.endsWith('.bin'))return alert('只支持 .bin 文件');if(!confirm('确认升级固件？设备将自动重启。'))return;var fd=new FormData();fd.append('firmware',f);$('otaProgress').style.display='block';$('otaState').textContent='上传中...';$('otaState').className='stat-value warn';var xhr=new XMLHttpRequest();xhr.open('POST','/api/ota/update');xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('otaProgressText').textContent='上传中 '+formatSize(e.loaded)+'/'+formatSize(e.total);$('otaProgressPct').textContent=p+'%';$('otaProgressBar').style.width=p+'%';}};xhr.onload=function(){if(xhr.status===200){$('otaState').textContent='升级成功，重启中...';$('otaState').className='stat-value good';$('otaProgressText').textContent='升级完成，设备正在重启';$('otaProgressBar').style.width='100%';}else{try{var e=JSON.parse(xhr.responseText);alert(e.message||'升级失败');}catch(e){alert('升级失败: '+xhr.responseText);}$('otaState').textContent='升级失败';$('otaState').className='stat-value error';}};xhr.onerror=function(){$('otaState').textContent='网络错误';$('otaState').className='stat-value error';};xhr.send(fd);}"
+"function revertFactory(){if(!confirm('确认恢复出厂固件？设备将自动重启。'))return;fetch('/api/ota/factory',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.status==='success'){alert('恢复成功，设备将重启');}else{alert(d.message||'恢复失败')}}).catch(e=>alert('请求失败'))}"
+"function rollbackOTA(){if(!confirm('确认回滚到上一OTA固件？设备将自动重启。'))return;fetch('/api/ota/rollback',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.status==='success'){alert('回滚成功，设备将重启');}else{alert(d.message||'回滚失败')}}).catch(e=>alert('请求失败'))}"
 "loadOTA();"
 "</script></body></html>";
 
@@ -1751,7 +1775,59 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         ota_st == OTA_STATE_COMPLETE ? "complete" : "failed");
     cJSON_AddNumberToObject(root, "written", ota_update_get_bytes_written());
 
-    // 获取当前运行分区的编译时间
+    // 获取当前运行分区信息
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running) {
+        cJSON_AddStringToObject(root, "partition", running->label);
+        cJSON_AddNumberToObject(root, "partition_size", running->size);
+
+        // factory分区是出厂固件，永远有效可OTA
+        const char *rollback_status = "有效";
+        bool can_ota = true;
+
+        if (running->type == ESP_PARTITION_TYPE_APP &&
+            running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) {
+            // factory分区：出厂固件，永远有效
+            rollback_status = "出厂固件";
+            can_ota = true;
+        } else {
+            // OTA分区：检查固件状态
+            esp_ota_img_states_t img_state;
+            esp_err_t err = esp_ota_get_state_partition(running, &img_state);
+            if (err == ESP_OK) {
+                switch (img_state) {
+                    case ESP_OTA_IMG_VALID:
+                        rollback_status = "有效";
+                        can_ota = true;
+                        break;
+                    case ESP_OTA_IMG_PENDING_VERIFY:
+                        rollback_status = "待验证";
+                        can_ota = false;
+                        break;
+                    case ESP_OTA_IMG_INVALID:
+                        rollback_status = "无效";
+                        can_ota = false;
+                        break;
+                    case ESP_OTA_IMG_ABORTED:
+                        rollback_status = "已中止";
+                        can_ota = false;
+                        break;
+                    default:
+                        rollback_status = "未知";
+                        can_ota = true;
+                        break;
+                }
+            }
+        }
+        cJSON_AddStringToObject(root, "rollback_status", rollback_status);
+        cJSON_AddBoolToObject(root, "can_ota", can_ota);
+    } else {
+        cJSON_AddStringToObject(root, "partition", "unknown");
+        cJSON_AddStringToObject(root, "rollback_status", "未知");
+        cJSON_AddBoolToObject(root, "can_ota", false);
+    }
+
+    // 获取固件版本信息
     const esp_app_desc_t *app_desc = esp_app_get_description();
     if (app_desc) {
         cJSON_AddStringToObject(root, "running_version", app_desc->version);
@@ -1759,11 +1835,8 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         cJSON_AddStringToObject(root, "compile_date", app_desc->time);
     } else {
         cJSON_AddStringToObject(root, "running_version", "unknown");
-    }
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    if (running) {
-        cJSON_AddStringToObject(root, "partition", running->label);
-        cJSON_AddNumberToObject(root, "partition_size", running->size);
+        cJSON_AddStringToObject(root, "compile_time", "");
+        cJSON_AddStringToObject(root, "compile_date", "");
     }
 
     const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
@@ -1782,6 +1855,59 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     free(resp);
     cJSON_Delete(root);
     return ESP_OK;
+}
+
+/**
+ * @brief 恢复出厂固件API处理器
+ */
+static esp_err_t ota_factory_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "收到恢复出厂固件请求");
+    httpd_resp_set_type(req, "application/json");
+
+    esp_err_t err = ota_update_revert_to_factory();
+    if (err == ESP_OK) {
+        // 成功设置，即将重启，返回响应
+        httpd_resp_sendstr(req, "{\"status\":\"success\",\"message\":\"已设置启动分区为factory，设备将重启\"}");
+        return ESP_OK;
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"未找到factory分区\"}");
+        return ESP_OK;
+    } else {
+        char resp[128];
+        snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"设置失败: %s\"}", esp_err_to_name(err));
+        httpd_resp_sendstr(req, resp);
+        return ESP_OK;
+    }
+}
+
+/**
+ * @brief 回滚到上一OTA固件API处理器
+ */
+static esp_err_t ota_rollback_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "收到回滚到上一OTA固件请求");
+    httpd_resp_set_type(req, "application/json");
+
+    esp_err_t err = ota_update_rollback();
+    if (err == ESP_OK) {
+        httpd_resp_sendstr(req, "{\"status\":\"success\",\"message\":\"已设置回滚分区，设备将重启\"}");
+        return ESP_OK;
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"未找到可回滚的OTA分区\"}");
+        return ESP_OK;
+    } else if (err == ESP_ERR_NOT_SUPPORTED) {
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"当前不在OTA分区运行，无法回滚\"}");
+        return ESP_OK;
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"目标分区无有效固件\"}");
+        return ESP_OK;
+    } else {
+        char resp[128];
+        snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"回滚失败: %s\"}", esp_err_to_name(err));
+        httpd_resp_sendstr(req, resp);
+        return ESP_OK;
+    }
 }
 
 // ==================== 公共接口 ====================
@@ -1882,6 +2008,12 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(ctx.server, &uri);
 
     uri.uri = "/api/ota/status", uri.method = HTTP_GET, uri.handler = ota_status_handler;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/ota/factory", uri.method = HTTP_POST, uri.handler = ota_factory_handler;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/ota/rollback", uri.method = HTTP_POST, uri.handler = ota_rollback_handler;
     httpd_register_uri_handler(ctx.server, &uri);
 
     uri.uri = "/ota", uri.method = HTTP_GET, uri.handler = handle_ota;

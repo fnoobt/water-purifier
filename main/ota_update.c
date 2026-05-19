@@ -55,6 +55,25 @@ esp_err_t ota_update_init(void)
     ESP_LOGI(TAG, "当前运行分区: %s (地址 0x%lx, 大小 %lu KB)",
              running->label, running->address, running->size / 1024);
 
+    // 检查并确认当前固件有效（解决OTA升级后PENDING_VERIFY状态无法再次OTA的问题）
+    esp_ota_img_states_t img_state;
+    esp_err_t state_err = esp_ota_get_state_partition(running, &img_state);
+    if (state_err == ESP_OK) {
+        if (img_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGI(TAG, "当前固件处于待验证状态，确认有效...");
+            esp_err_t mark_err = esp_ota_mark_app_valid_cancel_rollback();
+            if (mark_err == ESP_OK) {
+                ESP_LOGI(TAG, "固件已确认有效，回滚保护已取消");
+            } else {
+                ESP_LOGW(TAG, "确认固件有效失败: %s（将影响后续OTA）", esp_err_to_name(mark_err));
+            }
+        } else if (img_state == ESP_OTA_IMG_VALID) {
+            ESP_LOGD(TAG, "当前固件状态: 已验证有效");
+        } else {
+            ESP_LOGD(TAG, "当前固件OTA状态: %d", img_state);
+        }
+    }
+
     const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
     if (!next) {
         ESP_LOGE(TAG, "未找到 OTA 分区，请检查分区表配置");
@@ -380,4 +399,95 @@ const char *ota_update_get_running_version(void)
 {
     // running_version在初始化后不变，无需锁保护
     return s_ctx.running_version;
+}
+
+/**
+ * @brief 恢复到factory出厂分区
+ * @note 设置启动分区为factory并重启
+ * @return ESP_OK 成功，ESP_ERR_NOT_FOUND factory分区不存在
+ */
+esp_err_t ota_update_revert_to_factory(void)
+{
+    // 查找factory分区
+    const esp_partition_t *factory = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+    if (!factory) {
+        ESP_LOGE(TAG, "未找到factory出厂分区");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    // 检查当前是否已在factory分区运行
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running && running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) {
+        ESP_LOGI(TAG, "当前已在factory分区运行，无需恢复");
+        return ESP_OK;
+    }
+
+    // 设置启动分区为factory
+    esp_err_t err = esp_ota_set_boot_partition(factory);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "设置factory启动分区失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "已设置启动分区为factory，即将重启...");
+    // 延迟重启，让HTTP响应先发送
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+
+    return ESP_OK;
+}
+
+/**
+ * @brief 回滚到上一个OTA固件
+ * @note 从ota_0切换到ota_1或反之，检查目标分区固件有效性
+ * @return ESP_OK 成功，ESP_ERR_NOT_FOUND 无可回滚分区，ESP_ERR_INVALID_STATE 目标分区无效
+ */
+esp_err_t ota_update_rollback(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running) {
+        ESP_LOGE(TAG, "无法获取当前运行分区");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    // 只能从OTA分区回滚，factory分区没有"上一个OTA"
+    if (running->subtype != ESP_PARTITION_SUBTYPE_APP_OTA_0 &&
+        running->subtype != ESP_PARTITION_SUBTYPE_APP_OTA_1) {
+        ESP_LOGW(TAG, "当前不在OTA分区运行，无法回滚到上一OTA固件");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    // 确定回滚目标分区
+    esp_partition_subtype_t target_subtype =
+        (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) ?
+        ESP_PARTITION_SUBTYPE_APP_OTA_1 : ESP_PARTITION_SUBTYPE_APP_OTA_0;
+
+    const esp_partition_t *target = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP, target_subtype, NULL);
+    if (!target) {
+        ESP_LOGE(TAG, "未找到目标OTA分区 (subtype %d)", target_subtype);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    // 检查目标分区固件状态
+    esp_ota_img_states_t img_state;
+    esp_err_t err = esp_ota_get_state_partition(target, &img_state);
+    if (err != ESP_OK || img_state != ESP_OTA_IMG_VALID) {
+        ESP_LOGW(TAG, "目标分区 %s 无有效固件 (state=%d)", target->label, img_state);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // 设置启动分区
+    err = esp_ota_set_boot_partition(target);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "设置启动分区 %s 失败: %s", target->label, esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "已设置启动分区为 %s，即将重启...", target->label);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+
+    return ESP_OK;
 }

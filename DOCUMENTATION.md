@@ -520,7 +520,7 @@ water-purifier/set/flush           # 冲洗控制
 **主要功能**:
 - 首页（只读监控，30秒自动刷新）
 - 管理页（配置控制）
-- 日志页（实时串口日志，SSE推送）
+- 日志页（实时串口日志，SSE推送，SNTP同步后显示真实时间戳）
 - RESTful API接口
 
 **API接口**:
@@ -539,8 +539,11 @@ water-purifier/set/flush           # 冲洗控制
 | `/api/filter/capacity` | POST | 设置滤芯容量（批量） |
 | `/api/tds/calibrate` | POST | TDS传感器校准 |
 | `/api/mqtt/config` | GET/POST | MQTT配置 |
+| `/ota` | GET | OTA固件升级页面（独立页面） |
 | `/api/ota/status` | GET | OTA升级状态 |
 | `/api/ota/update` | POST | 上传固件OTA升级 |
+| `/api/ota/factory` | POST | 恢复出厂固件（切换到factory分区并重启） |
+| `/api/ota/rollback` | POST | 回滚到上一OTA固件（ota_0↔ota_1切换） |
 | `/logs` | GET | 实时串口日志页面 |
 | `/api/logs/debug` | GET | 日志缓冲区内容（HTML格式） |
 | `/api/logs` | GET | 日志缓冲区内容（JSON数组） |
@@ -577,6 +580,7 @@ water-purifier/set/flush           # 冲洗控制
 |------|------|------|
 | 首页 | `/` | 只读监控，30秒自动刷新 |
 | 管理页 | `/admin` | 配置控制 |
+| OTA页 | `/ota` | 固件升级、恢复出厂、回滚上一版本 |
 | 日志页 | `/logs` | 实时串口日志（SSE流式推送） |
 
 **首页功能**:
@@ -598,7 +602,7 @@ water-purifier/set/flush           # 冲洗控制
 | TDS校准 | 进水/出水TDS传感器一点校准 |
 | WiFi配置 | 扫描网络、保存配置 |
 | MQTT配置 | Broker地址、用户名、密码 |
-| OTA升级 | 固件上传、进度显示 |
+| OTA升级 | 固件上传、进度显示、恢复出厂固件、回滚上一版本 |
 | 日志查看 | 实时串口日志，远程监控设备状态 |
 
 **访问方式**: `http://<设备IP>` 或 `http://waterpurifier.local`（mDNS）
@@ -663,7 +667,7 @@ typedef struct {
 
 ### 10. OTA升级 (ota_update.c/h)
 
-**职责**: 固件升级、版本检测、回滚保护
+**职责**: 固件升级、版本检测、回滚保护、分区切换
 
 **工作流程**:
 1. `ota_update_begin()`: 获取OTA分区，初始化写入句柄
@@ -675,7 +679,11 @@ typedef struct {
 
 **边界保护**: `init_buf[512]` 积累固件头部数据，解析ESP镜像头前检查大小有效性，防止异常输入导致缓冲区溢出。
 
-**回滚保护**: OTA成功后调用 `esp_ota_mark_app_valid_cancel_rollback()`，取消回滚倒计时。
+**回滚保护**: OTA成功后调用 `esp_ota_mark_app_valid_cancel_rollback()`，取消回滚倒计时。启动时自动确认待验证固件有效。
+
+**分区切换功能**:
+- `ota_update_revert_to_factory()`: 恢复到factory出厂分区
+- `ota_update_rollback()`: 回滚到上一OTA固件（ota_0↔ota_1），自动检测目标分区有效性
 
 **主要函数**:
 ```c
@@ -687,6 +695,8 @@ void ota_update_abort(void);
 ota_state_t ota_update_get_state(void);
 uint32_t ota_update_get_bytes_written(void);
 const char *ota_update_get_running_version(void);
+esp_err_t ota_update_revert_to_factory(void);
+esp_err_t ota_update_rollback(void);
 ```
 
 ---
@@ -818,6 +828,22 @@ POST /api/mqtt/config
 {"enabled": true, "broker": "mqtt://homeassistant.local:1883", "user": "", "password": "", "prefix": "water-purifier"}
 ```
 
+### OTA分区切换
+
+```http
+POST /api/ota/factory
+# 恢复出厂固件（切换到factory分区）
+
+POST /api/ota/rollback
+# 回滚到上一OTA固件（ota_0↔ota_1）
+```
+
+**响应**:
+```json
+{"status": "success", "message": "已设置启动分区为factory，设备将重启"}
+{"status": "error", "message": "目标分区无有效固件"}
+```
+
 ---
 
 ## 配置存储
@@ -947,6 +973,8 @@ POST /api/mqtt/config
 | 1.2.0 | 2026-04 | ESP-IDF v6.0.0适配，ADC驱动重构，WiFi/MQTT API更新 |
 | 1.2.1 | 2026-05 | 滤芯水量精确计量（制水/冲洗分离），总用水量+制水量双显示，Web日志页，WiFi重连稳定性 |
 | 1.2.2 | 2026-05-17 | **代码审查修复**：TDS温度补偿方向修正、水锤控制竞态修复、线程安全增强（config/GPIO/MQTT）、NVS错误处理完善、OTA回滚时序修正、总制水量NVS持久化补全 |
+| 1.2.3 | 2026-05-19 | Web日志页增强：SNTP时间戳、DEBUG日志启用、级别过滤、空行跳过、自动滚动修复；OTA状态页增强：回滚状态检测、是否可升级提示、禁用按钮、错误提示；Flash保存周期新增4小时选项；日志噪声优化 |
+| 1.2.4 | 2026-05-19 | OTA分区切换功能：恢复出厂固件按钮、回滚到上一OTA固件按钮、API接口 `/api/ota/factory` 和 `/api/ota/rollback` |
 
 ---
 

@@ -599,7 +599,7 @@ static void wifi_reconnect_task(void *arg)
 
     while (retry < max_retries) {
         TickType_t delay = delays[(retry < delay_count) ? retry : delay_count - 1];
-        ESP_LOGI(TAG, "尝试重连 %d/%d，等待 %lums...", retry + 1, max_retries, pdTICKS_TO_MS(delay));
+        ESP_LOGD(TAG, "尝试重连 %d/%d，等待 %lums...", retry + 1, max_retries, pdTICKS_TO_MS(delay));
         esp_task_wdt_reset();
         vTaskDelay(delay);
 
@@ -664,7 +664,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
     if (base == WIFI_EVENT) {
         switch (id) {
             case WIFI_EVENT_STA_START:
-                ESP_LOGI(TAG, "STA启动");
+                ESP_LOGD(TAG, "STA启动");
                 if (strlen(ctx.ssid) > 0) {
                     set_state(WIFI_STATE_CONNECTING);
                     esp_wifi_connect();
@@ -672,7 +672,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
                 break;
 
             case WIFI_EVENT_STA_CONNECTED:
-                ESP_LOGI(TAG, "已连接到AP");
+                ESP_LOGD(TAG, "已连接到AP");
                 break;
 
             case WIFI_EVENT_STA_DISCONNECTED: {
@@ -690,11 +690,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
             }
 
             case WIFI_EVENT_AP_START:
-                ESP_LOGI(TAG, "AP已启动");
+                ESP_LOGD(TAG, "AP已启动");
                 break;
 
             case WIFI_EVENT_AP_STACONNECTED:
-                ESP_LOGI(TAG, "有设备连接到AP");
+                ESP_LOGD(TAG, "有设备连接到AP");
                 break;
 
             default:

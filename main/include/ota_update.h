@@ -75,6 +75,20 @@ uint32_t ota_update_get_bytes_written(void);
  */
 const char *ota_update_get_running_version(void);
 
+/**
+ * @brief 恢复到factory出厂分区
+ * @note 设置启动分区为factory并重启
+ * @return ESP_OK 成功，ESP_ERR_NOT_FOUND factory分区不存在
+ */
+esp_err_t ota_update_revert_to_factory(void);
+
+/**
+ * @brief 回滚到上一个OTA固件
+ * @note 从ota_0切换到ota_1或反之，检查目标分区固件有效性
+ * @return ESP_OK 成功，ESP_ERR_NOT_FOUND 无可回滚分区，ESP_ERR_INVALID_STATE 目标分区无效
+ */
+esp_err_t ota_update_rollback(void);
+
 #ifdef __cplusplus
 }
 #endif

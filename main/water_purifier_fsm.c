@@ -261,7 +261,7 @@ static void stop_all_outputs(void)
  */
 static void start_production_with_delay(void)
 {
-    ESP_LOGI(TAG, "启动制水（开进水阀，延时%lu ms后开泵）",
+    ESP_LOGD(TAG, "启动制水（开进水阀，延时%lu ms后开泵）",
              fsm_ctx.water_hammer_valve_open_delay_ms);
 
     gpio_driver_set_inlet_valve(true);
@@ -280,7 +280,7 @@ static void start_production_with_delay(void)
  */
 static void transition_to_pure_flush(void)
 {
-    ESP_LOGI(TAG, "常规冲洗→纯水洗膜过渡（停泵，延时%lu ms→关进水阀，延时%lu ms→开回水阀）",
+    ESP_LOGD(TAG, "常规冲洗→纯水洗膜过渡（停泵，延时%lu ms→关进水阀，延时%lu ms→开回水阀）",
              fsm_ctx.water_hammer_pump_stop_delay_ms,
              fsm_ctx.water_hammer_valve_close_delay_ms);
 
@@ -301,7 +301,7 @@ static void transition_to_pure_flush(void)
     transition_to(FSM_STATE_PURE_FLUSH);
     fsm_ctx.current_phase = FLUSH_PHASE_STOP_PUMP;
     fsm_ctx.phase_start_time = esp_timer_get_time();
-    ESP_LOGI(TAG, "已进入纯水洗膜状态，水锤过渡阶段：停泵延时");
+    ESP_LOGD(TAG, "已进入纯水洗膜状态，水锤过渡阶段：停泵延时");
 }
 
 // ==================== 状态名称 ====================
@@ -487,7 +487,7 @@ static void execute_standby(void)
         if (pre_liters > 0.1f || post_liters > 0.1f) {
             filter_mgr_update_water_usage_dual(pre_liters, post_liters);
             history_update_daily_production((uint32_t)duration);
-            ESP_LOGI(TAG, "本次制水: %.1f 升(RO), 前三级过水: %.1f 升", post_liters, pre_liters);
+            ESP_LOGD(TAG, "水量更新: %.1f 升(RO), 前三级 %.1f 升", post_liters, pre_liters);
         }
 
         fsm_ctx.runtime_dirty = true;
@@ -505,7 +505,7 @@ static void execute_production(void)
     if (fsm_ctx.current_phase == FLUSH_PHASE_VALVE_DELAY) {
         uint64_t elapsed_ms = get_elapsed_ms(fsm_ctx.phase_start_time);
         if (elapsed_ms >= fsm_ctx.water_hammer_valve_open_delay_ms) {
-            ESP_LOGI(TAG, "开增压泵（水锤延时完成）");
+            ESP_LOGD(TAG, "开增压泵（水锤延时完成）");
             gpio_driver_set_boost_pump(true);
             fsm_ctx.production_start_time = esp_timer_get_time();  // 泵实际开启时开始计时
             fsm_ctx.current_phase = FLUSH_PHASE_RUNNING;
@@ -572,7 +572,7 @@ static void execute_normal_flush(void)
 {
     if (fsm_ctx.current_phase == FLUSH_PHASE_NONE) {
         // 水锤控制：先开进水阀，延时后再开废水阀+增压泵
-        ESP_LOGI(TAG, "常规冲洗：开进水阀，延时%lu ms后开废水阀+增压泵",
+        ESP_LOGD(TAG, "常规冲洗：开进水阀，延时%lu ms后开废水阀+增压泵",
                  fsm_ctx.water_hammer_valve_open_delay_ms);
         gpio_driver_set_inlet_valve(true);
         gpio_driver_set_waste_valve(false);
@@ -589,7 +589,7 @@ static void execute_normal_flush(void)
     if (fsm_ctx.current_phase == FLUSH_PHASE_VALVE_DELAY) {
         uint64_t elapsed_ms = get_elapsed_ms(fsm_ctx.phase_start_time);
         if (elapsed_ms >= fsm_ctx.water_hammer_valve_open_delay_ms) {
-            ESP_LOGI(TAG, "开废水阀+增压泵（水锤延时完成）");
+            ESP_LOGD(TAG, "开废水阀+增压泵（水锤延时完成）");
             gpio_driver_set_waste_valve(true);
             gpio_driver_set_boost_pump(true);
             fsm_ctx.flush_start_time = esp_timer_get_time();
@@ -690,7 +690,7 @@ static void execute_pure_flush(void)
             gpio_driver_set_inlet_valve(false);
             fsm_ctx.current_phase = FLUSH_PHASE_CLOSE_VALVE;
             fsm_ctx.phase_start_time = esp_timer_get_time();
-            ESP_LOGI(TAG, "关进水阀，延时%lu ms后开回水阀",
+            ESP_LOGD(TAG, "关进水阀，延时%lu ms后开回水阀",
                      fsm_ctx.water_hammer_valve_close_delay_ms);
         }
         return;
@@ -704,7 +704,7 @@ static void execute_pure_flush(void)
             gpio_driver_set_waste_valve(true);
             fsm_ctx.flush_start_time = esp_timer_get_time();
             fsm_ctx.current_phase = FLUSH_PHASE_RUNNING;
-            ESP_LOGI(TAG, "纯水洗膜开始（开回水阀+废水阀）");
+            ESP_LOGD(TAG, "纯水洗膜开始（开回水阀+废水阀）");
         }
         return;
     }

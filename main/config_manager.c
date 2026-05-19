@@ -226,7 +226,7 @@ esp_err_t config_manager_load(void)
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
 
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "NVS中无配置，使用默认值");
+        ESP_LOGD(TAG, "NVS中无配置，使用默认值");
         return ESP_OK;
     }
 

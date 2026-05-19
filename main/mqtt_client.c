@@ -983,7 +983,7 @@ static void mqtt_reconnect_task(void *pvParameters)
                 continue;
             }
         } else {
-            ESP_LOGI(TAG, "尝试MQTT重连 %d/%d", retry + 1, max_retries);
+            ESP_LOGD(TAG, "尝试MQTT重连 %d/%d", retry + 1, max_retries);
             esp_err_t ret = esp_mqtt_client_start(mqtt_ctx.mqtt_client);
             if (ret == ESP_OK) {
                 /* 等待连接成功或超时，最多等待5秒 */

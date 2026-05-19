@@ -159,6 +159,20 @@ static void monitor_task(void *arg)
 
 void app_main(void)
 {
+    // 启用所有模块DEBUG日志输出（Web日志页面可按级别过滤显示）
+    esp_log_level_set("CONFIG", ESP_LOG_DEBUG);
+    esp_log_level_set("GPIO_DRIVER", ESP_LOG_DEBUG);
+    esp_log_level_set("TDS", ESP_LOG_DEBUG);
+    esp_log_level_set("FILTER_MGR", ESP_LOG_DEBUG);
+    esp_log_level_set("FSM", ESP_LOG_DEBUG);
+    esp_log_level_set("HISTORY", ESP_LOG_DEBUG);
+    esp_log_level_set("WIFI", ESP_LOG_DEBUG);
+    esp_log_level_set("WEB", ESP_LOG_DEBUG);
+    esp_log_level_set("APP_MQTT", ESP_LOG_DEBUG);
+    esp_log_level_set("OTA", ESP_LOG_DEBUG);
+    esp_log_level_set("PM", ESP_LOG_DEBUG);
+    esp_log_level_set("MAIN", ESP_LOG_DEBUG);
+
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  净水器主控板程序启动");
