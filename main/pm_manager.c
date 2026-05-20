@@ -13,6 +13,13 @@
 #include "freertos/task.h"
 #include "config_manager.h"
 
+// ESP32-C3不支持DFS动态频率调节和PM锁，使用宏检测
+#ifdef CONFIG_IDF_TARGET_ESP32C3
+#define PM_DFS_SUPPORTED 0
+#else
+#define PM_DFS_SUPPORTED 1
+#endif
+
 static const char *TAG = "PM";
 
 // ==================== 状态 ====================
@@ -38,43 +45,57 @@ esp_err_t pm_manager_init(void)
 
     ESP_LOGI(TAG, "初始化电源管理...");
 
+#if PM_DFS_SUPPORTED
     // 启用DFS（动态频率调节），最小80MHz，最大160MHz
-    // ESP32-C3不支持light sleep，必须设置为false
     esp_pm_config_t pm_cfg = {
         .max_freq_mhz = 160,
         .min_freq_mhz = 80,
-        .light_sleep_enable = false,  // ESP32-C3不支持light sleep
+        .light_sleep_enable = false,
     };
     esp_err_t ret = esp_pm_configure(&pm_cfg);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "电源管理配置失败: %s", esp_err_to_name(ret));
-        // 不返回错误，继续初始化其他部分（电源管理可选）
     }
 
     // 创建CPU频率锁（用于强制保持160MHz）
-    // ESP32-C3使用ESP_PM_APB_FREQ_MAX锁保持高频
     esp_pm_lock_handle_t lock_handle = NULL;
     ret = esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "cpu_freq", &lock_handle);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "CPU频率锁创建失败: %s", esp_err_to_name(ret));
-        // 继续初始化，频率锁可选
     }
+#else
+    // ESP32-C3不支持DFS，跳过配置
+    ESP_LOGI(TAG, "ESP32-C3不支持DFS动态频率调节");
+#endif
 
     taskENTER_CRITICAL(&pm_spinlock);
+#if PM_DFS_SUPPORTED
     s_ctx.cpu_freq_lock = lock_handle;
-    s_ctx.cpu_lock_acquired = false;  // 初始不持有锁，让DFS自动管理
-    // WiFi TX功率初始为20dBm（表中最高档位，避免首次调整匹配失败）
-    s_ctx.current_wifi_tx_power = 80;  // 20dBm = 80 * 0.25dBm
+#else
+    s_ctx.cpu_freq_lock = NULL;  // ESP32-C3不支持PM锁
+#endif
+    s_ctx.cpu_lock_acquired = false;
+    s_ctx.current_wifi_tx_power = 80;  // 20dBm
     s_ctx.wifi_tx_adjusted = false;
     s_ctx.initialized = true;
     taskEXIT_CRITICAL(&pm_spinlock);
 
+#if PM_DFS_SUPPORTED
     ESP_LOGI(TAG, "电源管理已启用: DFS 80MHz~160MHz, WiFi TX初始20dBm");
+#else
+    ESP_LOGI(TAG, "电源管理已启用: WiFi TX初始20dBm (DFS不支持)");
+#endif
     return ESP_OK;
 }
 
 esp_err_t pm_manager_set_cpu_mode(bool low_power)
 {
+#if !PM_DFS_SUPPORTED
+    // ESP32-C3不支持DFS，直接返回成功
+    (void)low_power;
+    return ESP_OK;
+#endif
+
     taskENTER_CRITICAL(&pm_spinlock);
     if (!s_ctx.initialized || s_ctx.cpu_freq_lock == NULL) {
         taskEXIT_CRITICAL(&pm_spinlock);

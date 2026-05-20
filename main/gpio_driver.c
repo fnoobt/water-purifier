@@ -106,7 +106,6 @@ esp_err_t gpio_driver_init_inputs(void)
     if (ret != ESP_OK) return ret;
     gpio_set_pull_mode(GPIO_WATER_LEAK_SENSOR, GPIO_PULLUP_ONLY);
 
-    ESP_LOGI(TAG, "输入GPIO初始化完成");
     return ESP_OK;
 }
 
@@ -149,7 +148,7 @@ esp_err_t gpio_driver_init_outputs(void)
     if (ret != ESP_OK) return ret;
     gpio_set_level(GPIO_BOOST_PUMP, inactive_level);
 
-    ESP_LOGI(TAG, "输出GPIO初始化完成 (触发电平: %s)",
+    ESP_LOGD(TAG, "输出GPIO初始化完成 (触发电平: %s)",
              output_state.relay_trigger_level ? "高电平" : "低电平");
 
     // 创建输出状态互斥锁
@@ -185,7 +184,6 @@ esp_err_t gpio_driver_init_leds(void)
     if (ret != ESP_OK) return ret;
     gpio_set_level(GPIO_LED_STATUS_2, 0);
 
-    ESP_LOGI(TAG, "LED初始化完成");
     return ESP_OK;
 }
 
@@ -193,8 +191,6 @@ esp_err_t gpio_driver_init_leds(void)
 
 esp_err_t gpio_driver_deinit(void)
 {
-    ESP_LOGI(TAG, "反初始化GPIO驱动...");
-
     // 释放输出状态互斥锁
     if (output_mutex) {
         vSemaphoreDelete(output_mutex);
@@ -208,7 +204,6 @@ esp_err_t gpio_driver_deinit(void)
     memset(&output_state, 0, sizeof(output_state));
     output_state.relay_trigger_level = RELAY_TRIGGER_LEVEL_DEFAULT;
 
-    ESP_LOGI(TAG, "GPIO驱动已反初始化");
     return ESP_OK;
 }
 

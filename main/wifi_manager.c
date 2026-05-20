@@ -34,6 +34,9 @@ static bool s_mdns_initialized = false;
 // SNTP是否已初始化标志
 static bool s_sntp_initialized = false;
 
+// 系统启动时的墙钟时间（Unix timestamp，在NTP首次同步后计算）
+static time_t s_boot_wall_clock_time = 0;
+
 // ==================== 事件位定义 ====================
 
 #define WIFI_CONNECTED_BIT    BIT0
@@ -64,8 +67,11 @@ static struct {
 
     wifi_state_callback_t callback;
 
-    // 重连任务句柄
+    // 重连任务句柄和追踪
     TaskHandle_t reconnect_task_handle;
+    uint32_t reconnect_sequence;      // 每次断开事件递增的序列号
+    uint32_t active_reconnect_seq;    // 当前活跃任务的序列号
+    volatile bool reconnect_active;   // 重连任务是否正在运行
 
     // 状态访问互斥锁（保护state、is_ap_mode等字段）
     SemaphoreHandle_t state_mutex;
@@ -133,15 +139,50 @@ static void init_sntp(void)
 
     ESP_LOGI(TAG, "启动SNTP时间同步...");
 
+    // 设置时区（中国标准时间 UTC+8）
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
     // 配置NTP服务器
     sntp_setoperatingmode(SNTP_OPMODE_POLL);
     sntp_setservername(0, "ntp.aliyun.com");
     sntp_init();
     s_sntp_initialized = true;
+}
 
-    // 设置时区（中国标准时间 UTC+8）
-    setenv("TZ", "CST-8", 1);
-    tzset();
+/**
+ * @brief 更新启动墙钟时间（在NTP同步后调用）
+ * @note 检查NTP是否已同步，若已同步则计算启动时的墙钟时间
+ */
+void wifi_manager_update_boot_wall_clock_time(void)
+{
+    if (s_boot_wall_clock_time > 0) {
+        return;  // 已经计算过
+    }
+
+    // 检查时间是否有效（年份大于2020）
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+
+    if (tm_now.tm_year + 1900 > 2020) {
+        // 时间已同步，计算启动墙钟时间
+        uint64_t elapsed_us = esp_timer_get_time();
+        s_boot_wall_clock_time = now - (elapsed_us / 1000000ULL);
+        ESP_LOGI(TAG, "NTP时间已同步！启动墙钟时间: %ld (当前: %ld, 运行: %llu秒)",
+                 (long)s_boot_wall_clock_time, (long)now, elapsed_us / 1000000ULL);
+    }
+}
+
+/**
+ * @brief 获取系统启动时的墙钟时间（用于日志时间戳转换）
+ * @return 启动时的Unix timestamp，0表示尚未同步
+ */
+time_t wifi_manager_get_boot_wall_clock_time(void)
+{
+    // 每次调用时尝试更新（如果尚未同步）
+    wifi_manager_update_boot_wall_clock_time();
+    return s_boot_wall_clock_time;
 }
 
 // ==================== 初始化 ====================
@@ -189,7 +230,6 @@ esp_err_t wifi_manager_init(void)
     esp_wifi_set_mode(WIFI_MODE_STA);
 
     ctx.initialized = true;
-    ESP_LOGI(TAG, "WiFi管理器初始化完成");
     return ESP_OK;
 }
 
@@ -232,7 +272,6 @@ esp_err_t wifi_manager_deinit(void)
     }
 
     ctx.initialized = false;
-    ESP_LOGI(TAG, "WiFi管理器已反初始化");
     return ESP_OK;
 }
 
@@ -426,9 +465,15 @@ int8_t wifi_manager_get_rssi(void)
     return 0;
 }
 
+/**
+ * @brief 获取当前WiFi SSID
+ * @return SSID字符串指针
+ * @warning 返回值指向静态缓冲区，多线程调用会互相覆盖。调用者应立即复制结果，不要长期持有指针。
+ */
 const char* wifi_manager_get_ssid(void)
 {
     // 使用静态缓冲区返回SSID（避免返回可能被修改的内部缓冲区指针）
+    // 注意：多线程环境下不安全，调用者应立即复制结果
     static char ssid_copy[33] = {0};
     if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         strncpy(ssid_copy, ctx.ssid, sizeof(ssid_copy) - 1);
@@ -576,10 +621,13 @@ static void set_state(wifi_state_t state)
  *
  * 策略：指数退避重连，初始1s，最大30s，总计约5分钟
  * 失败后进入AP模式并退出任务，下次断开时自动重建重连任务
+ *
+ * @param arg 重连序列号（用于检测是否仍是活跃任务）
  */
 
 static void wifi_reconnect_task(void *arg)
 {
+    uint32_t my_seq = (uint32_t)arg;  // 本任务的序列号
     int retry = 0;
     const int max_retries = 20;
     const TickType_t delays[] = {
@@ -592,7 +640,7 @@ static void wifi_reconnect_task(void *arg)
     };
     const int delay_count = sizeof(delays) / sizeof(delays[0]);
 
-    ESP_LOGI(TAG, "重连任务启动（最多%d次，约5分钟）", max_retries);
+    ESP_LOGI(TAG, "WiFi重连任务启动 seq=%lu", my_seq);
 
     // 注册看门狗
     esp_task_wdt_add(NULL);
@@ -603,10 +651,19 @@ static void wifi_reconnect_task(void *arg)
         esp_task_wdt_reset();
         vTaskDelay(delay);
 
-        // 检查是否已经连接成功（可能被事件处理器抢先连接）
-        if (ctx.state == WIFI_STATE_CONNECTED) {
-            ESP_LOGI(TAG, "重连期间已恢复连接，取消重连任务");
-            break;
+        // 使用mutex保护的状态检查
+        bool is_connected = false;
+        bool still_active = false;
+        if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            is_connected = (ctx.state == WIFI_STATE_CONNECTED);
+            still_active = (ctx.active_reconnect_seq == my_seq);
+            xSemaphoreGive(ctx.state_mutex);
+        }
+
+        // 如果已连接或不再是活跃任务，退出
+        if (is_connected || !still_active) {
+            ESP_LOGD(TAG, "重连任务退出 seq=%lu (connected=%d, active=%d)", my_seq, is_connected, still_active);
+            goto exit_task;
         }
 
         esp_err_t ret = esp_wifi_connect();
@@ -619,43 +676,53 @@ static void wifi_reconnect_task(void *arg)
         for (int i = 0; i < 10; i++) {
             esp_task_wdt_reset();
             vTaskDelay(pdMS_TO_TICKS(1000));
-            if (ctx.state == WIFI_STATE_CONNECTED) {
-                ESP_LOGI(TAG, "重连成功");
+
+            // mutex保护的状态检查
+            if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                is_connected = (ctx.state == WIFI_STATE_CONNECTED);
+                still_active = (ctx.active_reconnect_seq == my_seq);
+                xSemaphoreGive(ctx.state_mutex);
+            }
+
+            if (is_connected || !still_active) {
+                ESP_LOGD(TAG, "重连任务退出 seq=%lu (connected=%d, active=%d)", my_seq, is_connected, still_active);
                 goto exit_task;
             }
         }
     }
 
-    // 约5分钟后重连失败，进入AP模式并退出任务
-    ESP_LOGW(TAG, "重连失败%d次（约5分钟），进入AP模式", retry);
-    set_state(WIFI_STATE_DISCONNECTED);
-    wifi_manager_start_ap_mode();
-    ESP_LOGI(TAG, "重连任务退出，等待WiFi再次断开时自动重建重连任务");
+    // 在进入AP模式前，再次确认仍是活跃任务且未连接
+    bool is_connected = false;
+    bool still_active = false;
+
+    if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        is_connected = (ctx.state == WIFI_STATE_CONNECTED);
+        still_active = (ctx.active_reconnect_seq == my_seq);
+        xSemaphoreGive(ctx.state_mutex);
+    }
+
+    if (still_active && !is_connected) {
+        ESP_LOGW(TAG, "WiFi重连失败%d次，进入AP模式", retry);
+        set_state(WIFI_STATE_DISCONNECTED);
+        wifi_manager_start_ap_mode();
+    }
 
 exit_task:
+    // 清除活跃标志（使用mutex保护）
+    if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // 只有当前序列号仍匹配时才清除标志
+        if (ctx.active_reconnect_seq == my_seq) {
+            ctx.reconnect_active = false;
+            ctx.reconnect_task_handle = NULL;
+        }
+        xSemaphoreGive(ctx.state_mutex);
+    }
+
     esp_task_wdt_delete(NULL);
-    ctx.reconnect_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
 // ==================== 调试 ====================
-
-esp_err_t wifi_manager_get_status_string(char *buffer, size_t buffer_size)
-{
-    if (!buffer) return ESP_ERR_INVALID_ARG;
-
-    char ip[16] = "未连接";
-    wifi_manager_get_ip(ip, sizeof(ip));
-
-    snprintf(buffer, buffer_size,
-             "状态: %s\nSSID: %s\nIP: %s\nRSSI: %d dBm",
-             state_names[ctx.state],
-             ctx.ssid,
-             ip,
-             wifi_manager_get_rssi());
-    return ESP_OK;
-}
-
 
 // ==================== 事件处理 ====================
 
@@ -678,12 +745,48 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
             case WIFI_EVENT_STA_DISCONNECTED: {
                 wifi_event_sta_disconnected_t* disconn = (wifi_event_sta_disconnected_t*)data;
                 ESP_LOGW(TAG, "连接断开 (原因码: %d)", disconn->reason);
-                // 如果已有重连任务在运行，不重复创建
-                if (ctx.reconnect_task_handle == NULL) {
+
+                // 使用mutex保护重连任务创建，避免竞态条件
+                if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    // 递增序列号，用于追踪每次断开事件
+                    ctx.reconnect_sequence++;
+
+                    // 如果没有活跃的重连任务，创建新任务
+                    if (!ctx.reconnect_active) {
+                        ctx.reconnect_active = true;
+                        ctx.active_reconnect_seq = ctx.reconnect_sequence;
+                        xSemaphoreGive(ctx.state_mutex);
+
+                        set_state(WIFI_STATE_RECONNECTING);
+                        // 将序列号作为任务参数传递
+                        BaseType_t ret = xTaskCreate(wifi_reconnect_task, "wifi_reconnect",
+                                                     4096, (void*)ctx.active_reconnect_seq, 5,
+                                                     &ctx.reconnect_task_handle);
+                        if (ret != pdPASS) {
+                            ESP_LOGE(TAG, "创建重连任务失败");
+                            // 创建失败时重置标志
+                            if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                                ctx.reconnect_active = false;
+                                xSemaphoreGive(ctx.state_mutex);
+                            }
+                        }
+                    } else {
+                        // 任务已运行 - 更新活跃序列号，让旧任务继续处理新的断开事件
+                        ctx.active_reconnect_seq = ctx.reconnect_sequence;
+                        ESP_LOGI(TAG, "重连任务已运行，更新序列号=%lu", ctx.reconnect_sequence);
+                        xSemaphoreGive(ctx.state_mutex);
+                    }
+                } else {
+                    // mutex获取失败时的降级处理（不应发生，但做防御性编程）
+                    ESP_LOGW(TAG, "无法获取mutex，降级创建重连任务");
                     set_state(WIFI_STATE_RECONNECTING);
-                    BaseType_t ret = xTaskCreate(wifi_reconnect_task, "wifi_reconnect", 3072, NULL, 5, &ctx.reconnect_task_handle);
-                    if (ret != pdPASS) {
-                        ESP_LOGE(TAG, "创建重连任务失败");
+                    if (!ctx.reconnect_active) {
+                        ctx.reconnect_active = true;
+                        ctx.reconnect_sequence++;
+                        ctx.active_reconnect_seq = ctx.reconnect_sequence;
+                        xTaskCreate(wifi_reconnect_task, "wifi_reconnect",
+                                   4096, (void*)ctx.active_reconnect_seq, 5,
+                                   &ctx.reconnect_task_handle);
                     }
                 }
                 break;
@@ -708,6 +811,13 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
             set_state(WIFI_STATE_CONNECTED);
             xEventGroupSetBits(ctx.event_group, WIFI_CONNECTED_BIT);
             // WiFi配置仅在用户设置时保存，不在每次重连后重复保存（减少NVS磨损）
+
+            // 清除重连活跃标志（连接成功，重连任务将检测到并退出）
+            if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                ctx.reconnect_active = false;
+                ctx.reconnect_task_handle = NULL;
+                xSemaphoreGive(ctx.state_mutex);
+            }
 
             // 初始化mDNS，支持域名访问
             init_mdns();

@@ -484,7 +484,6 @@ esp_err_t filter_mgr_init(void)
 
     LOCK_GIVE();
 
-    ESP_LOGI(TAG, "滤芯管理模块初始化完成");
     return ESP_OK;
 }
 
@@ -508,34 +507,10 @@ esp_err_t filter_mgr_deinit(void)
     }
 
     fctx.initialized = false;
-    ESP_LOGI(TAG, "滤芯管理模块已反初始化");
     return ESP_OK;
 }
 
 // ==================== 用水量统计 ====================
-
-esp_err_t filter_mgr_set_filter_capacity(uint32_t total_liters)
-{
-    LOCK_GET(100);
-
-    ESP_LOGW(TAG, "filter_mgr_set_filter_capacity已废弃，请使用filter_mgr_set_all_filter_capacity");
-    fctx.filter_total_liters = total_liters;
-    fctx.filters[FILTER_RO_MEMBRANE].total_liters = total_liters;
-    if (total_liters > 0) {
-        float remaining = 1.0f - (float)fctx.filters[FILTER_RO_MEMBRANE].used_liters / total_liters;
-        if (remaining < 0) remaining = 0;
-        if (remaining > 1) remaining = 1;
-        fctx.filters[FILTER_RO_MEMBRANE].percentage = (uint8_t)(remaining * 100);
-        fctx.filters[FILTER_RO_MEMBRANE].effective_percentage =
-            (fctx.filters[FILTER_RO_MEMBRANE].percentage < fctx.filters[FILTER_RO_MEMBRANE].time_percentage) ?
-            fctx.filters[FILTER_RO_MEMBRANE].percentage : fctx.filters[FILTER_RO_MEMBRANE].time_percentage;
-    }
-    fctx.save_needed = true;
-
-    LOCK_GIVE();
-    ESP_LOGI(TAG, "RO膜兼容容量设置: %lu 升", total_liters);
-    return ESP_OK;
-}
 
 esp_err_t filter_mgr_update_water_usage(float liters)
 {
@@ -662,39 +637,6 @@ void filter_mgr_set_total_production_water(uint32_t liters)
     LOCK_GIVE();
 }
 
-// ==================== 滤芯寿命管理 ====================
-
-esp_err_t filter_mgr_get_filter_life(filter_life_t *life)
-{
-    if (!life) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    LOCK_GET(100);
-
-    update_filter_time_percentage_locked();
-
-    life->used_liters = fctx.filter_used_liters;
-    life->total_liters = fctx.filter_total_liters;
-    life->install_time = fctx.filter_install_time;
-
-    if (fctx.filter_total_liters > 0) {
-        life->percentage = fctx.filters[FILTER_RO_MEMBRANE].effective_percentage;
-    } else {
-        life->percentage = 100;
-    }
-
-    life->replacement_needed = (life->percentage < 10);
-
-    LOCK_GIVE();
-    return ESP_OK;
-}
-
-esp_err_t filter_mgr_reset_filter_life(void)
-{
-    return filter_mgr_reset_filter(FILTER_RO_MEMBRANE);
-}
-
 esp_err_t filter_mgr_get_filters_status(filters_status_t *status)
 {
     if (!status) {
@@ -709,21 +651,6 @@ esp_err_t filter_mgr_get_filters_status(filters_status_t *status)
     memcpy(status->filters, fctx.filters, sizeof(fctx.filters));
     status->total_water_used = fctx.total_water_used;
     status->any_filter_needs_replacement = filter_mgr_any_filter_needs_replacement();
-
-    LOCK_GIVE();
-    return ESP_OK;
-}
-
-esp_err_t filter_mgr_get_filter_info(filter_type_t filter_type, filter_info_t *info)
-{
-    if (filter_type >= FILTER_COUNT || !info) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    LOCK_GET(50);
-
-    update_filter_time_percentage_locked();
-    memcpy(info, &fctx.filters[filter_type], sizeof(filter_info_t));
 
     LOCK_GIVE();
     return ESP_OK;
@@ -863,39 +790,6 @@ esp_err_t filter_mgr_set_all_filter_times(const uint32_t time_hours[FILTER_COUNT
     LOCK_GIVE();
 
     ESP_LOGI(TAG, "所有滤芯时间寿命已批量更新");
-    return ret;
-}
-
-esp_err_t filter_mgr_set_filter_capacity_ex(filter_type_t filter_type, uint32_t total_liters)
-{
-    if (filter_type >= FILTER_COUNT) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    LOCK_GET(100);
-
-    fctx.filters[filter_type].total_liters = total_liters;
-    if (total_liters > 0) {
-        float remaining = 1.0f - (float)fctx.filters[filter_type].used_liters / total_liters;
-        if (remaining < 0) remaining = 0;
-        if (remaining > 1) remaining = 1;
-        fctx.filters[filter_type].percentage = (uint8_t)(remaining * 100);
-    }
-    fctx.filters[filter_type].effective_percentage =
-        (fctx.filters[filter_type].percentage < fctx.filters[filter_type].time_percentage) ?
-        fctx.filters[filter_type].percentage : fctx.filters[filter_type].time_percentage;
-    fctx.filters[filter_type].replacement_needed = (fctx.filters[filter_type].effective_percentage < 10);
-
-    if (filter_type == FILTER_RO_MEMBRANE) {
-        fctx.filter_total_liters = total_liters;
-    }
-
-    fctx.save_needed = true;
-    esp_err_t ret = save_to_nvs_locked();
-
-    LOCK_GIVE();
-
-    ESP_LOGI(TAG, "%s滤芯容量设置为 %lu 升", filter_names[filter_type], total_liters);
     return ret;
 }
 

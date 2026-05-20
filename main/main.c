@@ -159,19 +159,20 @@ static void monitor_task(void *arg)
 
 void app_main(void)
 {
-    // 启用所有模块DEBUG日志输出（Web日志页面可按级别过滤显示）
-    esp_log_level_set("CONFIG", ESP_LOG_DEBUG);
-    esp_log_level_set("GPIO_DRIVER", ESP_LOG_DEBUG);
-    esp_log_level_set("TDS", ESP_LOG_DEBUG);
-    esp_log_level_set("FILTER_MGR", ESP_LOG_DEBUG);
-    esp_log_level_set("FSM", ESP_LOG_DEBUG);
-    esp_log_level_set("HISTORY", ESP_LOG_DEBUG);
-    esp_log_level_set("WIFI", ESP_LOG_DEBUG);
-    esp_log_level_set("WEB", ESP_LOG_DEBUG);
-    esp_log_level_set("APP_MQTT", ESP_LOG_DEBUG);
-    esp_log_level_set("OTA", ESP_LOG_DEBUG);
-    esp_log_level_set("PM", ESP_LOG_DEBUG);
-    esp_log_level_set("MAIN", ESP_LOG_DEBUG);
+    // 生产环境日志级别设置（保留关键INFO日志，Web页面可按级别过滤）
+    // 调试时可临时改为 ESP_LOG_DEBUG
+    esp_log_level_set("CONFIG", ESP_LOG_INFO);
+    esp_log_level_set("GPIO_DRIVER", ESP_LOG_INFO);
+    esp_log_level_set("TDS", ESP_LOG_INFO);
+    esp_log_level_set("FILTER_MGR", ESP_LOG_INFO);
+    esp_log_level_set("FSM", ESP_LOG_INFO);
+    esp_log_level_set("HISTORY", ESP_LOG_INFO);
+    esp_log_level_set("WIFI", ESP_LOG_INFO);
+    esp_log_level_set("WEB", ESP_LOG_INFO);
+    esp_log_level_set("APP_MQTT", ESP_LOG_INFO);
+    esp_log_level_set("OTA", ESP_LOG_INFO);
+    esp_log_level_set("PM", ESP_LOG_INFO);
+    esp_log_level_set("MAIN", ESP_LOG_INFO);
 
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "========================================");

@@ -86,7 +86,11 @@ static int log_vprintf_hook(const char *fmt, va_list args)
     char buf[256];
     int len = vsnprintf(buf, sizeof(buf), fmt, args);
     if (len > 0) {
-        if (len > (int)sizeof(buf)) len = (int)sizeof(buf);
+        // vsnprintf返回理论长度（如果缓冲区足够大），实际写入最多sizeof(buf)-1字节
+        // 如果len >= sizeof(buf)，说明输出被截断，只写入sizeof(buf)-1字节（不含'\0'）
+        if (len >= (int)sizeof(buf)) {
+            len = (int)sizeof(buf) - 1;
+        }
         log_buf_write(buf, len);
     }
     if (s_original_vprintf) {
@@ -510,6 +514,7 @@ static const char html_ota_page[] =
 
 // ==================== 日志查看器 ====================
 
+// 日志查看器 - 增强版（带时间戳、日志级别过滤、自动刷新控制）
 static const char html_log_page[] =
 "<!DOCTYPE html><html><head>"
 "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -521,8 +526,15 @@ static const char html_log_page[] =
 "h1{color:#fff;text-align:center;margin-bottom:20px;text-shadow:0 2px 4px rgba(0,0,0,0.2)}"
 ".back-btn{background:rgba(255,255,255,0.2);color:#fff;padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:10px}"
 ".back-btn:hover{background:rgba(255,255,255,0.3)}"
-".card{background:rgba(255,255,255,0.95);padding:10px;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}"
-"iframe{width:100%;height:70vh;border:none;border-radius:8px;background:#1e1e1e}"
+".card{background:rgba(255,255,255,0.95);padding:15px;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.1);margin-bottom:15px}"
+".control-panel{display:flex;flex-wrap:wrap;gap:15px;align-items:center;padding:10px;background:#f8f9fa;border-radius:12px;margin-bottom:10px}"
+"select{padding:8px 12px;border:2px solid #e0e0e0;border-radius:8px;font-size:14px;background:#fff;min-width:120px}"
+"select:focus{outline:none;border-color:#667eea}"
+".toggle-label{display:flex;align-items:center;gap:8px;font-size:14px;color:#333;cursor:pointer}"
+".toggle-label input[type='checkbox']{width:18px;height:18px;cursor:pointer}"
+"#logContent{background:#f8f9fa;color:#333;font-family:'Cascadia Code','Fira Code',monospace;font-size:12px;padding:12px;border-radius:8px;white-space:pre-wrap;word-break:break-all;line-height:1.6;overflow-y:auto;max-height:65vh;border:1px solid #e0e0e0}"
+".ts{color:#888;margin-right:8px}"
+".E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}"
 "</style></head><body>"
 "<div class='container'>"
 "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>"
@@ -530,12 +542,62 @@ static const char html_log_page[] =
 "<button class='back-btn' onclick=\"location.href='/'\" style='margin:0'>首页 →</button>"
 "</div>"
 "<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>系统日志</h1>"
+
 "<div class='card'>"
-"<iframe src='/api/logs/debug'></iframe>"
+"<div class='control-panel'>"
+"<label style='font-size:14px;color:#333'>日志级别:</label>"
+"<select id='levelFilter'>"
+"<option value='all'>全部</option>"
+"<option value='E'>仅错误 (E)</option>"
+"<option value='W'>仅警告 (W)</option>"
+"<option value='I'>仅信息 (I)</option>"
+"<option value='D'>仅调试 (D)</option>"
+"<option value='EW'>错误+警告</option>"
+"<option value='EWI'>错误+警告+信息</option>"
+"</select>"
+"<label class='toggle-label'><input type='checkbox' id='autoRefresh' checked> 自动刷新</label>"
+"<label style='font-size:14px;color:#333'>间隔:</label>"
+"<select id='refreshInterval'>"
+"<option value='3'>3秒</option>"
+"<option value='5'>5秒</option>"
+"<option value='10' selected>10秒</option>"
+"<option value='30'>30秒</option>"
+"</select>"
+"<button id='refreshBtn' style='padding:8px 16px;border-radius:8px;background:#667eea;color:#fff;border:none;cursor:pointer;font-size:14px'>刷新</button>"
 "</div>"
+"<div id='logContent'>加载中...</div>"
+"</div>"
+
 "</div>"
 "<script>"
-"setInterval(function(){document.querySelector('iframe').src='/api/logs/debug'},10000);"
+"let refreshTimer=null;"
+"let currentLevel='all';"
+"let refreshInterval=10;"
+"function fetchLogs(){"
+"const url='/api/logs/debug?level='+currentLevel;"
+"fetch(url).then(r=>r.text()).then(html=>{"
+"document.getElementById('logContent').innerHTML=html;"
+"}).catch(e=>{"
+"document.getElementById('logContent').innerHTML='<span style=\"color:#f44747\">获取日志失败: '+e+'</span>';"
+"});}"
+"function startRefresh(){"
+"if(refreshTimer)clearInterval(refreshTimer);"
+"if(document.getElementById('autoRefresh').checked){"
+"refreshTimer=setInterval(fetchLogs,refreshInterval*1000);"
+"}"
+"}"
+"document.getElementById('levelFilter').addEventListener('change',function(){"
+"currentLevel=this.value;"
+"fetchLogs();"
+"});"
+"document.getElementById('autoRefresh').addEventListener('change',startRefresh);"
+"document.getElementById('refreshInterval').addEventListener('change',function(){"
+"refreshInterval=parseInt(this.value);"
+"startRefresh();"
+"});"
+"document.getElementById('refreshBtn').addEventListener('click',fetchLogs);"
+"fetchLogs();"
+"startRefresh();"
 "</script></body></html>";
 
 static esp_err_t handle_log_page(httpd_req_t *req)
@@ -619,21 +681,36 @@ static esp_err_t handle_log_api(httpd_req_t *req)
 }
 
 /**
- * @brief 日志端点：以HTML形式返回日志缓冲区内容（嵌入iframe使用）
+ * @brief 日志端点：以HTML形式返回日志缓冲区内容（支持时间戳转换和级别过滤）
+ * @note 查询参数: level=E/W/I/D/EW/EWI 过滤日志级别
  */
 static esp_err_t handle_log_debug(httpd_req_t *req)
 {
-    static char buf[LOG_BUF_SIZE + 512];
+    static char buf[LOG_BUF_SIZE + 1024];
     int pos = 0;
 
+    // 解析查询参数中的日志级别过滤
+    char query[64] = {0};
+    char level_filter[8] = "all";
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char level_val[16] = {0};
+        if (httpd_query_key_value(query, "level", level_val, sizeof(level_val)) == ESP_OK) {
+            strncpy(level_filter, level_val, sizeof(level_filter) - 1);
+        }
+    }
+
+    // 获取启动墙钟时间（用于时间戳转换）
+    time_t boot_wall = wifi_manager_get_boot_wall_clock_time();
+    bool has_wall_time = (boot_wall > 0);
+
+    // 构建HTML片段（嵌入到#logContent div中，继承父级样式）
     pos = snprintf(buf, sizeof(buf),
-        "<style>body{margin:0;background:#1e1e1e;color:#d4d4d4;font-family:'Cascadia Code','Fira Code',monospace;font-size:11px;"
-        "white-space:pre-wrap;word-break:break-all;line-height:1.5;overflow-y:auto}"
-        ".E{color:#f44747}.W{color:#dcdcaa}.I{color:#6a9955}.D{color:#569cd6}"
-        "</style>"
-        "<div style='color:#888;padding:4px 8px;border-bottom:1px solid #333;font-size:10px'>缓冲区 %lu/%lu 字节日志</div>",
+        "<style>.ts{color:#888;margin-right:4px}.E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}</style>"
+        "<div style='padding:4px 8px;border-bottom:1px solid #e0e0e0;font-size:10px;color:#888;background:#f0f0f0'>缓冲区 %lu/%lu 字节 | %s | 过滤: %s</div>",
         (unsigned long)(s_log_head >= s_log_tail ? s_log_head - s_log_tail : LOG_BUF_SIZE - s_log_tail + s_log_head),
-        (unsigned long)LOG_BUF_SIZE);
+        (unsigned long)LOG_BUF_SIZE,
+        has_wall_time ? "时间戳已同步" : "时间戳未同步",
+        level_filter);
 
     // 逐行读取并输出
     uint32_t read_pos = s_log_tail;
@@ -647,22 +724,95 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
         if (c == '\n' || c == '\r') {
             if (line_len > 0) {
                 line_buf[line_len] = '\0';
+
+                // 解析日志级别: 格式 "I (1234) TAG: message" (ESP-IDF标准格式，无前导空格)
                 char lvl = 0;
-                if (line_len >= 5 && line_buf[0] == ' ' &&
-                    (line_buf[1] == 'E' || line_buf[1] == 'W' || line_buf[1] == 'I' || line_buf[1] == 'D')) {
-                    lvl = line_buf[1];
+                uint32_t boot_ms = 0;
+                if (line_len >= 5 &&
+                    (line_buf[0] == 'E' || line_buf[0] == 'W' || line_buf[0] == 'I' || line_buf[0] == 'D')) {
+                    lvl = line_buf[0];
+                    // 解析括号中的毫秒时间戳: "I (1234)"
+                    if (line_buf[1] == ' ' && line_buf[2] == '(') {
+                        int ts_start = 3;
+                        int ts_end = ts_start;
+                        while (ts_end < line_len && line_buf[ts_end] != ')') ts_end++;
+                        if (ts_end < line_len && line_buf[ts_end] == ')') {
+                            // 提取时间戳数字
+                            char ts_str[16] = {0};
+                            int ts_len = ts_end - ts_start;
+                            if (ts_len > 0 && ts_len < 16) {
+                                memcpy(ts_str, line_buf + ts_start, ts_len);
+                                boot_ms = (uint32_t)atoi(ts_str);
+                            }
+                        }
+                    }
                 }
-                int cls = 0;
-                if (lvl) { pos += snprintf(buf + pos, sizeof(buf) - pos, "<span class='%c'>", lvl); cls = 1; }
-                for (int i = 0; i < line_len && pos < (int)sizeof(buf) - 20; i++) {
-                    char ch = line_buf[i];
-                    if (ch == '<') { buf[pos++] = '&'; buf[pos++] = 'l'; buf[pos++] = 't'; }
-                    else if (ch == '>') { buf[pos++] = '&'; buf[pos++] = 'g'; buf[pos++] = 't'; }
-                    else if (ch == '&') { buf[pos++] = '&'; buf[pos++] = 'a'; buf[pos++] = 'm'; buf[pos++] = 'p'; buf[pos++] = ';'; }
-                    else buf[pos++] = ch;
+
+                // 检查是否应该显示此日志级别
+                bool show_log = true;
+                if (strcmp(level_filter, "all") != 0 && lvl) {
+                    show_log = false;
+                    // 检查级别是否在过滤器中
+                    for (int i = 0; level_filter[i] != '\0'; i++) {
+                        if (level_filter[i] == lvl) {
+                            show_log = true;
+                            break;
+                        }
+                    }
                 }
-                if (cls) { pos += snprintf(buf + pos, sizeof(buf) - pos, "</span>"); }
-                buf[pos++] = '\n';
+
+                if (show_log) {
+                    int cls = 0;
+                    if (lvl) {
+                        pos += snprintf(buf + pos, sizeof(buf) - pos, "<span class='%c'>", lvl);
+                        cls = 1;
+                    }
+
+                    // 如果有墙钟时间且解析到时间戳，显示转换后的时间
+                    if (has_wall_time && boot_ms > 0) {
+                        time_t log_time = boot_wall + (boot_ms / 1000);
+                        struct tm tm_log;
+                        localtime_r(&log_time, &tm_log);
+                        // 格式: "2026-05-20 14:30:45" (年-月-日 时:分:秒，自动使用当地时区)
+                        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                                       "<span class='ts'>%04d-%02d-%02d %02d:%02d:%02d</span> ",
+                                       tm_log.tm_year + 1900, tm_log.tm_mon + 1, tm_log.tm_mday,
+                                       tm_log.tm_hour, tm_log.tm_min, tm_log.tm_sec);
+                    }
+
+                    // 输出日志内容（跳过原始时间戳部分，保留级别标记）
+                    int content_start = 0;
+                    if (lvl && line_len >= 5) {
+                        // 找到 TAG: 开始的位置 (在 "(1234) " 之后)
+                        // 格式: "I (1234) TAG: message"
+                        // 我们保留级别 "I " 和 " TAG: message"，跳过 "(1234)"
+                        // 找到右括号后的位置
+                        int paren_end = 2; // 从 '(' 位置开始找
+                        while (paren_end < line_len && line_buf[paren_end] != ')') paren_end++;
+                        if (paren_end < line_len) {
+                            // 输出级别标记
+                            buf[pos++] = lvl;        // 级别
+                            buf[pos++] = ' ';        // 空格
+                            // 输出括号后的内容 (TAG: message)
+                            content_start = paren_end + 1;
+                            if (content_start < line_len && line_buf[content_start] == ' ') content_start++;
+                        } else {
+                            content_start = 0; // 无法解析，输出完整行
+                        }
+                    }
+
+                    // HTML转义输出
+                    for (int i = content_start; i < line_len && pos < (int)sizeof(buf) - 20; i++) {
+                        char ch = line_buf[i];
+                        if (ch == '<') { buf[pos++] = '&'; buf[pos++] = 'l'; buf[pos++] = 't'; }
+                        else if (ch == '>') { buf[pos++] = '&'; buf[pos++] = 'g'; buf[pos++] = 't'; }
+                        else if (ch == '&') { buf[pos++] = '&'; buf[pos++] = 'a'; buf[pos++] = 'm'; buf[pos++] = 'p'; buf[pos++] = ';'; }
+                        else buf[pos++] = ch;
+                    }
+
+                    if (cls) { pos += snprintf(buf + pos, sizeof(buf) - pos, "</span>"); }
+                    buf[pos++] = '\n';
+                }
                 line_len = 0;
             }
         } else if (line_len < 299) {
@@ -1948,7 +2098,8 @@ esp_err_t web_server_start(void)
     cfg.server_port = ctx.config.port;
     cfg.lru_purge_enable = true;
     cfg.max_uri_handlers = 26;
-    cfg.stack_size = 8192;  // 默认4KB不够用
+    cfg.stack_size = 12288;  // 增加到12KB，handle_log_debug需要约9KB缓冲区
+    cfg.max_open_sockets = 3;  // ESP-IDF v6.0限制：LWIP_MAX_SOCKETS=6，httpd内部占用3
 
     if (httpd_start(&ctx.server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "启动失败");

@@ -91,13 +91,6 @@ esp_err_t filter_mgr_deinit(void);
 // ==================== 用水量统计 ====================
 
 /**
- * @brief 设置滤芯总容量（兼容旧接口，设置所有滤芯）
- * @param total_liters 总容量（升）
- * @return ESP_OK 成功
- */
-esp_err_t filter_mgr_set_filter_capacity(uint32_t total_liters);
-
-/**
  * @brief 更新已处理水量（累计，支持小数，内部累积后提交）
  * @param liters 增加的水量（升，可为小数）
  * @return ESP_OK 成功
@@ -144,32 +137,11 @@ float filter_mgr_get_pump_flow_lph(void);
 // ==================== 滤芯寿命管理 ====================
 
 /**
- * @brief 获取滤芯寿命信息（兼容旧接口，返回RO膜寿命）
- * @param life 输出：滤芯寿命信息
- * @return ESP_OK 成功
- */
-esp_err_t filter_mgr_get_filter_life(filter_life_t *life);
-
-/**
- * @brief 重置滤芯寿命（兼容旧接口，重置RO膜）
- * @return ESP_OK 成功
- */
-esp_err_t filter_mgr_reset_filter_life(void);
-
-/**
  * @brief 获取所有滤芯状态
  * @param status 输出：滤芯状态结构体
  * @return ESP_OK 成功
  */
 esp_err_t filter_mgr_get_filters_status(filters_status_t *status);
-
-/**
- * @brief 获取单个滤芯信息
- * @param filter_type 滤芯类型
- * @param info 输出：滤芯信息
- * @return ESP_OK 成功
- */
-esp_err_t filter_mgr_get_filter_info(filter_type_t filter_type, filter_info_t *info);
 
 /**
  * @brief 重置单个滤芯（更换滤芯后调用）
@@ -183,14 +155,6 @@ esp_err_t filter_mgr_reset_filter(filter_type_t filter_type);
  * @return ESP_OK 成功
  */
 esp_err_t filter_mgr_reset_all_filters(void);
-
-/**
- * @brief 设置单个滤芯容量
- * @param filter_type 滤芯类型
- * @param total_liters 总容量（升）
- * @return ESP_OK 成功
- */
-esp_err_t filter_mgr_set_filter_capacity_ex(filter_type_t filter_type, uint32_t total_liters);
 
 /**
  * @brief 批量设置所有滤芯容量（一次NVs写入）

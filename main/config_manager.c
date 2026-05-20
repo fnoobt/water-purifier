@@ -149,10 +149,11 @@ esp_err_t config_manager_init(void)
 
     ESP_LOGI(TAG, "初始化配置管理器...");
 
-    // 初始化NVS
+    // 初始化NVS（遇到损坏时自动擦除恢复）
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "擦除NVS并重新初始化");
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND ||
+        ret == ESP_ERR_NVS_KEY_TOO_LONG) {
+        ESP_LOGW(TAG, "NVS损坏，擦除恢复");
         nvs_flash_erase();
         ret = nvs_flash_init();
     }
@@ -168,32 +169,11 @@ esp_err_t config_manager_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    // 检测NVS中是否存在超长key，仅在确认超长key时才擦除
-    {
-        nvs_handle_t rt_handle;
-        esp_err_t rt_err = nvs_open(NVS_RUNTIME_NAMESPACE, NVS_READONLY, &rt_handle);
-        if (rt_err == ESP_ERR_NVS_KEY_TOO_LONG) {
-            ESP_LOGW(TAG, "NVS中存在超长key，擦除并恢复");
-            nvs_flash_erase();
-            ret = nvs_flash_init();
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "NVS恢复失败: %s", esp_err_to_name(ret));
-                return ret;
-            }
-        } else {
-            // NOT_FOUND（namespace不存在）或其他错误是正常的，不处理
-            if (rt_err == ESP_OK) {
-                nvs_close(rt_handle);
-            }
-        }
-    }
-
     // 加载配置
     memcpy(&ctx.config, &default_config, sizeof(system_config_t));
     config_manager_load();
 
     ctx.initialized = true;
-    ESP_LOGI(TAG, "配置管理器初始化完成");
     return ESP_OK;
 }
 
@@ -211,7 +191,6 @@ esp_err_t config_manager_deinit(void)
         ctx.mutex = NULL;
     }
 
-    ESP_LOGI(TAG, "配置管理器已反初始化");
     return ESP_OK;
 }
 
@@ -1199,33 +1178,4 @@ void config_manager_print_config(void)
              ctx.config.tds_inlet_threshold, ctx.config.tds_outlet_threshold);
     ESP_LOGI(TAG, "滤芯容量: %lu升", ctx.config.filter_capacity_liters);
     ESP_LOGI(TAG, "===================");
-}
-
-esp_err_t config_manager_get_status_string(char *buffer, size_t buffer_size)
-{
-    if (!buffer || buffer_size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    snprintf(buffer, buffer_size,
-             "WiFi: %s\n"
-             "MQTT: %s (%s)\n"
-             "冲洗: %lu秒\n"
-             "超时: %lu秒\n"
-             "漏确认: %lu秒\n"
-             "继电平: %s\n"
-             "TDS阈值: %.0f/%.0f ppm\n"
-             "滤芯: %lu升",
-             ctx.config.wifi_ssid,
-             ctx.config.mqtt_broker,
-             ctx.config.mqtt_enabled ? "开" : "关",
-             ctx.config.flush_duration_sec,
-             ctx.config.production_timeout_sec,
-             ctx.config.leak_confirm_time_sec,
-             ctx.config.relay_trigger_level ? "高" : "低",
-             ctx.config.tds_inlet_threshold,
-             ctx.config.tds_outlet_threshold,
-             ctx.config.filter_capacity_liters);
-
-    return ESP_OK;
 }

@@ -144,7 +144,6 @@ esp_err_t tds_sensor_init(void)
     }
 
     tds_ctx.initialized = true;
-    ESP_LOGI(TAG, "TDS传感器初始化完成");
     return ESP_OK;
 }
 
@@ -295,13 +294,10 @@ static int adc_read_averaged(adc_channel_t channel)
         esp_rom_delay_us(ADC_SAMPLE_DELAY_US);
     }
 
-    // 去掉最大最小值后计算平均（防止整数溢出）
-    if (sum >= min_val + max_val) {
-        sum = sum - min_val - max_val;
-        return sum / (ADC_SAMPLE_COUNT - 2);
-    }
-    // 异常情况：sum小于min+max，返回中间值
-    return (min_val + max_val) / 2;
+    // 去掉最大最小值后计算平均
+    // 16个样本，每个最大4095，sum最大65520，远小于INT_MAX(2147483647)，不会溢出
+    sum = sum - min_val - max_val;
+    return sum / (ADC_SAMPLE_COUNT - 2);
 }
 
 esp_err_t tds_sensor_measure(tds_sensor_id_t sensor_id, tds_measurement_t *measurement)
@@ -381,8 +377,9 @@ esp_err_t tds_sensor_get_latest(tds_sensor_id_t sensor_id, tds_measurement_t *me
         return ESP_ERR_TIMEOUT;
     }
 
-    bool valid = tds_ctx.latest[sensor_id].valid;
+    // 在mutex保护下复制整个结构体，包括valid标志
     memcpy(measurement, &tds_ctx.latest[sensor_id], sizeof(tds_measurement_t));
+    bool valid = measurement->valid;
     xSemaphoreGive(tds_ctx.data_mutex);
 
     if (!valid) {
@@ -595,13 +592,13 @@ static float calculate_tds(float voltage, float temperature)
     float tds = voltage * (1000.0f / 2300.0f);
 
     // 温度补偿 (系数约2%/°C)：温度升高时电导率增加
-    // 将实测值补偿到25°C参考值（乘法而非除法）
-    // denom > 1 表示温度高于25°C，实测值偏大，需乘以系数补偿到25°C等效值
+    // 将实测值补偿到25°C参考值（除法而非乘法）
+    // denom > 1 表示温度高于25°C，实测值偏大，需除以系数补偿到25°C等效值
     float temp_coeff = 1.0f + 0.02f * (temperature - 25.0f);
     if (temp_coeff < 0.5f) {
         temp_coeff = 0.5f;  // 防止极低温度导致系数过小
     }
-    tds = tds * temp_coeff;  // 正确：乘以系数，温度高于25°C时TDS值增加
+    tds = tds / temp_coeff;  // 正确：除以系数，温度高于25°C时TDS值降低到25°C等效值
 
     return tds;
 }

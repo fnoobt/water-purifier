@@ -703,11 +703,9 @@ esp_err_t ota_update_rollback(void);
 
 ### 11. 电源管理 (pm_manager.c/h)
 
-**职责**: CPU动态频率、WiFi TX功率、堆内存监控
+**职责**: WiFi TX功率调整、堆内存监控（ESP32-C3不支持DFS动态频率）
 
-**CPU频率控制**:
-- `pm_manager_set_cpu_mode(true)` — 降至80MHz（待机/停止/漏水）
-- `pm_manager_set_cpu_mode(false)` — 保持160MHz（制水/冲洗）
+**ESP32-C3限制**: 该芯片不支持DFS动态频率调节，代码自动检测并跳过相关配置。
 
 **WiFi TX功率**: 滞回窗口机制，RSSI < -55dBm升功率至20dBm，RSSI > -48dBm降至8dBm。
 
@@ -880,32 +878,6 @@ POST /api/ota/rollback
 
 ---
 
-## 内存使用
-
-### Flash分区
-
-| 分区 | 大小 | 说明 |
-|------|------|------|
-| Bootloader | 32KB | 系统引导 |
-| NVS | 24KB | 配置存储 |
-| otadata | 8KB | OTA记录 |
-| factory | 1152KB | 初始固件 |
-| ota_0 | 1408KB | OTA槽位0 |
-| ota_1 | 1408KB | OTA槽位1 |
-
-### RAM使用
-
-| 模块 | 估算 |
-|------|------|
-| WiFi协议栈 | ~100KB |
-| HTTP服务器 | ~30KB |
-| 日志环形缓冲区 | 8KB |
-| MQTT客户端 | ~20KB |
-| 状态机任务 | ~16KB |
-| TDS传感器任务 | ~12KB |
-| **总计** | ~190KB |
-| **可用** | ~210KB |
-
 ---
 
 ## 开发指南
@@ -955,6 +927,8 @@ POST /api/ota/rollback
 
 **COM端口拒绝访问**: 关闭串口监视器，按住BOOT键按RESET进入下载模式。
 
+**Web服务器启动失败**: `httpd: Config option max_open_sockets is too large` - ESP-IDF v6.0限制了httpd最大socket数（LWIP_MAX_SOCKETS - httpd内部socket = 可用连接数）。已在代码中设置 `max_open_sockets=3`。
+
 ---
 
 ## 版本历史
@@ -975,10 +949,50 @@ POST /api/ota/rollback
 | 1.2.2 | 2026-05-17 | **代码审查修复**：TDS温度补偿方向修正、水锤控制竞态修复、线程安全增强（config/GPIO/MQTT）、NVS错误处理完善、OTA回滚时序修正、总制水量NVS持久化补全 |
 | 1.2.3 | 2026-05-19 | Web日志页增强：SNTP时间戳、DEBUG日志启用、级别过滤、空行跳过、自动滚动修复；OTA状态页增强：回滚状态检测、是否可升级提示、禁用按钮、错误提示；Flash保存周期新增4小时选项；日志噪声优化 |
 | 1.2.4 | 2026-05-19 | OTA分区切换功能：恢复出厂固件按钮、回滚到上一OTA固件按钮、API接口 `/api/ota/factory` 和 `/api/ota/rollback` |
+| 1.2.5 | 2026-05-20 | **代码审查修复（Critical/High）**：TDS温度补偿公式修正（multiply→divide）、Web服务器栈溢出修复（12KB）、FSM水量计算防绕过、日志缓冲区截断处理、FSM mutex泄漏修复、OTA写入计数修正（写入成功后增加） |
+| 1.2.6 | 2026-05-20 | **代码审查修复（Medium）**：WiFi/MQTT重连任务竞态修复（reconnect_active标志）、MQTT发布参数NULL验证、任务栈优化（WiFi/MQTT重连4KB）；**日志清理**：移除重复初始化日志、降级重连轮询日志为DEBUG级别、合并FSM水量重复日志；**内存优化**：移除config_manager冗余NVS检查 |
+| 1.2.7 | 2026-05-21 | **ESP-IDF v6.0兼容性修复**：httpd `max_open_sockets=3`（LWIP_MAX_SOCKETS=6，httpd内部占用3） |
+| 2.2.1 | 2026-05-21 | **固件优化**：编译器SIZE优化、禁用GDB stub、禁用mbedTLS证书捆绑包（节省~50KB）、日志缓冲区4KB、生产级日志级别INFO；**代码清理**：删除6个废弃函数、NVS错误处理简化、pm_manager ESP32-C3 DFS跳过；**Web日志页**：级别解析修复、浅色背景；**版本管理**：手动版本号（CMake VERSION） |
 
 ---
 
-## 附录
+## 内存使用详细分析
+
+### Flash分区布局（4MB总容量）
+
+| 分区 | 大小 | 用途 |
+|------|------|------|
+| Bootloader | 32 KB | 系统引导程序 |
+| NVS | 24 KB | 非易失性存储（配置/运行数据） |
+| otadata | 8 KB | OTA启动状态记录 |
+| phy_init | 4 KB | RF校准数据 |
+| factory | 1152 KB | 出厂固件分区 |
+| ota_0 | 1408 KB | OTA固件槽位A |
+| ota_1 | 1408 KB | OTA固件槽位B |
+
+### RAM使用估算（ESP32-C3 ~400KB内部RAM）
+
+| 类别 | 大小 | 说明 |
+|------|------|------|
+| 静态缓冲区(BSS) | ~13.5 KB | 全局结构体、日志环形缓冲区 |
+| 任务栈 | ~34.5 KB | fsm(3KB), httpd(12KB), wifi_reconnect(4KB), mqtt_reconnect(4KB), 其他(11.5KB) |
+| WiFi/LWIP | ~25-30 KB | 协议栈缓冲区（动态分配） |
+| IDF系统开销 | ~20 KB | Heap管理器、定时器、系统任务 |
+| **已用总计** | ~93-98 KB | |
+| **可用堆内存** | ~300 KB | cJSON、临时缓冲区、动态分配 |
+
+### 任务栈配置
+
+| 任务 | 栈大小 | 优先级 | 说明 |
+|------|--------|--------|------|
+| main_task | 3.5 KB | 1 | ESP-IDF默认 |
+| event_task | 4 KB | 1 | WiFi/系统事件处理 |
+| fsm_task | 3 KB | 5 | 状态机主循环 |
+| httpd | 12 KB | 5 | Web服务器（handle_log_debug需要9KB） |
+| wifi_reconnect | 4 KB | 5 | WiFi指数退避重连 |
+| mqtt_reconnect | 4 KB | 4 | MQTT指数退避重连 |
+| tds_task | 2 KB | 4 | TDS传感器测量 |
+| monitor_task | 2 KB | 6 | 系统监控（看门狗） |
 
 ### LED指示
 

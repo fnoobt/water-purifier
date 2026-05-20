@@ -84,6 +84,7 @@ static struct {
     bool initialized;
     bool started;
     bool stop_requested;         // 停止请求标志（通知重连任务退出）
+    bool reconnect_active;       // 重连任务活跃标志（防止重复创建）
     app_mqtt_state_t state;
     app_mqtt_config_t config;
 
@@ -100,6 +101,7 @@ static struct {
     .initialized = false,
     .started = false,
     .stop_requested = false,
+    .reconnect_active = false,
     .state = APP_MQTT_STATE_DISCONNECTED,
     .mqtt_client = NULL,
     .message_callback = NULL,
@@ -141,7 +143,6 @@ esp_err_t mqtt_client_init(void)
     }
 
     mqtt_ctx.initialized = true;
-    ESP_LOGI(TAG, "MQTT客户端初始化完成");
     return ESP_OK;
 }
 
@@ -391,6 +392,16 @@ esp_err_t mqtt_client_disconnect(void)
 
 esp_err_t mqtt_client_publish(const char *topic, const char *data, uint32_t len, uint8_t qos, bool retain)
 {
+    // 参数验证
+    if (topic == NULL) {
+        ESP_LOGW(TAG, "MQTT发布失败: topic为NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (data == NULL && len > 0) {
+        ESP_LOGW(TAG, "MQTT发布失败: data为NULL但len>0");
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (mqtt_ctx.mqtt_client == NULL || !mqtt_client_is_connected()) {
         ESP_LOGW(TAG, "MQTT未连接，无法发布消息");
         return ESP_ERR_INVALID_STATE;
@@ -572,13 +583,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             }
             /* 启动重连任务（临界保护防止多任务重复创建） */
             taskENTER_CRITICAL(&mqtt_spinlock);
-            if (mqtt_ctx.reconnect_task == NULL) {
-                BaseType_t ret = xTaskCreate(mqtt_reconnect_task, "mqtt_recon", 3072, NULL, 4, &mqtt_ctx.reconnect_task);
+            // 使用标志位防止重复创建，而不是检查task handle（xTaskCreate后handle才被设置）
+            if (!mqtt_ctx.reconnect_active) {
+                mqtt_ctx.reconnect_active = true;  // 先设置标志，再创建任务
+                taskEXIT_CRITICAL(&mqtt_spinlock);
+                BaseType_t ret = xTaskCreate(mqtt_reconnect_task, "mqtt_recon", 4096, NULL, 4, &mqtt_ctx.reconnect_task);
                 if (ret != pdPASS) {
                     ESP_LOGE(TAG, "创建MQTT重连任务失败");
+                    taskENTER_CRITICAL(&mqtt_spinlock);
+                    mqtt_ctx.reconnect_active = false;  // 创建失败，重置标志
+                    taskEXIT_CRITICAL(&mqtt_spinlock);
                 }
+            } else {
+                taskEXIT_CRITICAL(&mqtt_spinlock);
             }
-            taskEXIT_CRITICAL(&mqtt_spinlock);
             break;
 
         case MQTT_EVENT_DATA:
@@ -634,13 +652,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             }
             /* 与断开事件一样启动重连任务 */
             taskENTER_CRITICAL(&mqtt_spinlock);
-            if (mqtt_ctx.reconnect_task == NULL && mqtt_ctx.started) {
-                BaseType_t ret = xTaskCreate(mqtt_reconnect_task, "mqtt_recon", 3072, NULL, 4, &mqtt_ctx.reconnect_task);
+            if (!mqtt_ctx.reconnect_active && mqtt_ctx.started) {
+                mqtt_ctx.reconnect_active = true;
+                taskEXIT_CRITICAL(&mqtt_spinlock);
+                BaseType_t ret = xTaskCreate(mqtt_reconnect_task, "mqtt_recon", 4096, NULL, 4, &mqtt_ctx.reconnect_task);
                 if (ret != pdPASS) {
                     ESP_LOGE(TAG, "创建MQTT重连任务失败");
+                    taskENTER_CRITICAL(&mqtt_spinlock);
+                    mqtt_ctx.reconnect_active = false;
+                    taskEXIT_CRITICAL(&mqtt_spinlock);
                 }
+            } else {
+                taskEXIT_CRITICAL(&mqtt_spinlock);
             }
-            taskEXIT_CRITICAL(&mqtt_spinlock);
             break;
 
         case MQTT_EVENT_PUBLISHED:
@@ -910,10 +934,11 @@ static void mqtt_reconnect_task(void *pvParameters)
 
     // 首先检查WiFi是否已连接，避免无WiFi时浪费资源
     if (!wifi_manager_is_connected()) {
-        ESP_LOGW(TAG, "WiFi未连接，MQTT重连任务提前退出");
+        ESP_LOGW(TAG, "WiFi未连接，MQTT重连任务退出");
         esp_task_wdt_delete(NULL);
         taskENTER_CRITICAL(&mqtt_spinlock);
         mqtt_ctx.reconnect_task = NULL;
+        mqtt_ctx.reconnect_active = false;  // 清除活跃标志
         taskEXIT_CRITICAL(&mqtt_spinlock);
         vTaskDelete(NULL);
         return;
@@ -925,7 +950,7 @@ static void mqtt_reconnect_task(void *pvParameters)
         bool should_stop = mqtt_ctx.stop_requested;
         taskEXIT_CRITICAL(&mqtt_spinlock);
         if (should_stop) {
-            ESP_LOGI(TAG, "收到停止请求，MQTT重连任务退出");
+            ESP_LOGD(TAG, "MQTT重连任务收到停止请求");
             break;
         }
 
@@ -944,7 +969,7 @@ static void mqtt_reconnect_task(void *pvParameters)
             should_stop = mqtt_ctx.stop_requested;
             taskEXIT_CRITICAL(&mqtt_spinlock);
             if (should_stop) {
-                ESP_LOGI(TAG, "延迟期间收到停止请求，MQTT重连任务退出");
+                ESP_LOGD(TAG, "MQTT重连任务收到停止请求");
                 break;
             }
         }
@@ -952,17 +977,18 @@ static void mqtt_reconnect_task(void *pvParameters)
 
         // 每次重试前检查WiFi状态
         if (!wifi_manager_is_connected()) {
-            ESP_LOGW(TAG, "WiFi连接断开，暂停MQTT重连");
+            ESP_LOGW(TAG, "WiFi断开，MQTT重连任务退出");
             esp_task_wdt_delete(NULL);
             taskENTER_CRITICAL(&mqtt_spinlock);
             mqtt_ctx.reconnect_task = NULL;
+            mqtt_ctx.reconnect_active = false;  // 清除活跃标志
             taskEXIT_CRITICAL(&mqtt_spinlock);
             vTaskDelete(NULL);
             return;
         }
 
         if (mqtt_client_is_connected()) {
-            ESP_LOGI(TAG, "重连期间已恢复连接，取消重连任务");
+            ESP_LOGD(TAG, "MQTT重连期间已恢复连接");
             break;
         }
 
@@ -970,7 +996,7 @@ static void mqtt_reconnect_task(void *pvParameters)
         bool is_started = mqtt_ctx.started;
         taskEXIT_CRITICAL(&mqtt_spinlock);
         if (!is_started) {
-            ESP_LOGI(TAG, "MQTT已停止，取消重连任务");
+            ESP_LOGD(TAG, "MQTT已停止，重连任务退出");
             break;
         }
 
@@ -996,7 +1022,7 @@ static void mqtt_reconnect_task(void *pvParameters)
                     should_stop = mqtt_ctx.stop_requested;
                     taskEXIT_CRITICAL(&mqtt_spinlock);
                     if (should_stop) {
-                        ESP_LOGI(TAG, "等待连接期间收到停止请求，退出");
+                        ESP_LOGD(TAG, "MQTT重连任务收到停止请求");
                         break;
                     }
 
@@ -1016,12 +1042,13 @@ static void mqtt_reconnect_task(void *pvParameters)
     }
 
     if (retry >= max_retries && !mqtt_client_is_connected()) {
-        ESP_LOGE(TAG, "MQTT重连失败，已达最大重试次数");
+        ESP_LOGW(TAG, "MQTT重连失败，已达最大重试次数");
     }
 
     esp_task_wdt_delete(NULL);  // 任务结束前注销看门狗
     taskENTER_CRITICAL(&mqtt_spinlock);
     mqtt_ctx.reconnect_task = NULL;
+    mqtt_ctx.reconnect_active = false;  // 清除活跃标志
     taskEXIT_CRITICAL(&mqtt_spinlock);
     vTaskDelete(NULL);
 }

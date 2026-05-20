@@ -92,7 +92,6 @@ esp_err_t ota_update_init(void)
     }
 
     s_ctx.state = OTA_STATE_IDLE;
-    ESP_LOGI(TAG, "OTA 模块初始化完成");
     return ESP_OK;
 }
 
@@ -207,7 +206,7 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
         if (copy_to_buf > 0) {
             memcpy(s_ctx.init_buf + s_ctx.init_len, data, copy_to_buf);
             s_ctx.init_len += copy_to_buf;
-            s_ctx.total_written += copy_to_buf;
+            // 注意：不在此处增加total_written，等待实际flash写入成功后再增加
             data += copy_to_buf;
             len -= copy_to_buf;
         }
@@ -249,6 +248,8 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
             s_ctx.state = OTA_STATE_FAILED;
             return err;
         }
+        // 写入成功后增加计数（init_buf已写入flash）
+        s_ctx.total_written += s_ctx.init_len;
 
         s_ctx.image_header_checked = true;
         s_ctx.state = OTA_STATE_WRITING;

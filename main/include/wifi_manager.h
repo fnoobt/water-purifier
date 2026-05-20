@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
 #include "esp_err.h"
 #include "esp_wifi.h"
 
@@ -138,9 +139,10 @@ esp_err_t wifi_manager_register_callback(wifi_state_callback_t callback);
 // ==================== 调试接口 ====================
 
 /**
- * @brief 获取状态字符串
+ * @brief 获取系统启动时的墙钟时间（用于日志时间戳转换）
+ * @return 启动时的Unix timestamp，0表示NTP尚未同步
  */
-esp_err_t wifi_manager_get_status_string(char *buffer, size_t buffer_size);
+time_t wifi_manager_get_boot_wall_clock_time(void);
 
 #ifdef __cplusplus
 }

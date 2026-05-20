@@ -235,7 +235,6 @@ esp_err_t history_logger_init(void)
         return ESP_ERR_TIMEOUT;
     }
 
-    ESP_LOGI(TAG, "历史记录模块初始化完成，已有%lu条记录", ctx.record_count);
     return ESP_OK;
 }
 

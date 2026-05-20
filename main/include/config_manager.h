@@ -233,15 +233,8 @@ bool config_manager_has_mqtt_config(void);
 /**
  * @brief 打印配置信息
  */
-void config_manager_print_config(void);
 
-/**
- * @brief 获取配置状态字符串
- * @param buffer 输出缓冲区
- * @param buffer_size 缓冲区大小
- * @return ESP_OK 成功
- */
-esp_err_t config_manager_get_status_string(char *buffer, size_t buffer_size);
+void config_manager_print_config(void);
 
 #ifdef __cplusplus
 }
