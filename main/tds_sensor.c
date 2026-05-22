@@ -42,6 +42,9 @@ static struct {
     // 报警状态标志（避免重复日志）
     bool alarm_active[TDS_SENSOR_COUNT];
 
+    // 跳过报警检测标志（纯水洗膜期间使用）
+    bool skip_alarm_detection;
+
     // 校准参数
     tds_calibration_t calibration[TDS_SENSOR_COUNT];
 
@@ -54,6 +57,7 @@ static struct {
     .initialized = false,
     .running = false,
     .alarm_threshold = {500.0f, 100.0f},  // 进水500ppm，出水100ppm
+    .skip_alarm_detection = false,
     .temperature = 25.0f,
 };
 
@@ -188,33 +192,35 @@ static void tds_sensor_task(void *arg)
             ESP_LOGD(TAG, "进水: %.1f ppm, 出水: %.1f ppm, 去除率: %.1f%%",
                      dual.inlet.tds_value, dual.outlet.tds_value, dual.reduction_rate);
 
-            // 检查报警（分别检查进水和出水传感器，带迟滞防止频繁切换）
-            float tds_values[TDS_SENSOR_COUNT] = {dual.inlet.tds_value, dual.outlet.tds_value};
-            for (int i = 0; i < TDS_SENSOR_COUNT; i++) {
-                float tds_val = tds_values[i];
-                float threshold = tds_ctx.alarm_threshold[i];
-                float clear_threshold = threshold * (1.0f - ALARM_HYSTERESIS_PERCENT);  // 解除阈值=阈值*0.95
+            // 检查报警（纯水洗膜期间跳过，因无水流导致测量无效）
+            if (!tds_ctx.skip_alarm_detection) {
+                float tds_values[TDS_SENSOR_COUNT] = {dual.inlet.tds_value, dual.outlet.tds_value};
+                for (int i = 0; i < TDS_SENSOR_COUNT; i++) {
+                    float tds_val = tds_values[i];
+                    float threshold = tds_ctx.alarm_threshold[i];
+                    float clear_threshold = threshold * (1.0f - ALARM_HYSTERESIS_PERCENT);  // 解除阈值=阈值*0.95
 
-                if (tds_val > threshold) {
-                    // 超过报警阈值
-                    if (!tds_ctx.alarm_active[i]) {
-                        ESP_LOGW(TAG, "%s报警: %.1f > %.1f ppm",
-                                 sensor_names[i],
-                                 tds_val,
-                                 threshold);
-                        tds_ctx.alarm_active[i] = true;
+                    if (tds_val > threshold) {
+                        // 超过报警阈值
+                        if (!tds_ctx.alarm_active[i]) {
+                            ESP_LOGW(TAG, "%s报警: %.1f > %.1f ppm",
+                                     sensor_names[i],
+                                     tds_val,
+                                     threshold);
+                            tds_ctx.alarm_active[i] = true;
+                        }
+                    } else if (tds_val < clear_threshold) {
+                        // 低于解除阈值（比报警阈值低5%），带迟滞
+                        if (tds_ctx.alarm_active[i]) {
+                            ESP_LOGI(TAG, "%s报警已解除: %.1f < %.1f ppm (迟滞阈值)",
+                                     sensor_names[i],
+                                     tds_val,
+                                     clear_threshold);
+                            tds_ctx.alarm_active[i] = false;
+                        }
                     }
-                } else if (tds_val < clear_threshold) {
-                    // 低于解除阈值（比报警阈值低5%），带迟滞
-                    if (tds_ctx.alarm_active[i]) {
-                        ESP_LOGI(TAG, "%s报警已解除: %.1f < %.1f ppm (迟滞阈值)",
-                                 sensor_names[i],
-                                 tds_val,
-                                 clear_threshold);
-                        tds_ctx.alarm_active[i] = false;
-                    }
+                    // 介于阈值和解除阈值之间时，保持当前报警状态不变（迟滞区间）
                 }
-                // 介于阈值和解除阈值之间时，保持当前报警状态不变（迟滞区间）
             }
         }
 
@@ -521,6 +527,14 @@ bool tds_sensor_is_alarm(tds_sensor_id_t sensor_id)
         xSemaphoreGive(tds_ctx.data_mutex);
     }
     return result;
+}
+
+void tds_sensor_set_skip_alarm_detection(bool skip)
+{
+    tds_ctx.skip_alarm_detection = skip;
+    if (skip) {
+        ESP_LOGD(TAG, "跳过报警检测（纯水洗膜期间）");
+    }
 }
 
 // ==================== 温度 ====================

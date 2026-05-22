@@ -43,6 +43,13 @@ static void fsm_state_callback(fsm_state_t old_state, fsm_state_t new_state)
         pm_manager_set_cpu_mode(true);
     }
 
+    // 纯水洗膜期间跳过TDS报警检测（泵停止、进水阀关闭，TDS读数无效）
+    if (new_state == FSM_STATE_PURE_FLUSH) {
+        tds_sensor_set_skip_alarm_detection(true);
+    } else if (old_state == FSM_STATE_PURE_FLUSH) {
+        tds_sensor_set_skip_alarm_detection(false);
+    }
+
     // 发布MQTT状态更新
     if (mqtt_client_is_connected()) {
         mqtt_publish_purifier_status();
@@ -272,7 +279,6 @@ void app_main(void)
         ESP_LOGE(TAG, "监控任务创建失败");
     }
 
-    ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  系统初始化完成！");
     ESP_LOGI(TAG, "  可用内存: %lu bytes", esp_get_free_heap_size());

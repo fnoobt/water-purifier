@@ -929,6 +929,8 @@ POST /api/ota/rollback
 
 **Web服务器启动失败**: `httpd: Config option max_open_sockets is too large` - ESP-IDF v6.0限制了httpd最大socket数（LWIP_MAX_SOCKETS - httpd内部socket = 可用连接数）。已在代码中设置 `max_open_sockets=3`。
 
+**Web日志显示异常**: 日志页面显示时间戳但内容为空 - 日志缓冲区读取竞态条件导致。已在v1.2.8修复：添加`s_log_head`快照和解析边界检查。
+
 ---
 
 ## 版本历史
@@ -952,6 +954,8 @@ POST /api/ota/rollback
 | 1.2.5 | 2026-05-20 | **代码审查修复（Critical/High）**：TDS温度补偿公式修正（multiply→divide）、Web服务器栈溢出修复（12KB）、FSM水量计算防绕过、日志缓冲区截断处理、FSM mutex泄漏修复、OTA写入计数修正（写入成功后增加） |
 | 1.2.6 | 2026-05-20 | **代码审查修复（Medium）**：WiFi/MQTT重连任务竞态修复（reconnect_active标志）、MQTT发布参数NULL验证、任务栈优化（WiFi/MQTT重连4KB）；**日志清理**：移除重复初始化日志、降级重连轮询日志为DEBUG级别、合并FSM水量重复日志；**内存优化**：移除config_manager冗余NVS检查 |
 | 1.2.7 | 2026-05-21 | **ESP-IDF v6.0兼容性修复**：httpd `max_open_sockets=3`（LWIP_MAX_SOCKETS=6，httpd内部占用3） |
+| 1.2.8 | 2026-05-22 | **Web日志缓冲区修复**：`s_log_head`快照避免竞态条件、解析边界检查（确保日志内容完整性）；**TDS纯水洗膜修复**：跳过报警检测（泵停止期间无水流导致读数无效） |
+| 1.2.9 | 2026-05-22 | **ESP32-C3专用优化**：简化pm_manager移除DFS死代码（ESP32-C3不支持动态频率调节），CPU固定160MHz；**管理页面**：新增重启按钮（二次确认），调整控制面板按钮顺序避免红色按钮相邻 |
 | 2.2.1 | 2026-05-21 | **固件优化**：编译器SIZE优化、禁用GDB stub、禁用mbedTLS证书捆绑包（节省~50KB）、日志缓冲区4KB、生产级日志级别INFO；**代码清理**：删除6个废弃函数、NVS错误处理简化、pm_manager ESP32-C3 DFS跳过；**Web日志页**：级别解析修复、浅色背景；**版本管理**：手动版本号（CMake VERSION） |
 
 ---

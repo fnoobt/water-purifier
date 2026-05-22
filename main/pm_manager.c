@@ -1,41 +1,30 @@
 /**
  * @file pm_manager.c
- * @brief 电源管理模块实现
- * @note CPU动态频率切换、WiFi TX功率动态调整、堆内存监控
+ * @brief 电源管理模块实现 (ESP32-C3专用)
+ * @note WiFi TX功率动态调整、堆内存监控
+ *       ESP32-C3不支持DFS动态频率调节，CPU固定160MHz
  */
 
 #include "pm_manager.h"
 #include "esp_log.h"
-#include "esp_pm.h"
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "config_manager.h"
-
-// ESP32-C3不支持DFS动态频率调节和PM锁，使用宏检测
-#ifdef CONFIG_IDF_TARGET_ESP32C3
-#define PM_DFS_SUPPORTED 0
-#else
-#define PM_DFS_SUPPORTED 1
-#endif
 
 static const char *TAG = "PM";
 
 // ==================== 状态 ====================
 
-// 临界保护 spinlock（用于多任务并发访问）
 static portMUX_TYPE pm_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 static struct {
     bool initialized;
-    bool cpu_lock_acquired;       // CPU频率锁当前是否持有（避免无效操作）
     uint8_t current_wifi_tx_power; // 当前WiFi TX功率(0.25dBm单位)
-    bool wifi_tx_adjusted;       // 是否已调整过WiFi功率（用于日志）
-    esp_pm_lock_handle_t cpu_freq_lock; // CPU频率锁
+    bool wifi_tx_adjusted;         // 是否已调整过WiFi功率
 } s_ctx = {0};
 
-// ==================== CPU频率 ====================
+// ==================== 初始化 ====================
 
 esp_err_t pm_manager_init(void)
 {
@@ -44,98 +33,24 @@ esp_err_t pm_manager_init(void)
     }
 
     ESP_LOGI(TAG, "初始化电源管理...");
-
-#if PM_DFS_SUPPORTED
-    // 启用DFS（动态频率调节），最小80MHz，最大160MHz
-    esp_pm_config_t pm_cfg = {
-        .max_freq_mhz = 160,
-        .min_freq_mhz = 80,
-        .light_sleep_enable = false,
-    };
-    esp_err_t ret = esp_pm_configure(&pm_cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "电源管理配置失败: %s", esp_err_to_name(ret));
-    }
-
-    // 创建CPU频率锁（用于强制保持160MHz）
-    esp_pm_lock_handle_t lock_handle = NULL;
-    ret = esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "cpu_freq", &lock_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "CPU频率锁创建失败: %s", esp_err_to_name(ret));
-    }
-#else
-    // ESP32-C3不支持DFS，跳过配置
-    ESP_LOGI(TAG, "ESP32-C3不支持DFS动态频率调节");
-#endif
+    ESP_LOGI(TAG, "ESP32-C3不支持DFS，CPU固定160MHz");
 
     taskENTER_CRITICAL(&pm_spinlock);
-#if PM_DFS_SUPPORTED
-    s_ctx.cpu_freq_lock = lock_handle;
-#else
-    s_ctx.cpu_freq_lock = NULL;  // ESP32-C3不支持PM锁
-#endif
-    s_ctx.cpu_lock_acquired = false;
-    s_ctx.current_wifi_tx_power = 80;  // 20dBm
+    s_ctx.current_wifi_tx_power = 80;  // 20dBm (80 * 0.25 = 20)
     s_ctx.wifi_tx_adjusted = false;
     s_ctx.initialized = true;
     taskEXIT_CRITICAL(&pm_spinlock);
 
-#if PM_DFS_SUPPORTED
-    ESP_LOGI(TAG, "电源管理已启用: DFS 80MHz~160MHz, WiFi TX初始20dBm");
-#else
-    ESP_LOGI(TAG, "电源管理已启用: WiFi TX初始20dBm (DFS不支持)");
-#endif
+    ESP_LOGI(TAG, "电源管理已启用: WiFi TX初始20dBm");
     return ESP_OK;
 }
 
 esp_err_t pm_manager_set_cpu_mode(bool low_power)
 {
-#if !PM_DFS_SUPPORTED
-    // ESP32-C3不支持DFS，直接返回成功
+    // ESP32-C3不支持DFS动态频率调节，CPU固定160MHz
+    // 此函数保留接口兼容性，但不执行任何操作
     (void)low_power;
     return ESP_OK;
-#endif
-
-    taskENTER_CRITICAL(&pm_spinlock);
-    if (!s_ctx.initialized || s_ctx.cpu_freq_lock == NULL) {
-        taskEXIT_CRITICAL(&pm_spinlock);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // 检查当前锁状态，避免无效操作
-    bool need_acquire = (!low_power && !s_ctx.cpu_lock_acquired);
-    bool need_release = (low_power && s_ctx.cpu_lock_acquired);
-
-    if (!need_acquire && !need_release) {
-        // 当前状态已符合目标，无需切换
-        taskEXIT_CRITICAL(&pm_spinlock);
-        return ESP_OK;
-    }
-    taskEXIT_CRITICAL(&pm_spinlock);
-
-    // 在临界区外执行锁操作（PM锁API可能阻塞）
-    esp_err_t ret;
-    if (need_acquire) {
-        // 持有锁，强制保持160MHz
-        ret = esp_pm_lock_acquire(s_ctx.cpu_freq_lock);
-        if (ret == ESP_OK) {
-            taskENTER_CRITICAL(&pm_spinlock);
-            s_ctx.cpu_lock_acquired = true;
-            taskEXIT_CRITICAL(&pm_spinlock);
-            ESP_LOGD(TAG, "CPU频率升至160MHz（高性能模式）");
-        }
-    } else {
-        // 释放锁，让DFS自动降到80MHz
-        ret = esp_pm_lock_release(s_ctx.cpu_freq_lock);
-        if (ret == ESP_OK) {
-            taskENTER_CRITICAL(&pm_spinlock);
-            s_ctx.cpu_lock_acquired = false;
-            taskEXIT_CRITICAL(&pm_spinlock);
-            ESP_LOGD(TAG, "CPU频率降至80MHz（低功耗模式）");
-        }
-    }
-
-    return ret;
 }
 
 // ==================== WiFi TX功率 ====================
@@ -223,9 +138,7 @@ esp_err_t pm_manager_check_heap(void)
     if (free_heap < 15360) {
         ESP_LOGE(TAG, "堆内存严重不足! 可用=%u bytes, 历史最低=%u bytes, 即将重启",
                  (unsigned)free_heap, (unsigned)min_ever_heap);
-        // 内存过低时跳过NVS保存，直接重启（避免保存操作进一步消耗内存）
         esp_restart();
-        // 不会执行到这里
         return ESP_ERR_NO_MEM;
     }
 

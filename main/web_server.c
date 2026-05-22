@@ -269,9 +269,10 @@ static const char html_admin_page[] =
 "<button class='btn btn-primary' onclick='normalFlush()'>常规冲洗</button>"
 "<button class='btn btn-info' onclick='pureFlush()'>纯水洗膜</button>"
 "<button class='btn btn-warning' onclick='filterFlush()'>换芯冲洗</button>"
-"<button class='btn btn-dark' onclick='goStandby()'>待机</button>"
-"<button class='btn btn-success' onclick='resetStop()'>复位</button>"
 "<button class='btn btn-danger' onclick='shutdown()'>停止</button>"
+"<button class='btn btn-success' onclick='resetStop()'>复位</button>"
+"<button class='btn btn-dark' onclick='goStandby()'>待机</button>"
+"<button class='btn btn-danger' onclick='reboot()'>重启</button>"
 "</div></div>"
 
 "<div class='card'><h3>滤芯管理</h3>"
@@ -404,6 +405,7 @@ static const char html_admin_page[] =
 "function resetStop(){api('/api/control',{action:'reset'}).then(d=>alert(d.status||'已执行'))}"
 "function goStandby(){api('/api/control',{action:'standby'}).then(d=>alert(d.status||'已执行'))}"
 "function shutdown(){api('/api/control',{action:'shutdown'}).then(d=>alert(d.status||'已执行'))}"
+"function reboot(){if(confirm('确认重启设备？重启期间服务将暂时中断。')){api('/api/control',{action:'reboot'}).then(d=>alert(d.status||'重启中...'))}}"
 "function resetFilter(i){if(confirm('确认重置该滤芯？')){api('/api/filter/reset',{filter:i}).then(d=>{alert(d.filter_name+' 已重置');loadFilters()})}}"
 "function saveFilterCaps(){api('/api/filter/capacity',{caps:[parseInt($('cap0').value),parseInt($('cap1').value),parseInt($('cap2').value),parseInt($('cap3').value),parseInt($('cap4').value)],times:[parseInt($('time0').value),parseInt($('time1').value),parseInt($('time2').value),parseInt($('time3').value),parseInt($('time4').value)]}).then(d=>alert(d.status||'已保存'))}"
 "function saveConfig(){api('/api/config',{normalFlushDur:parseInt($('normalFlushDur').value),pureFlushDur:parseInt($('pureFlushDur').value),filterFlushDur:parseInt($('filterFlushDur').value)*60,prodTimeout:parseInt($('prodTimeout').value)*60,leakConfirm:parseInt($('leakConfirm').value),saveInterval:parseInt($('saveInterval').value),relayLevel:parseInt($('relayLevel').value),tdsInTh:parseFloat($('tdsInTh').value),tdsOutTh:parseFloat($('tdsOutTh').value),whValveOpen:parseInt($('whValveOpen').value),whPumpStop:parseInt($('whPumpStop').value),whValveClose:parseInt($('whValveClose').value)}).then(d=>alert(d.status||'已保存'))}"
@@ -714,10 +716,11 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
 
     // 逐行读取并输出
     uint32_t read_pos = s_log_tail;
+    uint32_t head = s_log_head;  // 快照避免竞态条件
     char line_buf[300];
     int line_len = 0;
 
-    while (read_pos != s_log_head) {
+    while (read_pos != head) {
         char c = s_log_buf[read_pos];
         read_pos = (read_pos + 1) % LOG_BUF_SIZE;
 
@@ -789,7 +792,8 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
                         // 找到右括号后的位置
                         int paren_end = 2; // 从 '(' 位置开始找
                         while (paren_end < line_len && line_buf[paren_end] != ')') paren_end++;
-                        if (paren_end < line_len) {
+                        if (paren_end < line_len && paren_end + 3 < line_len) {
+                            // 确保括号后至少有3个字符（空格+TAG首字母+冒号）
                             // 输出级别标记
                             buf[pos++] = lvl;        // 级别
                             buf[pos++] = ' ';        // 空格
@@ -797,7 +801,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
                             content_start = paren_end + 1;
                             if (content_start < line_len && line_buf[content_start] == ' ') content_start++;
                         } else {
-                            content_start = 0; // 无法解析，输出完整行
+                            content_start = 0; // 无法解析或内容不足，输出完整行
                         }
                     }
 
@@ -1064,6 +1068,15 @@ static esp_err_t handle_control(httpd_req_t *req)
     else if (strcmp(a, "reset") == 0) fsm_clear_stop();
     else if (strcmp(a, "standby") == 0) fsm_manual_go_standby();
     else if (strcmp(a, "shutdown") == 0) fsm_manual_shutdown();
+    else if (strcmp(a, "reboot") == 0) {
+        ESP_LOGI(TAG, "用户请求重启设备");
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"重启中...\"}");
+        vTaskDelay(pdMS_TO_TICKS(100));  // 等待HTTP响应完成
+        esp_restart();
+        return ESP_OK;  // 不会执行到这里
+    }
     else {
         cJSON_Delete(root);
         httpd_resp_set_type(req, "application/json");
