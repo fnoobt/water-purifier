@@ -125,6 +125,9 @@ static struct {
     // runtime_data访问互斥锁（保护uint64_t字段的原子读取）
     SemaphoreHandle_t runtime_data_mutex;
 
+    // 状态转换日志用的冲洗时间（解决flush_start_time被清零/重置的问题）
+    uint32_t pending_flush_duration_sec;
+
     // 回调
     fsm_state_callback_t state_callback;} fsm_ctx = {0};
 
@@ -286,15 +289,21 @@ static void transition_to_pure_flush(void)
 
     // 冲洗时长已在execute_normal_flush中统计，此处无需重复
 
-    // 重置flush_start_time，纯水洗膜阶段重新计时
-    fsm_ctx.flush_start_time = esp_timer_get_time();
+    // 保存常规冲洗时间供transition_to日志使用
+    if (fsm_ctx.flush_start_time > 0) {
+        fsm_ctx.pending_flush_duration_sec = (uint32_t)get_elapsed_sec(fsm_ctx.flush_start_time);
+    } else {
+        fsm_ctx.pending_flush_duration_sec = 0;
+    }
 
     gpio_driver_set_boost_pump(false);   // 先停泵
 
-    // 先切换状态（transition_to会重置current_phase），再设置水锤过渡阶段
+    // 先切换状态（transition_to会输出日志使用pending_flush_duration_sec）
     transition_to(FSM_STATE_PURE_FLUSH);
     fsm_ctx.current_phase = FLUSH_PHASE_STOP_PUMP;
     fsm_ctx.phase_start_time = esp_timer_get_time();
+    // 纯水洗膜阶段重新计时（在transition_to之后，不影响日志输出）
+    fsm_ctx.flush_start_time = esp_timer_get_time();
     ESP_LOGD(TAG, "已进入纯水洗膜状态，水锤过渡阶段：停泵延时");
 }
 
@@ -426,12 +435,9 @@ static void transition_to(fsm_state_t new_state)
 
     /* 常规冲洗 -> 纯水洗膜：包含冲洗时长 */
     if (new_state == FSM_STATE_PURE_FLUSH && old_state == FSM_STATE_NORMAL_FLUSH) {
-        uint64_t flush_sec = 0;
-        if (fsm_ctx.flush_start_time > 0) {
-            flush_sec = get_elapsed_sec(fsm_ctx.flush_start_time);
-        }
         ESP_LOGI(TAG, "状态转换: 常规冲洗(%lu秒) -> 纯水洗膜",
-                 (uint32_t)flush_sec);
+                 fsm_ctx.pending_flush_duration_sec);
+        fsm_ctx.pending_flush_duration_sec = 0;  // 清除临时变量
         if (fsm_ctx.state_callback) {
             fsm_ctx.state_callback(old_state, new_state);
         }
@@ -440,12 +446,9 @@ static void transition_to(fsm_state_t new_state)
 
     /* 纯水洗膜 -> 待机：包含洗膜时长 */
     if (new_state == FSM_STATE_STANDBY && old_state == FSM_STATE_PURE_FLUSH) {
-        uint64_t flush_sec = 0;
-        if (fsm_ctx.flush_start_time > 0) {
-            flush_sec = get_elapsed_sec(fsm_ctx.flush_start_time);
-        }
         ESP_LOGI(TAG, "状态转换: 纯水洗膜(%lu秒) -> 待机",
-                 (uint32_t)flush_sec);
+                 fsm_ctx.pending_flush_duration_sec);
+        fsm_ctx.pending_flush_duration_sec = 0;  // 清除临时变量
         if (fsm_ctx.state_callback) {
             fsm_ctx.state_callback(old_state, new_state);
         }
@@ -759,6 +762,10 @@ static void execute_pure_flush(void)
                 fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
                 history_increment_daily_flush();
                 fsm_ctx.runtime_dirty = true;
+                // 保存纯水洗膜时间供transition_to日志使用
+                fsm_ctx.pending_flush_duration_sec = (uint32_t)pure_flush_sec;
+            } else {
+                fsm_ctx.pending_flush_duration_sec = 0;
             }
             fsm_ctx.flush_start_time = 0;
 

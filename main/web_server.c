@@ -590,6 +590,8 @@ static const char html_log_page[] =
 "<option value='30'>30秒</option>"
 "</select>"
 "<button id='refreshBtn' style='padding:8px 16px;border-radius:8px;background:#667eea;color:#fff;border:none;cursor:pointer;font-size:14px'>刷新</button>"
+"<button id='scrollTopBtn' style='padding:8px 12px;border-radius:8px;background:#28a745;color:#fff;border:none;cursor:pointer;font-size:14px'>↑顶部</button>"
+"<button id='scrollBottomBtn' style='padding:8px 12px;border-radius:8px;background:#17a2b8;color:#fff;border:none;cursor:pointer;font-size:14px'>↓底部</button>"
 "</div>"
 "<div id='logContent'>加载中...</div>"
 "</div>"
@@ -629,6 +631,8 @@ static const char html_log_page[] =
 "startRefresh();"
 "});"
 "document.getElementById('refreshBtn').addEventListener('click',fetchLogs);"
+"document.getElementById('scrollTopBtn').addEventListener('click',function(){var el=document.getElementById('logContent');if(el)el.scrollTop=0});"
+"document.getElementById('scrollBottomBtn').addEventListener('click',function(){var el=document.getElementById('logContent');if(el)el.scrollTop=el.scrollHeight});"
 "fetchLogs();"
 "startRefresh();"
 "</script></body></html>";
@@ -866,7 +870,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     // ==================== 第一阶段：逆向扫描（记录每行位置）====================
     // 不进行估算，直接在第二阶段正向输出边写入边检查
 
-    #define MAX_LOG_LINES 200  // 最多记录200行位置
+    #define MAX_LOG_LINES 300  // 最多记录300行位置
     static uint32_t line_starts[MAX_LOG_LINES];  // 每行的起始位置
     int line_count = 0;
     uint32_t scan_pos = head;

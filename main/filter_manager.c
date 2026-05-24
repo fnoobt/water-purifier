@@ -223,8 +223,8 @@ static void load_from_nvs(void)
     fctx.filter_install_time = fctx.filters[FILTER_RO_MEMBRANE].last_reset_time;
 
     nvs_close(handle);
-    ESP_LOGI(TAG, "滤芯数据已加载: 总用水%luL, RO已用%luL, 累加器pre=%lumL post=%lumL",
-             fctx.total_water_used, fctx.filters[FILTER_RO_MEMBRANE].used_liters,
+    ESP_LOGI(TAG, "滤芯数据已加载: 总用水%luL, 总制水%luL, RO换后已制水%luL, 累加器pre=%lumL post=%lumL",
+             fctx.total_water_used, fctx.total_production_water, fctx.filters[FILTER_RO_MEMBRANE].used_liters,
              fctx.pre_pump_accumulator_ml, fctx.post_pump_accumulator_ml);
 }
 
