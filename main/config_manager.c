@@ -18,7 +18,162 @@ static const char *TAG = "CONFIG";
 // ==================== NVS命名空间 ====================
 
 #define NVS_NAMESPACE "water_purifier"
-#define NVS_RUNTIME_NAMESPACE "wp_rt"
+
+// ==================== NVS迁移 ====================
+
+/**
+ * @brief 迁移旧NVS命名空间到统一结构
+ * @note 仅在首次启动时执行，检测到旧命名空间后迁移并删除
+ */
+static void config_manager_migrate_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err;
+    bool migrated = false;
+
+    // 1. 迁移wifi命名空间 → water_purifier
+    err = nvs_open("wifi", NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        char ssid[33] = {0};
+        char pass[65] = {0};
+        size_t len = sizeof(ssid);
+        bool has_wifi = (nvs_get_str(handle, "ssid", ssid, &len) == ESP_OK && strlen(ssid) > 0);
+        len = sizeof(pass);
+        nvs_get_str(handle, "pass", pass, &len);
+
+        nvs_close(handle);
+
+        if (has_wifi) {
+            // 写入water_purifier命名空间
+            nvs_handle_t wp_handle;
+            if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &wp_handle) == ESP_OK) {
+                nvs_set_str(wp_handle, "wifi_ssid", ssid);
+                nvs_set_str(wp_handle, "wifi_pass", pass);
+                nvs_commit(wp_handle);
+                nvs_close(wp_handle);
+                ESP_LOGI(TAG, "迁移WiFi配置: %s", ssid);
+                migrated = true;
+            }
+        }
+
+        // 删除旧wifi命名空间（v6.0: 打开后擦除全部）
+        nvs_handle_t erase_handle;
+        if (nvs_open("wifi", NVS_READWRITE, &erase_handle) == ESP_OK) {
+            nvs_erase_all(erase_handle);
+            nvs_commit(erase_handle);
+            nvs_close(erase_handle);
+        }
+        ESP_LOGI(TAG, "已删除旧wifi命名空间");
+    }
+
+    // 2. 迁移mqtt_config命名空间 → water_purifier
+    err = nvs_open("mqtt_config", NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        char broker[128] = {0};
+        char user[64] = {0};
+        char pass[64] = {0};
+        char topic[64] = {0};
+        size_t len;
+
+        len = sizeof(broker);
+        bool has_mqtt = (nvs_get_str(handle, "broker_uri", broker, &len) == ESP_OK && strlen(broker) > 0);
+        len = sizeof(user);
+        nvs_get_str(handle, "username", user, &len);
+        len = sizeof(pass);
+        nvs_get_str(handle, "password", pass, &len);
+        len = sizeof(topic);
+        nvs_get_str(handle, "topic_prefix", topic, &len);
+
+        nvs_close(handle);
+
+        if (has_mqtt) {
+            nvs_handle_t wp_handle;
+            if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &wp_handle) == ESP_OK) {
+                nvs_set_str(wp_handle, "mqtt_broker", broker);
+                nvs_set_str(wp_handle, "mqtt_user", user);
+                nvs_set_str(wp_handle, "mqtt_pass", pass);
+                nvs_set_str(wp_handle, "mqtt_topic", topic);
+                nvs_set_u8(wp_handle, "mqtt_en", 1);
+                nvs_commit(wp_handle);
+                nvs_close(wp_handle);
+                ESP_LOGI(TAG, "迁移MQTT配置: %s", broker);
+                migrated = true;
+            }
+        }
+
+        // 删除旧mqtt_config命名空间（v6.0: 打开后擦除全部）
+        nvs_handle_t erase_handle;
+        if (nvs_open("mqtt_config", NVS_READWRITE, &erase_handle) == ESP_OK) {
+            nvs_erase_all(erase_handle);
+            nvs_commit(erase_handle);
+            nvs_close(erase_handle);
+        }
+        ESP_LOGI(TAG, "已删除旧mqtt_config命名空间");
+    }
+
+    // 3. 迁移wp_rt命名空间 → wp_filters（仅total_water）
+    err = nvs_open("wp_rt", NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        uint32_t total_water = 0;
+        if (nvs_get_u32(handle, "total_water", &total_water) == ESP_OK && total_water > 0) {
+            // 写入wp_filters命名空间
+            nvs_handle_t filter_handle;
+            if (nvs_open("wp_filters", NVS_READWRITE, &filter_handle) == ESP_OK) {
+                // 检查wp_filters是否已有total_water，避免覆盖新数据
+                uint32_t existing_water = 0;
+                if (nvs_get_u32(filter_handle, "total_water", &existing_water) != ESP_OK || existing_water == 0) {
+                    nvs_set_u32(filter_handle, "total_water", total_water);
+                    nvs_commit(filter_handle);
+                    ESP_LOGI(TAG, "迁移总用水量: %lu升", total_water);
+                    migrated = true;
+                }
+                nvs_close(filter_handle);
+            }
+        }
+        nvs_close(handle);
+
+        // 删除旧wp_rt命名空间（v6.0: 打开后擦除全部）
+        nvs_handle_t erase_handle;
+        if (nvs_open("wp_rt", NVS_READWRITE, &erase_handle) == ESP_OK) {
+            nvs_erase_all(erase_handle);
+            nvs_commit(erase_handle);
+            nvs_close(erase_handle);
+        }
+        ESP_LOGI(TAG, "已删除旧wp_rt命名空间");
+    }
+
+    // 4. 清理water_purifier中的废弃字段
+    err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        // 检查废弃键是否存在（读取后不使用，仅检测存在性）
+        uint32_t deprecated_val;
+        bool has_deprecated = false;
+
+        if (nvs_get_u32(handle, "flush_dur", &deprecated_val) == ESP_OK) {
+            has_deprecated = true;
+        }
+        if (nvs_get_u32(handle, "filter_cap", &deprecated_val) == ESP_OK) {
+            has_deprecated = true;
+        }
+        nvs_close(handle);
+
+        if (has_deprecated) {
+            nvs_handle_t wp_handle;
+            if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &wp_handle) == ESP_OK) {
+                nvs_erase_key(wp_handle, "flush_dur");
+                nvs_erase_key(wp_handle, "filter_cap");
+                nvs_commit(wp_handle);
+                nvs_close(wp_handle);
+                ESP_LOGI(TAG, "已清理废弃字段(flush_dur, filter_cap)");
+                migrated = true;
+            }
+        }
+    }
+
+    if (migrated) {
+        ESP_LOGI(TAG, "NVS迁移完成，旧数据已统一到新结构");
+    }
+}
 
 // ==================== 辅助函数 ====================
 
@@ -50,7 +205,6 @@ static bool config_equal(const system_config_t *a, const system_config_t *b)
     if (a->waste_valve_flow_cc != b->waste_valve_flow_cc) return false;
 
     // 系统参数
-    if (a->flush_duration_sec != b->flush_duration_sec) return false;
     if (a->production_timeout_sec != b->production_timeout_sec) return false;
     if (a->leak_confirm_time_sec != b->leak_confirm_time_sec) return false;
     if (a->runtime_save_interval_min != b->runtime_save_interval_min) return false;
@@ -75,9 +229,6 @@ static bool config_equal(const system_config_t *a, const system_config_t *b)
     if (fabs(a->tds_calibration_scale[0] - b->tds_calibration_scale[0]) > 0.0001f) return false;
     if (fabs(a->tds_calibration_scale[1] - b->tds_calibration_scale[1]) > 0.0001f) return false;
 
-    // 滤芯配置
-    if (a->filter_capacity_liters != b->filter_capacity_liters) return false;
-
     // Web配置
     if (a->web_port != b->web_port) return false;
     if (a->web_auth_enabled != b->web_auth_enabled) return false;
@@ -101,7 +252,6 @@ static const system_config_t default_config = {
     .pump_type = 1,                      // 三角洲75G
     .tank_size = 0,                      // 3G
     .waste_valve_flow_cc = 300,          // 300CC (18L/h)
-    .flush_duration_sec = 30,              // @deprecated 遗留字段，请使用 normal_flush_duration_sec
     .production_timeout_sec = 3 * 3600,    // 3小时
     .leak_confirm_time_sec = 5,            // 5秒（漏水确认时间）
     .runtime_save_interval_min = 120,      // 2小时（默认保存间隔）
@@ -119,7 +269,6 @@ static const system_config_t default_config = {
     .tds_outlet_threshold = 100.0f,        // 出水100ppm
     .tds_calibration_offset = {0.0f, 0.0f},
     .tds_calibration_scale = {1.0f, 1.0f},
-    .filter_capacity_liters = 3000,        // 3000升
     .web_port = 80,
     .web_auth_enabled = false,
     .web_username = "admin",
@@ -161,6 +310,9 @@ esp_err_t config_manager_init(void)
         ESP_LOGE(TAG, "NVS初始化失败: %s", esp_err_to_name(ret));
         return ret;
     }
+
+    // 执行NVS迁移（将旧命名空间数据统一到新结构）
+    config_manager_migrate_nvs();
 
     // 创建互斥锁（保护config和dirty标志）
     ctx.mutex = xSemaphoreCreateMutex();
@@ -274,11 +426,7 @@ esp_err_t config_manager_load(void)
         strlcpy(ctx.config.mqtt_topic_prefix, str_buf, sizeof(ctx.config.mqtt_topic_prefix));
     }
 
-    // 系统参数（添加错误检查，失败时保留默认值）
-    err = nvs_get_u32(handle, "flush_dur", &ctx.config.flush_duration_sec);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "读取flush_dur失败: %s", esp_err_to_name(err));
-    }
+    // 系统参数
     err = nvs_get_u32(handle, "prod_timeout", &ctx.config.production_timeout_sec);
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGW(TAG, "读取prod_timeout失败: %s", esp_err_to_name(err));
@@ -362,12 +510,6 @@ esp_err_t config_manager_load(void)
     }
     if (nvs_get_i32(handle, "tds_out_scale", &i32_val) == ESP_OK) {
         ctx.config.tds_calibration_scale[1] = i32_val / 10000.0f;
-    }
-
-    // 滤芯容量
-    err = nvs_get_u32(handle, "filter_cap", &ctx.config.filter_capacity_liters);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "读取filter_cap失败: %s", esp_err_to_name(err));
     }
 
     // Web配置（添加错误检查）
@@ -460,7 +602,6 @@ esp_err_t config_manager_save(void)
     nvs_set_str(handle, "mqtt_topic", config_copy.mqtt_topic_prefix);
 
     // 系统参数
-    nvs_set_u32(handle, "flush_dur", config_copy.flush_duration_sec);
     nvs_set_u32(handle, "prod_timeout", config_copy.production_timeout_sec);
     nvs_set_u32(handle, "leak_confirm", config_copy.leak_confirm_time_sec);
 
@@ -488,9 +629,6 @@ esp_err_t config_manager_save(void)
     nvs_set_i32(handle, "tds_out_off", (int32_t)(config_copy.tds_calibration_offset[1] * 100.0f));
     nvs_set_i32(handle, "tds_in_scale", (int32_t)(config_copy.tds_calibration_scale[0] * 10000.0f));
     nvs_set_i32(handle, "tds_out_scale", (int32_t)(config_copy.tds_calibration_scale[1] * 10000.0f));
-
-    // 滤芯容量
-    nvs_set_u32(handle, "filter_cap", config_copy.filter_capacity_liters);
 
     // Web配置
     nvs_set_u16(handle, "web_port", config_copy.web_port);
@@ -558,74 +696,6 @@ esp_err_t config_manager_factory_reset(void)
         }
     }
     return err;  // 返回实际错误状态
-}
-
-// ==================== 运行数据持久化 ====================
-
-// 上次保存的运行数据，用于脏检查
-static runtime_data_t s_last_saved_runtime = {0};
-static bool s_runtime_data_initialized = false;
-
-esp_err_t config_manager_save_runtime_data(const runtime_data_t *data)
-{
-    if (!data) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // 脏检查：数据未变化则跳过写入
-    if (s_runtime_data_initialized &&
-        memcmp(data, &s_last_saved_runtime, sizeof(runtime_data_t)) == 0) {
-        return ESP_OK;
-    }
-
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_RUNTIME_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "NVS运行时数据打开失败: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    nvs_set_u32(handle, "prod_cycles", data->total_production_cycles);
-    nvs_set_u32(handle, "flush_cycles", data->total_flush_cycles);
-    nvs_set_u64(handle, "prod_time", data->total_production_time_sec);
-    nvs_set_u64(handle, "flush_time", data->total_flush_time_sec);
-    nvs_set_u32(handle, "total_water", data->total_water_used);
-    nvs_set_u32(handle, "prod_water", data->total_production_water);
-
-    err = nvs_commit(handle);
-    nvs_close(handle);
-
-    if (err == ESP_OK) {
-        s_last_saved_runtime = *data;
-        s_runtime_data_initialized = true;
-        ESP_LOGD(TAG, "运行数据已保存");
-    }
-    return err;
-}
-
-esp_err_t config_manager_load_runtime_data(runtime_data_t *data)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_RUNTIME_NAMESPACE, NVS_READONLY, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGI(TAG, "NVS中无运行数据，使用默认值");
-        memset(data, 0, sizeof(runtime_data_t));
-        return ESP_OK;
-    }
-
-    nvs_get_u32(handle, "prod_cycles", &data->total_production_cycles);
-    nvs_get_u32(handle, "flush_cycles", &data->total_flush_cycles);
-    nvs_get_u64(handle, "prod_time", &data->total_production_time_sec);
-    nvs_get_u64(handle, "flush_time", &data->total_flush_time_sec);
-    nvs_get_u32(handle, "total_water", &data->total_water_used);
-    nvs_get_u32(handle, "prod_water", &data->total_production_water);
-
-    nvs_close(handle);
-
-    ESP_LOGI(TAG, "运行数据已加载: 制水%lu次, 冲洗%lu次, 总水%luL, 制水%luL",
-             data->total_production_cycles, data->total_flush_cycles,
-             data->total_water_used, data->total_production_water);
-    return ESP_OK;
 }
 
 // ==================== 配置获取和设置 ====================
@@ -832,7 +902,6 @@ static void update_config_int_from_key(const char *key, int value, bool *changed
     UPDATE_U8_FIELD(pump_type);
     UPDATE_U8_FIELD(tank_size);
     UPDATE_U16_FIELD(waste_valve_flow_cc);
-    UPDATE_U32_FIELD(flush_duration_sec);
     UPDATE_U32_FIELD(production_timeout_sec);
     UPDATE_U32_FIELD(leak_confirm_time_sec);
     UPDATE_U32_FIELD(normal_flush_duration_sec);
@@ -844,7 +913,6 @@ static void update_config_int_from_key(const char *key, int value, bool *changed
     UPDATE_U32_FIELD(water_hammer_valve_close_delay_ms);
     UPDATE_U8_FIELD(relay_trigger_level);
     UPDATE_U16_FIELD(runtime_save_interval_min);
-    UPDATE_U32_FIELD(filter_capacity_liters);
     UPDATE_U16_FIELD(web_port);
 
 #undef UPDATE_U8_FIELD
@@ -1004,9 +1072,6 @@ bool config_manager_validate(const system_config_t *config)
     }
 
     // 验证时间参数
-    if (config->flush_duration_sec < 10 || config->flush_duration_sec > 600) {
-        return false;
-    }
     if (config->production_timeout_sec < 600 || config->production_timeout_sec > 86400) {
         return false;
     }
@@ -1170,12 +1235,14 @@ void config_manager_print_config(void)
              ro_names[ctx.config.ro_membrane_type],
              pump_names[ctx.config.pump_type],
              tank_names[ctx.config.tank_size]);
-    ESP_LOGI(TAG, "冲洗时间: %lu秒", ctx.config.flush_duration_sec);
+    ESP_LOGI(TAG, "冲洗: 常规%lu秒/纯水%lu秒/换芯%lu秒",
+             ctx.config.normal_flush_duration_sec,
+             ctx.config.pure_flush_duration_sec,
+             ctx.config.filter_flush_duration_sec);
     ESP_LOGI(TAG, "制水超时: %lu秒", ctx.config.production_timeout_sec);
     ESP_LOGI(TAG, "漏水确认: %lu秒", ctx.config.leak_confirm_time_sec);
     ESP_LOGI(TAG, "继电平: %s", ctx.config.relay_trigger_level ? "高" : "低");
     ESP_LOGI(TAG, "TDS阈值: 进水%.0f/出水%.0f ppm",
              ctx.config.tds_inlet_threshold, ctx.config.tds_outlet_threshold);
-    ESP_LOGI(TAG, "滤芯容量: %lu升", ctx.config.filter_capacity_liters);
     ESP_LOGI(TAG, "===================");
 }

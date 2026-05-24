@@ -47,3 +47,6 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # Task stack sizes (keep original)
 CONFIG_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# Enable OTA rollback support (auto-convert NEW to PENDING_VERIFY)
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

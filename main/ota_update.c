@@ -69,9 +69,30 @@ esp_err_t ota_update_init(void)
             }
         } else if (img_state == ESP_OTA_IMG_VALID) {
             ESP_LOGD(TAG, "当前固件状态: 已验证有效");
+        } else if (img_state == ESP_OTA_IMG_NEW) {
+            // NEW状态：rollback未启用时会出现，尝试标记为有效
+            ESP_LOGW(TAG, "固件状态为NEW（rollback未启用？），尝试标记有效...");
+            esp_err_t mark_err = esp_ota_mark_app_valid_cancel_rollback();
+            if (mark_err == ESP_OK) {
+                ESP_LOGI(TAG, "NEW状态已标记为有效");
+            } else if (mark_err == ESP_ERR_NOT_SUPPORTED) {
+                ESP_LOGW(TAG, "NEW状态无法直接标记，需启用CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE");
+            } else {
+                ESP_LOGW(TAG, "标记失败: %s", esp_err_to_name(mark_err));
+            }
         } else {
-            ESP_LOGD(TAG, "当前固件OTA状态: %d", img_state);
+            // 其他异常状态（INVALID/ABORTED/未知）
+            ESP_LOGW(TAG, "当前固件OTA状态异常: %d，尝试标记为有效...", img_state);
+            esp_err_t mark_err = esp_ota_mark_app_valid_cancel_rollback();
+            if (mark_err == ESP_OK) {
+                ESP_LOGI(TAG, "固件已强制标记为有效");
+            } else {
+                ESP_LOGW(TAG, "强制标记有效失败: %s", esp_err_to_name(mark_err));
+            }
         }
+    } else {
+        ESP_LOGW(TAG, "读取OTA状态失败: %s，尝试标记为有效...", esp_err_to_name(state_err));
+        esp_ota_mark_app_valid_cancel_rollback();  // 尝试修复
     }
 
     const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);

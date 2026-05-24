@@ -39,7 +39,6 @@ typedef struct {
     uint16_t waste_valve_flow_cc;     // 废水阀流量 (CC=mL/min), 默认300
 
     // 系统参数
-    uint32_t flush_duration_sec;        // @deprecated 遗留字段，请使用 normal_flush_duration_sec
     uint32_t production_timeout_sec;    // 制水超时时间（秒），默认3小时
     uint32_t leak_confirm_time_sec;     // 漏水确认时间（秒），默认5秒
     uint16_t runtime_save_interval_min;  // 运行数据保存间隔（分钟），默认120
@@ -61,9 +60,6 @@ typedef struct {
     float tds_outlet_threshold;         // 出水TDS报警阈值
     float tds_calibration_offset[2];    // TDS校准偏移量（进水、出水）
     float tds_calibration_scale[2];     // TDS校准比例系数（进水、出水）
-
-    // 滤芯配置
-    uint32_t filter_capacity_liters;    // 滤芯容量（升）
 
     // Web服务器配置
     uint16_t web_port;
@@ -175,27 +171,6 @@ esp_err_t config_manager_get_bool(const char *key, bool *value);
  * @return ESP_OK 成功
  */
 esp_err_t config_manager_set_bool(const char *key, bool value);
-
-// ==================== 运行数据持久化 ====================
-
-typedef struct {
-    uint32_t total_production_cycles;
-    uint32_t total_flush_cycles;
-    uint64_t total_production_time_sec;
-    uint64_t total_flush_time_sec;
-    uint32_t total_water_used;
-    uint32_t total_production_water;
-} runtime_data_t;
-
-/**
- * @brief 保存运行数据到NVS
- */
-esp_err_t config_manager_save_runtime_data(const runtime_data_t *data);
-
-/**
- * @brief 从NVS加载运行数据
- */
-esp_err_t config_manager_load_runtime_data(runtime_data_t *data);
 
 // ==================== 统一保存接口 ====================
 

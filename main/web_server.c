@@ -20,7 +20,10 @@
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_random.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
+#include "mbedtls/base64.h"
 #include <string.h>
 #include <time.h>
 #include <stdbool.h>
@@ -58,6 +61,16 @@ static uint64_t s_last_control_time = 0;     // 上次控制操作时间
 static uint64_t s_last_wifi_scan_time = 0;   // 上次WiFi扫描时间
 #define CONTROL_DEBOUNCE_MS 1000             // 控制按钮防抖间隔（1秒）
 #define WIFI_SCAN_DEBOUNCE_MS 5000           // WiFi扫描防抖间隔（5秒）
+
+// ==================== Basic Auth + Session ====================
+
+#define SESSION_TIMEOUT_SEC 86400  // Session有效期24小时
+
+static struct {
+    char token[33];           // hex session token (32 chars + null)
+    uint64_t create_time_us;  // 创建时间
+    bool valid;               // 是否有效
+} session_ctx = {.valid = false};
 
 // ==================== 日志拦截器 ====================
 
@@ -316,7 +329,7 @@ static const char html_admin_page[] =
 "<div class='form-row'><label>换芯冲洗时间 (分钟)</label><input type='number' id='filterFlushDur' value='60'></div>"
 "<div class='form-row'><label>制水超时 (分钟)</label><input type='number' id='prodTimeout' value='180'></div>"
 "<div class='form-row'><label>漏水确认 (秒)</label><input type='number' id='leakConfirm' value='5'></div>"
-"<div class='form-row'><label>Flash保存周期</label><select id='saveInterval'><option value='10'>10分钟</option><option value='60'>1小时</option><option value='120'>2小时 (推荐)</option><option value='360'>6小时</option><option value='720'>12小时</option><option value='1440'>24小时</option></select></div>"
+"<div class='form-row'><label>Flash保存周期</label><select id='saveInterval'><option value='10'>10分钟</option><option value='60'>1小时</option><option value='120'>2小时 (默认)</option><option value='240'>4小时</option><option value='360'>6小时</option><option value='720'>12小时</option><option value='1440'>24小时</option></select></div>"
 "<div class='form-row'><label>继电器触发电平</label><select id='relayLevel'><option value='0'>低电平触发</option><option value='1'>高电平触发</option></select></div>"
 "<div class='form-row'><label>TDS进水阈值 (ppm)</label><input type='number' id='tdsInTh' value='500'></div>"
 "<div class='form-row'><label>TDS出水阈值 (ppm)</label><input type='number' id='tdsOutTh' value='50'></div>"
@@ -370,6 +383,14 @@ static const char html_admin_page[] =
 "<div class='btn-group'><button class='btn btn-primary' onclick='saveMQTT()'>保存MQTT配置</button></div>"
 "</div>"
 
+"<div class='card'><h3>Web认证配置</h3>"
+"<p style='color:#888;font-size:12px;margin-bottom:10px'>启用后，管理页面、OTA升级、系统日志需要登录认证。首页和WiFi配网无需认证。</p>"
+"<div class='form-row'><label>启用认证</label><select id='webAuthEn'><option value='0'>禁用</option><option value='1'>启用</option></select></div>"
+"<div class='form-row'><label>用户名</label><input type='text' id='webUser' placeholder='输入用户名' maxlength='31'></div>"
+"<div class='form-row'><label>密码</label><input type='password' id='webPass' placeholder='输入密码' maxlength='31'></div>"
+"<div class='btn-group'><button class='btn btn-warning' onclick='saveWebAuth()'>保存认证配置</button></div>"
+"</div>"
+
 "</div>"
 "<script>"
 "function $(id){return document.getElementById(id)}"
@@ -416,7 +437,9 @@ static const char html_admin_page[] =
 "function calibrateTDS(sensor){const v=sensor===0?$('tdsInCal').value:$('tdsOutCal').value;if(!v)return alert('请输入标准值');api('/api/tds/calibrate',{sensor:parseInt(sensor),value:parseFloat(v)}).then(d=>alert(d.status||'校准完成'))}"
 "function loadMQTT(){fetch('/api/mqtt/config').then(r=>r.json()).then(d=>{$('mqttEn').value=d.enabled?1:0;$('mqttBroker').value=d.broker||'';$('mqttUser').value=d.user||'';$('mqttPass').value='';$('mqttPrefix').value=d.prefix||'water-purifier'})}"
 "function saveMQTT(){api('/api/mqtt/config',{enabled:$('mqttEn').value==1,broker:$('mqttBroker').value,user:$('mqttUser').value,password:$('mqttPass').value,prefix:$('mqttPrefix').value}).then(d=>alert(d.status||'已保存'))}"
-"loadConfig();loadFilters();loadMQTT();"
+"function loadWebAuth(){fetch('/api/config').then(r=>r.json()).then(d=>{$('webAuthEn').value=d.webAuthEnabled?1:0;$('webUser').value=d.webUsername||'admin';$('webPass').value='';})}"
+"function saveWebAuth(){const u=$('webUser').value.trim();const p=$('webPass').value;if($('webAuthEn').value==1){if(!u)return alert('启用认证时必须设置用户名');if(u.length<3)return alert('用户名至少3个字符');if(!p)return alert('启用认证时必须设置密码');if(p.length<4)return alert('密码至少4个字符');}api('/api/config',{webAuthEnabled:$('webAuthEn').value==1,webUsername:u,webPassword:p}).then(d=>{alert(d.status||'已保存');if($('webAuthEn').value==1)setTimeout(()=>location.reload(),500);})}"
+"loadConfig();loadFilters();loadMQTT();loadWebAuth();"
 "</script></body></html>";
 
 // 固件升级页面 - 独立页面
@@ -577,8 +600,15 @@ static const char html_log_page[] =
 "let refreshInterval=10;"
 "function fetchLogs(){"
 "const url='/api/logs/debug?level='+currentLevel;"
-"fetch(url).then(r=>r.text()).then(html=>{"
-"document.getElementById('logContent').innerHTML=html;"
+"fetch(url,{credentials:'include'}).then(r=>{"
+"if(r.status===401){"
+"document.getElementById('logContent').innerHTML='<span style=\"color:#f44747\">认证已过期，请<a href=\"/logs\" style=\"color:#667eea\">重新登录</a></span>';"
+"if(refreshTimer)clearInterval(refreshTimer);"
+"return;"
+"}"
+"return r.text();"
+"}).then(html=>{"
+"if(html)document.getElementById('logContent').innerHTML=html;"
 "}).catch(e=>{"
 "document.getElementById('logContent').innerHTML='<span style=\"color:#f44747\">获取日志失败: '+e+'</span>';"
 "});}"
@@ -602,8 +632,111 @@ static const char html_log_page[] =
 "startRefresh();"
 "</script></body></html>";
 
+// ==================== Basic Auth函数 ====================
+
+static void generate_session(void)
+{
+    uint8_t rand_bytes[16];
+    esp_fill_random(rand_bytes, sizeof(rand_bytes));
+    for (int i = 0; i < 16; i++) {
+        sprintf(&session_ctx.token[i*2], "%02x", rand_bytes[i]);
+    }
+    session_ctx.token[32] = '\0';
+    session_ctx.create_time_us = esp_timer_get_time();
+    session_ctx.valid = true;
+}
+
+static bool validate_session(const char *token)
+{
+    if (!session_ctx.valid) return false;
+    if (strcmp(token, session_ctx.token) != 0) return false;
+    uint64_t age = (esp_timer_get_time() - session_ctx.create_time_us) / 1000000;
+    if (age > SESSION_TIMEOUT_SEC) {
+        session_ctx.valid = false;
+        return false;
+    }
+    // 刷新session时间（滑动过期），活跃用户不会过期
+    session_ctx.create_time_us = esp_timer_get_time();
+    return true;
+}
+
+static bool check_auth(httpd_req_t *req)
+{
+    system_config_t cfg;
+    config_manager_get_config(&cfg);
+
+    // 未启用认证，直接通过
+    if (!cfg.web_auth_enabled) return true;
+
+    // 优先检查Session Cookie
+    char cookie[128];
+    if (httpd_req_get_hdr_value_str(req, "Cookie", cookie, sizeof(cookie)) == ESP_OK) {
+        char *s = strstr(cookie, "session=");
+        if (s) {
+            s += 8;
+            char tok[33] = {0};
+            for (int i = 0; s[i] && s[i] != ';' && i < 32; i++) tok[i] = s[i];
+            if (validate_session(tok)) return true;
+        }
+    }
+
+    // 检查Basic Auth
+    char auth[128];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) != ESP_OK) return false;
+    if (strncmp(auth, "Basic ", 6) != 0) return false;
+
+    // Base64解码
+    unsigned char decoded[64] = {0};
+    size_t dec_len = 0;
+    mbedtls_base64_decode(decoded, sizeof(decoded), &dec_len,
+                          (unsigned char*)(auth + 6), strlen(auth + 6));
+
+    // 格式: username:password
+    char *colon = strchr((char*)decoded, ':');
+    if (!colon) return false;
+
+    int user_len = colon - (char*)decoded;
+    char user[32] = {0}, pass[32] = {0};
+    if (user_len > 0 && user_len < 32) {
+        memcpy(user, decoded, user_len);
+        strcpy(pass, colon + 1);
+    }
+
+    // 比较凭证
+    if (strcmp(user, cfg.web_username) == 0 && strcmp(pass, cfg.web_password) == 0) {
+        generate_session();
+        return true;
+    }
+
+    return false;
+}
+
+static void send_401(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"Water Purifier\"");
+    httpd_resp_send(req, "Unauthorized", 11);
+}
+
+static void set_session_cookie(httpd_req_t *req)
+{
+    if (session_ctx.valid) {
+        char hdr[64];
+        snprintf(hdr, sizeof(hdr), "session=%s; Path=/; Max-Age=%d",
+                 session_ctx.token, SESSION_TIMEOUT_SEC);
+        httpd_resp_set_hdr(req, "Set-Cookie", hdr);
+    }
+}
+
+// ==================== 页面和API处理函数 ====================
+
 static esp_err_t handle_log_page(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     return httpd_resp_send(req, html_log_page, HTTPD_RESP_USE_STRLEN);
@@ -611,6 +744,11 @@ static esp_err_t handle_log_page(httpd_req_t *req)
 
 static esp_err_t handle_log_api(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     // 使用静态缓冲区避免HTTP服务器任务栈溢出(默认栈仅4KB)
     static char buf[4096];
     int pos = 0;
@@ -685,10 +823,25 @@ static esp_err_t handle_log_api(httpd_req_t *req)
 /**
  * @brief 日志端点：以HTML形式返回日志缓冲区内容（支持时间戳转换和级别过滤）
  * @note 查询参数: level=E/W/I/D/EW/EWI 过滤日志级别
+ *       两阶段扫描：先逆向计算能显示的行数，再正向输出（确保新日志完整）
  */
 static esp_err_t handle_log_debug(httpd_req_t *req)
 {
-    static char buf[LOG_BUF_SIZE + 1024];
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
+
+    // 检查可用内存
+    size_t free_heap = esp_get_free_heap_size();
+    if (free_heap < 20000) {
+        ESP_LOGW(TAG, "内存不足(%lu字节)，跳过日志详细处理", (unsigned long)free_heap);
+        httpd_resp_set_type(req, "text/html");
+        return httpd_resp_send(req, "<span style='color:#f57c00'>内存不足，无法显示详细日志</span>", HTTPD_RESP_USE_STRLEN);
+    }
+
+    static char buf[LOG_BUF_SIZE + 2048];
     int pos = 0;
 
     // 解析查询参数中的日志级别过滤
@@ -705,22 +858,97 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     time_t boot_wall = wifi_manager_get_boot_wall_clock_time();
     bool has_wall_time = (boot_wall > 0);
 
-    // 构建HTML片段（嵌入到#logContent div中，继承父级样式）
+    // 快照当前缓冲区状态
+    uint32_t tail = s_log_tail;
+    uint32_t head = s_log_head;
+
+    // ==================== 第一阶段：逆向扫描 ====================
+    // 从 head 逆向扫描，计算能显示多少行（确保新日志完整）
+    #define HTML_OUTPUT_LIMIT 9000  // 预留1KB给头部和尾部JS
+    #define HTML_LINE_OVERHEAD 80   // 每行HTML开销（span标签+时间戳+换行）
+
+    uint32_t scan_pos = head;
+    uint32_t output_start = tail;  // 默认从tail开始
+    int html_accum = 0;
+    int output_lines = 0;
+    int total_lines = 0;
+
+    // 临时缓冲区读取一行（逆向扫描时）
+    char scan_line[300];
+    int scan_line_len = 0;
+
+    while (scan_pos != tail && html_accum < HTML_OUTPUT_LIMIT) {
+        // 逆向移动一个位置
+        scan_pos = (scan_pos == 0) ? (LOG_BUF_SIZE - 1) : (scan_pos - 1);
+        char c = s_log_buf[scan_pos];
+
+        if (c == '\n' || c == '\r') {
+            if (scan_line_len > 0) {
+                // 找到一行，解析级别
+                scan_line[scan_line_len] = '\0';
+                char lvl = 0;
+                if (scan_line_len >= 1) {
+                    char first = scan_line[scan_line_len - 1];  // 逆向存储，最后一个是第一个字符
+                    if (first == 'E' || first == 'W' || first == 'I' || first == 'D') {
+                        lvl = first;
+                    }
+                }
+
+                // 检查级别过滤
+                bool show_line = (strcmp(level_filter, "all") == 0);
+                if (!show_line && lvl) {
+                    for (int i = 0; level_filter[i]; i++) {
+                        if (level_filter[i] == lvl) { show_line = true; break; }
+                    }
+                }
+
+                if (show_line) {
+                    // 计算这一行的HTML大小
+                    int html_size = scan_line_len * 2 + HTML_LINE_OVERHEAD;  // 保守估算
+                    if (html_accum + html_size <= HTML_OUTPUT_LIMIT) {
+                        html_accum += html_size;
+                        output_lines++;
+                        output_start = scan_pos + 1;  // 这一行开始的位置
+                        if (output_start >= LOG_BUF_SIZE) output_start = 0;
+                    }
+                }
+                total_lines++;
+                scan_line_len = 0;
+            }
+        } else {
+            // 逆向存储字符（反向）
+            if (scan_line_len < 299) {
+                scan_line[scan_line_len++] = c;
+            }
+        }
+    }
+
+    int skip_count = total_lines - output_lines;
+
+    // ==================== 第二阶段：正向输出 ====================
+    // 从 output_start 正向读取到 head
+
     pos = snprintf(buf, sizeof(buf),
         "<style>.ts{color:#888;margin-right:4px}.E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}</style>"
         "<div style='padding:4px 8px;border-bottom:1px solid #e0e0e0;font-size:10px;color:#888;background:#f0f0f0'>缓冲区 %lu/%lu 字节 | %s | 过滤: %s</div>",
-        (unsigned long)(s_log_head >= s_log_tail ? s_log_head - s_log_tail : LOG_BUF_SIZE - s_log_tail + s_log_head),
+        (unsigned long)(head >= tail ? head - tail : LOG_BUF_SIZE - tail + head),
         (unsigned long)LOG_BUF_SIZE,
         has_wall_time ? "时间戳已同步" : "时间戳未同步",
         level_filter);
 
-    // 逐行读取并输出
-    uint32_t read_pos = s_log_tail;
-    uint32_t head = s_log_head;  // 快照避免竞态条件
+    // 如果跳过了旧日志，显示提示
+    if (skip_count > 0) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "<span style='color:#888;font-size:11px'>... (跳过%d条旧日志，显示最新%d条)</span>\n",
+            skip_count, output_lines);
+    }
+
+    // 从 output_start 正向读取
+    uint32_t read_pos = output_start;
     char line_buf[300];
     int line_len = 0;
 
-    while (read_pos != head) {
+    while (read_pos != head && pos < (int)sizeof(buf) - 100) {
         char c = s_log_buf[read_pos];
         read_pos = (read_pos + 1) % LOG_BUF_SIZE;
 
@@ -728,85 +956,71 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
             if (line_len > 0) {
                 line_buf[line_len] = '\0';
 
-                // 解析日志级别: 格式 "I (1234) TAG: message" (ESP-IDF标准格式，无前导空格)
+                // 解析日志级别
                 char lvl = 0;
                 uint32_t boot_ms = 0;
                 if (line_len >= 5 &&
                     (line_buf[0] == 'E' || line_buf[0] == 'W' || line_buf[0] == 'I' || line_buf[0] == 'D')) {
                     lvl = line_buf[0];
-                    // 解析括号中的毫秒时间戳: "I (1234)"
                     if (line_buf[1] == ' ' && line_buf[2] == '(') {
-                        int ts_start = 3;
-                        int ts_end = ts_start;
+                        int ts_end = 3;
                         while (ts_end < line_len && line_buf[ts_end] != ')') ts_end++;
                         if (ts_end < line_len && line_buf[ts_end] == ')') {
-                            // 提取时间戳数字
                             char ts_str[16] = {0};
-                            int ts_len = ts_end - ts_start;
+                            int ts_len = ts_end - 3;
                             if (ts_len > 0 && ts_len < 16) {
-                                memcpy(ts_str, line_buf + ts_start, ts_len);
+                                memcpy(ts_str, line_buf + 3, ts_len);
                                 boot_ms = (uint32_t)atoi(ts_str);
                             }
                         }
                     }
                 }
 
-                // 检查是否应该显示此日志级别
-                bool show_log = true;
-                if (strcmp(level_filter, "all") != 0 && lvl) {
-                    show_log = false;
-                    // 检查级别是否在过滤器中
-                    for (int i = 0; level_filter[i] != '\0'; i++) {
-                        if (level_filter[i] == lvl) {
-                            show_log = true;
-                            break;
-                        }
+                // 检查日志级别过滤
+                bool show_log = (strcmp(level_filter, "all") == 0);
+                if (!show_log && lvl) {
+                    for (int i = 0; level_filter[i]; i++) {
+                        if (level_filter[i] == lvl) { show_log = true; break; }
                     }
                 }
 
                 if (show_log) {
                     int cls = 0;
                     if (lvl) {
-                        pos += snprintf(buf + pos, sizeof(buf) - pos, "<span class='%c'>", lvl);
+                        memcpy(buf + pos, "<span class='", 13);
+                        pos += 13;
+                        buf[pos++] = lvl;
+                        memcpy(buf + pos, "'>", 2);
+                        pos += 2;
                         cls = 1;
                     }
 
-                    // 如果有墙钟时间且解析到时间戳，显示转换后的时间
-                    if (has_wall_time && boot_ms > 0) {
+                    // 时间戳
+                    if (has_wall_time && boot_ms > 0 && cls) {
                         time_t log_time = boot_wall + (boot_ms / 1000);
                         struct tm tm_log;
                         localtime_r(&log_time, &tm_log);
-                        // 格式: "2026-05-20 14:30:45" (年-月-日 时:分:秒，自动使用当地时区)
                         pos += snprintf(buf + pos, sizeof(buf) - pos,
-                                       "<span class='ts'>%04d-%02d-%02d %02d:%02d:%02d</span> ",
-                                       tm_log.tm_year + 1900, tm_log.tm_mon + 1, tm_log.tm_mday,
-                                       tm_log.tm_hour, tm_log.tm_min, tm_log.tm_sec);
+                            "<span class='ts'>%04d-%02d-%02d %02d:%02d:%02d</span> ",
+                            tm_log.tm_year + 1900, tm_log.tm_mon + 1, tm_log.tm_mday,
+                            tm_log.tm_hour, tm_log.tm_min, tm_log.tm_sec);
                     }
 
-                    // 输出日志内容（跳过原始时间戳部分，保留级别标记）
+                    // 输出日志内容
                     int content_start = 0;
                     if (lvl && line_len >= 5) {
-                        // 找到 TAG: 开始的位置 (在 "(1234) " 之后)
-                        // 格式: "I (1234) TAG: message"
-                        // 我们保留级别 "I " 和 " TAG: message"，跳过 "(1234)"
-                        // 找到右括号后的位置
-                        int paren_end = 2; // 从 '(' 位置开始找
+                        int paren_end = 2;
                         while (paren_end < line_len && line_buf[paren_end] != ')') paren_end++;
                         if (paren_end < line_len && paren_end + 3 < line_len) {
-                            // 确保括号后至少有3个字符（空格+TAG首字母+冒号）
-                            // 输出级别标记
-                            buf[pos++] = lvl;        // 级别
-                            buf[pos++] = ' ';        // 空格
-                            // 输出括号后的内容 (TAG: message)
+                            buf[pos++] = lvl;
+                            buf[pos++] = ' ';
                             content_start = paren_end + 1;
                             if (content_start < line_len && line_buf[content_start] == ' ') content_start++;
-                        } else {
-                            content_start = 0; // 无法解析或内容不足，输出完整行
                         }
                     }
 
-                    // HTML转义输出
-                    for (int i = content_start; i < line_len && pos < (int)sizeof(buf) - 20; i++) {
+                    // HTML转义
+                    for (int i = content_start; i < line_len && pos < (int)sizeof(buf) - 10; i++) {
                         char ch = line_buf[i];
                         if (ch == '<') { buf[pos++] = '&'; buf[pos++] = 'l'; buf[pos++] = 't'; }
                         else if (ch == '>') { buf[pos++] = '&'; buf[pos++] = 'g'; buf[pos++] = 't'; }
@@ -814,7 +1028,10 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
                         else buf[pos++] = ch;
                     }
 
-                    if (cls) { pos += snprintf(buf + pos, sizeof(buf) - pos, "</span>"); }
+                    if (cls && pos + 8 < (int)sizeof(buf)) {
+                        memcpy(buf + pos, "</span>", 7);
+                        pos += 7;
+                    }
                     buf[pos++] = '\n';
                 }
                 line_len = 0;
@@ -826,8 +1043,8 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
 
     buf[pos] = '\0';
 
-    // 自动滚动到最新
-    const char *scroll_js = "<script>window.scrollTo(0,document.body.scrollHeight)</script>";
+    // 滚动到底部（显示最新日志）
+    const char *scroll_js = "<script>(function(){var el=document.getElementById('logContent');if(el)el.scrollTop=el.scrollHeight})()</script>";
     int slen = strlen(scroll_js);
     if (pos + slen < (int)sizeof(buf)) {
         memcpy(buf + pos, scroll_js, slen);
@@ -874,6 +1091,11 @@ static esp_err_t handle_index(httpd_req_t *req)
 
 static esp_err_t handle_admin(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html_admin_page, strlen(html_admin_page));
     return ESP_OK;
@@ -881,6 +1103,11 @@ static esp_err_t handle_admin(httpd_req_t *req)
 
 static esp_err_t handle_ota(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html_ota_page, strlen(html_ota_page));
     return ESP_OK;
@@ -1026,6 +1253,11 @@ static esp_err_t handle_status(httpd_req_t *req)
 
 static esp_err_t handle_control(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     // 防抖检查：短时间内不允许重复控制操作
     uint64_t now = esp_timer_get_time();
     uint64_t elapsed_ms = (now - s_last_control_time) / 1000;
@@ -1092,6 +1324,11 @@ static esp_err_t handle_control(httpd_req_t *req)
 
 static esp_err_t handle_config_get(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     httpd_resp_set_type(req, "application/json");
 
     system_config_t cfg;
@@ -1114,6 +1351,8 @@ static esp_err_t handle_config_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "whValveOpen", cfg.water_hammer_valve_open_delay_ms);
     cJSON_AddNumberToObject(root, "whPumpStop", cfg.water_hammer_pump_stop_delay_ms);
     cJSON_AddNumberToObject(root, "whValveClose", cfg.water_hammer_valve_close_delay_ms);
+    cJSON_AddBoolToObject(root, "webAuthEnabled", cfg.web_auth_enabled);
+    cJSON_AddStringToObject(root, "webUsername", cfg.web_username);
 
     char *resp = cJSON_PrintUnformatted(root);
     if (!resp) {
@@ -1129,16 +1368,21 @@ static esp_err_t handle_config_get(httpd_req_t *req)
 
 static esp_err_t handle_config_set(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     /* 检查请求体长度 */
     int content_len = req->content_len;
-    if (content_len > 255) {
+    if (content_len > 512) {
         ESP_LOGW(TAG, "config_set请求体过大: %d字节", content_len);
         drain_http_body(req);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request too large");
         return ESP_FAIL;
     }
 
-    char buf[256];
+    char buf[512];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) {
         return ESP_FAIL;
@@ -1164,6 +1408,17 @@ static esp_err_t handle_config_set(httpd_req_t *req)
     if ((v = cJSON_GetObjectItem(root, "whValveOpen"))) cfg.water_hammer_valve_open_delay_ms = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "whPumpStop"))) cfg.water_hammer_pump_stop_delay_ms = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "whValveClose"))) cfg.water_hammer_valve_close_delay_ms = v->valueint;
+
+    // Web认证配置
+    if ((v = cJSON_GetObjectItem(root, "webAuthEnabled"))) cfg.web_auth_enabled = cJSON_IsTrue(v);
+    if ((v = cJSON_GetObjectItem(root, "webUsername")) && v->valuestring && strlen(v->valuestring) > 0) {
+        strncpy(cfg.web_username, v->valuestring, sizeof(cfg.web_username) - 1);
+        cfg.web_username[sizeof(cfg.web_username) - 1] = '\0';
+    }
+    if ((v = cJSON_GetObjectItem(root, "webPassword")) && v->valuestring && strlen(v->valuestring) > 0) {
+        strncpy(cfg.web_password, v->valuestring, sizeof(cfg.web_password) - 1);
+        cfg.web_password[sizeof(cfg.web_password) - 1] = '\0';
+    }
 
     config_manager_set_config(&cfg);
 
@@ -1192,6 +1447,11 @@ static esp_err_t handle_config_set(httpd_req_t *req)
 
 static esp_err_t handle_hardware_config_set(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     /* 检查请求体长度 */
     int content_len = req->content_len;
     if (content_len > 127) {
@@ -1361,6 +1621,11 @@ static esp_err_t handle_wifi_config(httpd_req_t *req)
 
 static esp_err_t handle_filter_reset(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     /* 检查请求体长度 */
     int content_len = req->content_len;
     if (content_len > 63) {
@@ -1419,6 +1684,11 @@ static esp_err_t handle_filter_reset(httpd_req_t *req)
 
 static esp_err_t handle_filter_capacity(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     /* 检查请求体长度 */
     int content_len = req->content_len;
     if (content_len > 255) {
@@ -1480,6 +1750,11 @@ static esp_err_t handle_filter_capacity(httpd_req_t *req)
 
 static esp_err_t tds_calibrate_handler(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     /* 检查请求体长度 */
     int content_len = req->content_len;
     if (content_len > 127) {
@@ -1577,6 +1852,11 @@ static esp_err_t tds_calibrate_handler(httpd_req_t *req)
 
 static esp_err_t handle_mqtt_config_get(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     system_config_t cfg;
     config_manager_get_config(&cfg);
 
@@ -1601,6 +1881,11 @@ static esp_err_t handle_mqtt_config_get(httpd_req_t *req)
 
 static esp_err_t handle_mqtt_config_set(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     /* 检查请求体长度 */
     int content_len = req->content_len;
     if (content_len > 255) {
@@ -1669,6 +1954,11 @@ static portMUX_TYPE s_ota_spinlock = portMUX_INITIALIZER_UNLOCKED;
  */
 static esp_err_t ota_update_handler(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     esp_err_t result = ESP_FAIL;  // 默认返回失败，成功时修改
 
     // 检查是否已有OTA会话进行中
@@ -1925,6 +2215,11 @@ cleanup_restart:
  */
 static esp_err_t ota_status_handler(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     cJSON *root = cJSON_CreateObject();
     // FAILED 状态无活跃会话时，自动恢复为 idle
     ota_state_t ota_st = ota_update_get_state();
@@ -1959,6 +2254,10 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
             esp_err_t err = esp_ota_get_state_partition(running, &img_state);
             if (err == ESP_OK) {
                 switch (img_state) {
+                    case ESP_OTA_IMG_NEW:
+                        rollback_status = "新固件";
+                        can_ota = false;
+                        break;
                     case ESP_OTA_IMG_VALID:
                         rollback_status = "有效";
                         can_ota = true;
@@ -1977,9 +2276,12 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
                         break;
                     default:
                         rollback_status = "未知";
-                        can_ota = true;
+                        can_ota = false;
                         break;
                 }
+            } else {
+                rollback_status = "读取失败";
+                can_ota = false;
             }
         }
         cJSON_AddStringToObject(root, "rollback_status", rollback_status);
@@ -2025,6 +2327,11 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
  */
 static esp_err_t ota_factory_handler(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     ESP_LOGI(TAG, "收到恢复出厂固件请求");
     httpd_resp_set_type(req, "application/json");
 
@@ -2049,6 +2356,11 @@ static esp_err_t ota_factory_handler(httpd_req_t *req)
  */
 static esp_err_t ota_rollback_handler(httpd_req_t *req)
 {
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
     ESP_LOGI(TAG, "收到回滚到上一OTA固件请求");
     httpd_resp_set_type(req, "application/json");
 
@@ -2113,6 +2425,8 @@ esp_err_t web_server_start(void)
     cfg.max_uri_handlers = 26;
     cfg.stack_size = 12288;  // 增加到12KB，handle_log_debug需要约9KB缓冲区
     cfg.max_open_sockets = 3;  // ESP-IDF v6.0限制：LWIP_MAX_SOCKETS=6，httpd内部占用3
+    cfg.recv_wait_timeout = 10;    // 接收超时10秒（默认5秒）
+    cfg.send_wait_timeout = 10;    // 发送超时10秒（默认5秒）
 
     if (httpd_start(&ctx.server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "启动失败");

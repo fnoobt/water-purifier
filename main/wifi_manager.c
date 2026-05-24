@@ -5,6 +5,7 @@
  */
 
 #include "wifi_manager.h"
+#include "config_manager.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -497,16 +498,12 @@ esp_err_t wifi_manager_save_config(void)
 {
     // 节流检查（esp_timer_get_time()是原子操作，竞态风险低）
     uint64_t now_us = esp_timer_get_time();
-    uint64_t last_save = s_last_wifi_save_time_us;  // 读取时可能略有偏差，但不影响节流效果
+    uint64_t last_save = s_last_wifi_save_time_us;
     uint64_t elapsed = (now_us - last_save) / 1000000ULL;
     if (elapsed < WIFI_SAVE_THROTTLE_SEC && last_save > 0) {
         ESP_LOGD(TAG, "WiFi配置保存节流：距上次保存仅%lu秒，跳过", (uint32_t)elapsed);
         return ESP_OK;
     }
-
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open("wifi", NVS_READWRITE, &handle);
-    if (err != ESP_OK) return err;
 
     // 使用mutex保护ssid/password读取
     char ssid[33], password[65];
@@ -521,13 +518,15 @@ esp_err_t wifi_manager_save_config(void)
     ssid[sizeof(ssid) - 1] = '\0';
     password[sizeof(password) - 1] = '\0';
 
-    nvs_set_str(handle, "ssid", ssid);
-    nvs_set_str(handle, "pass", password);
-    err = nvs_commit(handle);
-    nvs_close(handle);
+    // 使用config_manager保存（统一存储到water_purifier命名空间）
+    esp_err_t err = config_manager_set_string("wifi_ssid", ssid);
+    if (err != ESP_OK) return err;
+    err = config_manager_set_string("wifi_pass", password);
+    if (err != ESP_OK) return err;
+    err = config_manager_save();
 
     if (err == ESP_OK) {
-        s_last_wifi_save_time_us = esp_timer_get_time();  // 更新时间戳（原子操作）
+        s_last_wifi_save_time_us = esp_timer_get_time();
         ESP_LOGI(TAG, "WiFi配置已保存");
     }
     return err;
@@ -535,32 +534,25 @@ esp_err_t wifi_manager_save_config(void)
 
 esp_err_t wifi_manager_load_config(void)
 {
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open("wifi", NVS_READONLY, &handle);
+    // 从config_manager加载（统一存储在water_purifier命名空间）
+    esp_err_t err = config_manager_get_string("wifi_ssid", ctx.ssid, sizeof(ctx.ssid));
     if (err != ESP_OK) return err;
 
-    size_t len = sizeof(ctx.ssid);
-    err = nvs_get_str(handle, "ssid", ctx.ssid, &len);
-    if (err == ESP_OK) {
-        len = sizeof(ctx.password);
-        esp_err_t pass_err = nvs_get_str(handle, "pass", ctx.password, &len);
-        if (pass_err != ESP_OK && pass_err != ESP_ERR_NVS_NOT_FOUND) {
-            ESP_LOGW(TAG, "加载WiFi密码失败: %s", esp_err_to_name(pass_err));
-            ctx.password[0] = '\0';
-        }
+    esp_err_t pass_err = config_manager_get_string("wifi_pass", ctx.password, sizeof(ctx.password));
+    if (pass_err != ESP_OK && pass_err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "加载WiFi密码失败: %s", esp_err_to_name(pass_err));
+        ctx.password[0] = '\0';
     }
-    nvs_close(handle);
     return err;
 }
 
 esp_err_t wifi_manager_clear_config(void)
 {
-    nvs_handle_t handle;
-    if (nvs_open("wifi", NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_erase_all(handle);
-        nvs_commit(handle);
-        nvs_close(handle);
-    }
+    // 通过config_manager清除（设置空字符串）
+    config_manager_set_string("wifi_ssid", "");
+    config_manager_set_string("wifi_pass", "");
+    config_manager_save();
+
     ctx.ssid[0] = '\0';
     ctx.password[0] = '\0';
     return ESP_OK;
@@ -568,15 +560,7 @@ esp_err_t wifi_manager_clear_config(void)
 
 bool wifi_manager_has_saved_config(void)
 {
-    nvs_handle_t handle;
-    if (nvs_open("wifi", NVS_READONLY, &handle) != ESP_OK) {
-        return false;
-    }
-    char ssid[33];
-    size_t len = sizeof(ssid);
-    esp_err_t err = nvs_get_str(handle, "ssid", ssid, &len);
-    nvs_close(handle);
-    return err == ESP_OK && strlen(ssid) > 0;
+    return config_manager_has_wifi_config();
 }
 
 // ==================== 回调 ====================

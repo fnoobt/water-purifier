@@ -7,8 +7,9 @@
 - **8 状态 FSM**: 智能制水、双阶段冲洗、水锤控制
 - **双 TDS 监测**: 进水/出水实时监测 + 温度补偿校准
 - **5 级滤芯管理**: 水量 + 时间双维度寿命追踪
-- **Web 日志**: 8KB 环形缓冲区，远程实时查看串口日志
-- **OTA 升级**: Web 界面一键升级，版本检测 + 回滚保护 + 出厂恢复
+- **Web 认证**: Basic Auth + Session Cookie（24小时滑动过期），管理页面/OTA/日志需认证
+- **Web 日志**: 10KB HTML缓冲区，正向读取（新日志在底部），智能跳过旧日志
+- **OTA 升级**: Web 界面一键升级，版本检测 + 回滚保护 + 出厂恢复，bootloader自动状态转换
 - **Home Assistant**: MQTT 自动发现集成
 
 ## 快速开始
@@ -39,6 +40,22 @@ STANDBY → PRODUCTION → TANK_FULL → NORMAL_FLUSH → PURE_FLUSH → STANDBY
 WATER_SHORTAGE  ←────────  (任意状态 → LEAK_ALARM/STOP → 手动复位)
 ```
 
+## Web 认证
+
+| 页面 | 认证要求 |
+|------|---------|
+| 首页 `/` | 公开 |
+| WiFi配网 `/api/wifi` | 公开 |
+| 状态 `/api/status` | 公开 |
+| 管理页面 `/admin` | 需认证 |
+| OTA升级 `/ota` | 需认证 |
+| 系统日志 `/logs` | 需认证 |
+| 所有管理API | 需认证 |
+
+**默认账户**: 用户名 `admin`，密码 `admin`（认证默认禁用）
+
+在管理页面 → Web认证配置 中启用认证并设置用户名/密码。
+
 ## 模块
 
 | 模块 | 职责 |
@@ -48,10 +65,10 @@ WATER_SHORTAGE  ←────────  (任意状态 → LEAK_ALARM/STOP �
 | Filter | 滤芯寿命管理（水量/时间双维度） |
 | GPIO | 输入防抖 + 继电器控制 |
 | WiFi | STA/AP + 指数退避重连 |
-| Web | 首页 + 管理页 + 日志页 + OTA |
+| Web | 首页 + 管理页 + 日志页 + OTA + Basic Auth |
 | MQTT | Home Assistant 自动发现 |
 | Config | NVS 持久化配置 |
-| OTA | 固件升级 + 回滚 + 恢复出厂 |
+| OTA | 固件升级 + 回滚保护 + 恢复出厂（bootloader自动状态转换） |
 | PM | CPU频率/WiFi功率管理 |
 | History | 事件日志 + 每日统计 |
 

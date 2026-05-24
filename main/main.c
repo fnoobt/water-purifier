@@ -181,7 +181,9 @@ void app_main(void)
     esp_log_level_set("PM", ESP_LOG_INFO);
     esp_log_level_set("MAIN", ESP_LOG_INFO);
 
-    ESP_LOGI(TAG, "");
+    // 提前启动日志拦截器，捕获所有初始化日志
+    web_server_init_log_interceptor();
+
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  净水器主控板程序启动");
     ESP_LOGI(TAG, "  硬件: ESP32-C3");
@@ -269,7 +271,6 @@ void app_main(void)
     // 10. 初始化Web服务器
     ESP_LOGI(TAG, "[10/10] 初始化Web服务器...");
     web_server_init();
-    web_server_init_log_interceptor();
     web_server_start();
 
     // 创建监控任务（高优先级，确保能及时reset看门狗）

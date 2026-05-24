@@ -337,20 +337,6 @@ static const char* const event_names[] = {
     [FSM_EVENT_FILTER_FLUSH] = "换芯冲洗",
 };
 
-// ==================== 运行数据保存 ====================
-
-static esp_err_t save_runtime_data(void)
-{
-    runtime_data_t rt_data;
-    rt_data.total_production_cycles = fsm_ctx.runtime_data.total_production_cycles;
-    rt_data.total_flush_cycles = fsm_ctx.runtime_data.total_flush_cycles;
-    rt_data.total_production_time_sec = fsm_ctx.runtime_data.total_production_time_sec;
-    rt_data.total_flush_time_sec = fsm_ctx.runtime_data.total_flush_time_sec;
-    rt_data.total_water_used = filter_mgr_get_total_water_usage();
-    rt_data.total_production_water = filter_mgr_get_total_production_water();
-    return config_manager_save_runtime_data(&rt_data);
-}
-
 // ==================== 私有函数 ====================
 
 static void record_stop(stop_type_t type, const char *description)
@@ -1125,13 +1111,6 @@ static void fsm_task(void *arg)
         // 最小保存间隔为1分钟(600 ticks)，防止配置为0时频繁写入磨损Flash
         if (save_ticks < 600) save_ticks = 600;  // 600 * 100ms = 60秒
         if (periodic_save_counter >= save_ticks) {
-            // 先保存FSM运行数据
-            if (fsm_ctx.runtime_dirty) {
-                esp_err_t err = save_runtime_data();
-                if (err == ESP_OK) {
-                    fsm_ctx.runtime_dirty = false;
-                }
-            }
             // 调用统一保存接口（滤芯+历史记录）
             config_manager_periodic_save_all(save_interval_sec);
             periodic_save_counter = 0;
@@ -1221,16 +1200,7 @@ esp_err_t fsm_init(void)
     fsm_ctx.water_hammer_valve_close_delay_ms = WATER_HAMMER_VALVE_CLOSE_DELAY_MS;
     fsm_ctx.runtime_save_interval_min = 120;
 
-    // 加载运行数据
-    runtime_data_t rt_data;
-    if (config_manager_load_runtime_data(&rt_data) == ESP_OK) {
-        fsm_ctx.runtime_data.total_production_cycles = rt_data.total_production_cycles;
-        fsm_ctx.runtime_data.total_flush_cycles = rt_data.total_flush_cycles;
-        fsm_ctx.runtime_data.total_production_time_sec = rt_data.total_production_time_sec;
-        fsm_ctx.runtime_data.total_flush_time_sec = rt_data.total_flush_time_sec;
-        filter_mgr_set_total_water_usage(rt_data.total_water_used);
-        filter_mgr_set_total_production_water(rt_data.total_production_water);
-    }
+    // 运行数据现为临时状态（重启后清零），由filter_manager持久化水量数据
 
     // 初始化废水流量（用于制水状态前三级滤芯水量计算）
     system_config_t cfg;

@@ -14,7 +14,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
-#include "nvs_flash.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -27,11 +26,14 @@
 // ESP-IDF组件
 #include "cJSON.h"
 
+// 本地模块头文件
+#include "config_manager.h"
+#include "water_purifier_fsm.h"
+#include "tds_sensor.h"
+#include "wifi_manager.h"
+
 #define MQTT_MAX_TOPIC_LEN  128
 #define MQTT_MAX_DATA_LEN   1024
-
-// 本地模块头文件
-#include "water_purifier_fsm.h"
 #include "tds_sensor.h"
 #include "wifi_manager.h"
 
@@ -696,92 +698,54 @@ static char* mqtt_get_topic(const char *subtopic, char *buffer, size_t buffer_si
 
 esp_err_t mqtt_client_save_config(void)
 {
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("mqtt_config", NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        return err;
-    }
+    // 使用config_manager保存（统一存储到water_purifier命名空间）
+    esp_err_t err = config_manager_set_string("mqtt_broker", mqtt_ctx.config.broker_uri);
+    if (err != ESP_OK) return err;
+    err = config_manager_set_string("mqtt_user", mqtt_ctx.config.username);
+    if (err != ESP_OK) return err;
+    err = config_manager_set_string("mqtt_pass", mqtt_ctx.config.password);
+    if (err != ESP_OK) return err;
+    err = config_manager_set_string("mqtt_topic", mqtt_ctx.config.topic_prefix);
+    if (err != ESP_OK) return err;
 
-    nvs_set_str(nvs_handle, "broker_uri", mqtt_ctx.config.broker_uri);
-    nvs_set_str(nvs_handle, "client_id", mqtt_ctx.config.client_id);
-    nvs_set_str(nvs_handle, "username", mqtt_ctx.config.username);
-    nvs_set_str(nvs_handle, "password", mqtt_ctx.config.password);
-    nvs_set_str(nvs_handle, "topic_prefix", mqtt_ctx.config.topic_prefix);
-    nvs_set_u16(nvs_handle, "keepalive", mqtt_ctx.config.keepalive);
-    nvs_set_u8(nvs_handle, "retain", mqtt_ctx.config.retain);
-    nvs_set_u8(nvs_handle, "qos", mqtt_ctx.config.qos);
+    // client_id动态生成，不持久化
+    // keepalive/retain/qos使用默认值，不持久化
 
-    err = nvs_commit(nvs_handle);
-    nvs_close(nvs_handle);
-
+    err = config_manager_save();
     ESP_LOGI(TAG, "MQTT配置已保存");
     return err;
 }
 
 esp_err_t mqtt_client_load_config(void)
 {
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("mqtt_config", NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        if (err == ESP_ERR_NVS_NOT_FOUND) {
-            ESP_LOGW(TAG, "未找到保存的MQTT配置");
-        }
+    // 从config_manager加载（统一存储在water_purifier命名空间）
+    esp_err_t err = config_manager_get_string("mqtt_broker", mqtt_ctx.config.broker_uri, sizeof(mqtt_ctx.config.broker_uri));
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "加载MQTT broker失败: %s", esp_err_to_name(err));
         return err;
     }
 
-    size_t len = sizeof(mqtt_ctx.config.broker_uri);
-    err = nvs_get_str(nvs_handle, "broker_uri", mqtt_ctx.config.broker_uri, &len);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) goto exit;
+    config_manager_get_string("mqtt_user", mqtt_ctx.config.username, sizeof(mqtt_ctx.config.username));
+    config_manager_get_string("mqtt_pass", mqtt_ctx.config.password, sizeof(mqtt_ctx.config.password));
+    config_manager_get_string("mqtt_topic", mqtt_ctx.config.topic_prefix, sizeof(mqtt_ctx.config.topic_prefix));
 
-    len = sizeof(mqtt_ctx.config.client_id);
-    err = nvs_get_str(nvs_handle, "client_id", mqtt_ctx.config.client_id, &len);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) goto exit;
+    // 使用默认值（client_id动态生成，keepalive/retain/qos使用默认值）
+    mqtt_ctx.config.keepalive = 120;  // 默认保活时间120秒
+    mqtt_ctx.config.retain = true;    // 默认保留消息
+    mqtt_ctx.config.qos = 0;          // 默认QoS 0
 
-    len = sizeof(mqtt_ctx.config.username);
-    err = nvs_get_str(nvs_handle, "username", mqtt_ctx.config.username, &len);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) goto exit;
-
-    len = sizeof(mqtt_ctx.config.password);
-    err = nvs_get_str(nvs_handle, "password", mqtt_ctx.config.password, &len);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) goto exit;
-
-    len = sizeof(mqtt_ctx.config.topic_prefix);
-    err = nvs_get_str(nvs_handle, "topic_prefix", mqtt_ctx.config.topic_prefix, &len);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) goto exit;
-
-    uint16_t keepalive;
-    err = nvs_get_u16(nvs_handle, "keepalive", &keepalive);
-    if (err == ESP_OK) mqtt_ctx.config.keepalive = keepalive;
-
-    uint8_t retain;
-    err = nvs_get_u8(nvs_handle, "retain", &retain);
-    if (err == ESP_OK) mqtt_ctx.config.retain = retain;
-
-    uint8_t qos;
-    err = nvs_get_u8(nvs_handle, "qos", &qos);
-    if (err == ESP_OK) mqtt_ctx.config.qos = qos;
-
-exit:
-    nvs_close(nvs_handle);
-
-    if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "MQTT配置已加载");
-        return ESP_OK;
-    }
-    return err;
+    ESP_LOGI(TAG, "MQTT配置已加载");
+    return ESP_OK;
 }
 
 esp_err_t mqtt_client_clear_config(void)
 {
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("mqtt_config", NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    nvs_erase_all(nvs_handle);
-    nvs_commit(nvs_handle);
-    nvs_close(nvs_handle);
+    // 通过config_manager清除（设置空字符串）
+    config_manager_set_string("mqtt_broker", "");
+    config_manager_set_string("mqtt_user", "");
+    config_manager_set_string("mqtt_pass", "");
+    config_manager_set_string("mqtt_topic", "");
+    config_manager_save();
 
     ESP_LOGI(TAG, "MQTT配置已清除");
     return ESP_OK;
@@ -789,17 +753,7 @@ esp_err_t mqtt_client_clear_config(void)
 
 bool mqtt_client_has_saved_config(void)
 {
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("mqtt_config", NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        return false;
-    }
-
-    size_t len;
-    err = nvs_get_str(nvs_handle, "broker_uri", NULL, &len);
-    nvs_close(nvs_handle);
-
-    return err == ESP_OK;
+    return config_manager_has_mqtt_config();
 }
 
 // ==================== Home Assistant集成 ====================

@@ -97,6 +97,7 @@ WaterPurifier/
 
 **初始化顺序**:
 ```
+0. web_server_init_log_interceptor() -> 日志拦截器启动（捕获所有后续日志）
 1. config_manager_init()   -> NVS初始化，加载系统配置
 2. gpio_driver_init_*()    -> GPIO输入/输出/LED初始化
 3. tds_sensor_init()       -> ADC初始化
@@ -108,7 +109,7 @@ WaterPurifier/
 6. wifi_manager_init()     -> WiFi初始化
    wifi_manager_start()    -> STA/AP模式
 7. mqtt_client_init()      -> MQTT客户端初始化
-8. ota_update_init()       -> OTA模块初始化
+8. ota_update_init()       -> OTA模块初始化（异常状态自动标记有效）
 9. web_server_init()       -> HTTP服务器初始化
    web_server_start()      -> 启动Web服务
 10. monitor_task           -> 监控任务（30秒周期）
@@ -421,7 +422,7 @@ typedef struct {
 400G -> 62.4 L/h  (1.04 L/min)
 ```
 
-**周期保存**: FSM任务循环中按配置的保存间隔（默认120分钟，可选10/60/120/360/720/1440分钟）统一调用 `config_manager_periodic_save_all()`，协调所有模块脏数据保存。
+**周期保存**: FSM任务循环中按配置的保存间隔（默认120分钟，可选10/60/120/240/360/720/1440分钟）统一调用 `config_manager_periodic_save_all()`，协调所有模块脏数据保存。
 
 ---
 
@@ -515,38 +516,66 @@ water-purifier/set/flush           # 冲洗控制
 
 ### 8. Web服务器 (web_server.c/h)
 
-**职责**: HTTP服务器、Web控制界面、RESTful API
+**职责**: HTTP服务器、Web控制界面、RESTful API、日志缓冲区管理、Basic Auth认证
 
 **主要功能**:
-- 首页（只读监控，30秒自动刷新）
-- 管理页（配置控制）
-- 日志页（实时串口日志，SSE推送，SNTP同步后显示真实时间戳）
+- 首页（只读监控，30秒自动刷新，无需认证）
+- 管理页（配置控制，需认证）
+- 日志页（实时串口日志，SNTP同步后显示真实时间戳，需认证）
+- OTA升级页（固件上传，需认证）
 - RESTful API接口
+- Basic Auth + Session Cookie认证
+
+**Web认证机制**:
+- **Basic Auth**: 浏览器弹出认证框，输入用户名/密码
+- **Session Cookie**: 认证成功后生成32字节随机token，24小时有效
+- **滑动过期**: 每次请求自动刷新session时间，活跃用户不会过期
+- **保护范围**: `/admin`, `/ota`, `/logs`, `/api/config`, `/api/control`, `/api/filter/*`, `/api/tds/*`, `/api/mqtt/*`, `/api/ota/*`, `/api/logs`
+- **公开范围**: `/`, `/api/status`, `/api/wifi`, `/api/wifi/scan`, `/favicon.ico`
+
+**认证配置**:
+- 默认用户名: `admin`，默认密码: `admin`
+- 认证默认禁用，可在管理页 → Web认证配置中启用
+- 启用认证时强制设置用户名（≥3字符）和密码（≥4字符）
+
+**日志缓冲区实现**:
+- 8KB环形缓冲区 `s_log_buf[LOG_BUF_SIZE]`，存储ESP-IDF原始日志
+- `log_vprintf_hook()` 通过 `esp_log_set_vprintf()` 拦截所有 `ESP_LOG*` 输出
+- 日志拦截器在初始化最开始启动，捕获全部初始化日志
+- `handle_log_debug()` 正向输出（旧→新），最新日志显示在底部
+- 动态空间估算，缓冲区不足时跳过旧日志确保新日志完整
+- 内存检查：可用堆 < 20KB时返回简单错误消息
+
+**HTTP服务器配置**:
+- 任务栈: 12KB（handle_log_debug需要约10KB缓冲区）
+- 接收/发送超时: 10秒（默认5秒）
+- 最大socket: 3（ESP-IDF v6.0 LWIP限制）
+- 最大URI处理器: 26
 
 **API接口**:
 
-| 接口 | 方法 | 功能 |
-|------|------|------|
-| `/` | GET | 首页（只读监控） |
-| `/admin` | GET | 管理页面 |
-| `/api/status` | GET | 获取系统状态（JSON） |
-| `/api/control` | POST | 发送控制命令 |
-| `/api/config` | GET/POST | 获取/保存系统配置 |
-| `/api/config/hardware` | POST | 保存硬件配置 |
-| `/api/wifi/scan` | GET | 扫描WiFi网络 |
-| `/api/wifi` | POST | 保存WiFi配置 |
-| `/api/filter/reset` | POST | 重置滤芯 |
-| `/api/filter/capacity` | POST | 设置滤芯容量（批量） |
-| `/api/tds/calibrate` | POST | TDS传感器校准 |
-| `/api/mqtt/config` | GET/POST | MQTT配置 |
-| `/ota` | GET | OTA固件升级页面（独立页面） |
-| `/api/ota/status` | GET | OTA升级状态 |
-| `/api/ota/update` | POST | 上传固件OTA升级 |
-| `/api/ota/factory` | POST | 恢复出厂固件（切换到factory分区并重启） |
-| `/api/ota/rollback` | POST | 回滚到上一OTA固件（ota_0↔ota_1切换） |
-| `/logs` | GET | 实时串口日志页面 |
-| `/api/logs/debug` | GET | 日志缓冲区内容（HTML格式） |
-| `/api/logs` | GET | 日志缓冲区内容（JSON数组） |
+| 接口 | 方法 | 认证 | 功能 |
+|------|------|------|------|
+| `/` | GET | 公开 | 首页（只读监控） |
+| `/admin` | GET | 需要 | 管理页面 |
+| `/api/status` | GET | 公开 | 获取系统状态（JSON） |
+| `/api/control` | POST | 需要 | 发送控制命令 |
+| `/api/config` | GET/POST | 需要 | 获取/保存系统配置（含Web认证配置） |
+| `/api/config/hardware` | POST | 需要 | 保存硬件配置 |
+| `/api/wifi/scan` | GET | 公开 | 扫描WiFi网络 |
+| `/api/wifi` | POST | 公开 | 保存WiFi配置 |
+| `/api/filter/reset` | POST | 需要 | 重置滤芯 |
+| `/api/filter/capacity` | POST | 需要 | 设置滤芯容量（批量） |
+| `/api/tds/calibrate` | POST | 需要 | TDS传感器校准 |
+| `/api/mqtt/config` | GET/POST | 需要 | MQTT配置 |
+| `/ota` | GET | 需要 | OTA固件升级页面 |
+| `/api/ota/status` | GET | 需要 | OTA升级状态 |
+| `/api/ota/update` | POST | 需要 | 上传固件OTA升级 |
+| `/api/ota/factory` | POST | 需要 | 恢复出厂固件 |
+| `/api/ota/rollback` | POST | 需要 | 回滚到上一OTA固件 |
+| `/logs` | GET | 需要 | 实时串口日志页面 |
+| `/api/logs/debug` | GET | 需要 | 日志缓冲区内容（HTML格式） |
+| `/api/logs` | GET | 需要 | 日志缓冲区内容（JSON数组） |
 
 **控制命令**:
 ```json
@@ -628,7 +657,7 @@ typedef struct {
 
     // 系统参数
     uint32_t flush_duration_sec, production_timeout_sec, leak_confirm_time_sec;
-    uint16_t runtime_save_interval_min;   // 10/60/120/360/720/1440
+    uint16_t runtime_save_interval_min;   // 10/60/120/240/360/720/1440
 
     // 冲洗参数
     uint32_t normal_flush_duration_sec, pure_flush_duration_sec;
@@ -680,6 +709,8 @@ typedef struct {
 **边界保护**: `init_buf[512]` 积累固件头部数据，解析ESP镜像头前检查大小有效性，防止异常输入导致缓冲区溢出。
 
 **回滚保护**: OTA成功后调用 `esp_ota_mark_app_valid_cancel_rollback()`，取消回滚倒计时。启动时自动确认待验证固件有效。
+
+**异常状态修复**: 启动时检测固件状态，若为异常值（NEW/INVALID/ABORTED/未知），强制调用 `esp_ota_mark_app_valid_cancel_rollback()` 标记为有效（因为固件已成功启动）。解决OTA升级后显示"固件状态未知"问题。
 
 **分区切换功能**:
 - `ota_update_revert_to_factory()`: 恢复到factory出厂分区
@@ -848,33 +879,85 @@ POST /api/ota/rollback
 
 ### NVS键值映射
 
-| 键名 | 类型 | 命名空间 | 说明 |
-|------|------|---------|------|
-| `wifi_ssid` | string | water_purifier | WiFi SSID |
-| `wifi_pass` | string | water_purifier | WiFi密码 |
-| `mqtt_en` | u8 | water_purifier | MQTT启用 |
-| `mqtt_broker` | string | water_purifier | MQTT Broker |
-| `ro_mem` | u8 | water_purifier | RO膜类型 |
-| `pump` | u8 | water_purifier | 泵类型 |
-| `tank` | u8 | water_purifier | 压力桶大小 |
-| `nflush_dur` | u32 | water_purifier | 常规冲洗时间（秒） |
-| `pflush_dur` | u32 | water_purifier | 纯水洗膜时间（秒） |
-| `fflush_dur` | u32 | water_purifier | 换芯冲洗时间（秒） |
-| `wh_vopn` | u32 | water_purifier | 水锤开阀延时（毫秒） |
-| `wh_pstp` | u32 | water_purifier | 水锤停泵延时（毫秒） |
-| `wh_vcls` | u32 | water_purifier | 水锤关阀延时（毫秒） |
-| `tds_in_th` | u32 | water_purifier | 进水TDS阈值 |
-| `tds_out_th` | u32 | water_purifier | 出水TDS阈值 |
-| `web_port` | u16 | water_purifier | Web端口 |
-| `prod_cycles` | u32 | wp_rt | 制水次数 |
-| `flush_cycles` | u32 | wp_rt | 冲洗次数 |
-| `prod_time` | u64 | wp_rt | 总制水时间（秒） |
-| `total_water` | u32 | wp_rt | 总用水量（升，含冲洗） |
-| `prod_water` | u32 | wp_rt | 总制水量（升，仅纯水） |
-| `f%d_used` | u32 | wp_filters | 各级滤芯已用水量 |
-| `f%d_reset` | u32 | wp_filters | 各级滤芯重置时间 |
-| `f%d_cap` | u32 | wp_filters | 各级滤芯自定义容量 |
-| `f%d_time` | u32 | wp_filters | 各级滤芯时间寿命（小时） |
+**统一NVS架构**（v2.3.0起）：废弃独立命名空间，所有配置统一存储。
+
+| 命名空间 | 用途 | 管理模块 |
+|---------|------|---------|
+| `water_purifier` | 系统配置（WiFi/MQTT/硬件/TDS） | config_manager |
+| `wp_filters` | 滤芯寿命 + 用水量统计 | filter_manager |
+| `history` | 事件日志（20条环形缓冲） | history_logger |
+| `daily_stats` | 每日统计（按日期键） | history_logger |
+
+#### water_purifier（系统配置）
+
+| 键名 | 类型 | 说明 |
+|------|------|------|
+| `wifi_ssid` | string | WiFi SSID |
+| `wifi_pass` | string | WiFi密码 |
+| `mqtt_en` | u8 | MQTT启用标志 |
+| `mqtt_broker` | string | MQTT Broker URI |
+| `mqtt_user` | string | MQTT用户名 |
+| `mqtt_pass` | string | MQTT密码 |
+| `mqtt_topic` | string | MQTT主题前缀 |
+| `ro_mem` | u8 | RO膜类型（0=50G, 1=75G, 2=100G, 3=200G, 4=400G） |
+| `pump` | u8 | 泵类型 |
+| `tank` | u8 | 压力桶大小 |
+| `wv_flow` | u16 | 废水阀流量（CC） |
+| `prod_timeout` | u32 | 制水超时时间（秒） |
+| `leak_confirm` | u32 | 漏水确认时间（秒） |
+| `save_intv` | u16 | 运行数据保存间隔（分钟） |
+| `nflush_dur` | u32 | 常规冲洗时间（秒） |
+| `pflush_dur` | u32 | 纯水洗膜时间（秒） |
+| `fflush_dur` | u32 | 换芯冲洗时间（秒） |
+| `short_prod` | u32 | 短制水判断阈值（秒） |
+| `wh_vopn` | u32 | 水锤开阀延时（毫秒） |
+| `wh_pstp` | u32 | 水锤停泵延时（毫秒） |
+| `wh_vcls` | u32 | 水锤关阀延时（毫秒） |
+| `relay_lvl` | u8 | 继电器触发电平 |
+| `tds_in_th` | i32 | 进水TDS阈值 |
+| `tds_out_th` | i32 | 出水TDS阈值 |
+| `tds_in_off` | i32 | 进水TDS校准偏移 |
+| `tds_out_off` | i32 | 出水TDS校准偏移 |
+| `tds_in_scale` | i32 | 进水TDS校准比例 |
+| `tds_out_scale` | i32 | 出水TDS校准比例 |
+| `web_port` | u16 | Web端口 |
+| `web_auth` | u8 | Web认证启用 |
+| `web_user` | string | Web用户名 |
+| `web_pass` | string | Web密码 |
+
+#### wp_filters（滤芯数据）
+
+| 键名 | 类型 | 说明 |
+|------|------|------|
+| `total_water` | u32 | 总用水量（升，含冲洗） |
+| `total_prod` | u32 | 总制水量（升，仅纯水） |
+| `pre_acc` | u32 | 前三级水量累加器（mL） |
+| `post_acc` | u32 | 后两级水量累加器（mL） |
+| `prod_rate` | i32 | 制水速率（L/h ×100） |
+| `f0_used`~`f4_used` | u32 | 各级滤芯已用水量 |
+| `f0_reset`~`f4_reset` | u32 | 各级滤芯重置时间戳 |
+| `f0_cap`~`f4_cap` | u32 | 各级滤芯自定义容量 |
+| `f0_time`~`f4_time` | u32 | 各级滤芯时间寿命（小时） |
+
+#### history（事件日志）
+
+| 键名 | 类型 | 说明 |
+|------|------|------|
+| `count` | u32 | 日志总记录数 |
+| `index` | u32 | 环形缓冲区写入位置 |
+| `records` | blob | 20条事件记录数组 |
+
+#### daily_stats（每日统计）
+
+| 键名 | 类型 | 说明 |
+|------|------|------|
+| `dYYYYMMDD` | blob | NTP同步日期统计（如d20260521） |
+| `bXXX` | blob | 启动日统计回退（如b001） |
+
+**废弃命名空间**（v2.3.0前，自动迁移）：
+- `wifi` → 已合并到 `water_purifier`
+- `mqtt_config` → 已合并到 `water_purifier`
+- `wp_rt` → 已删除（运行数据改为临时状态）
 
 ---
 
@@ -957,6 +1040,8 @@ POST /api/ota/rollback
 | 1.2.8 | 2026-05-22 | **Web日志缓冲区修复**：`s_log_head`快照避免竞态条件、解析边界检查（确保日志内容完整性）；**TDS纯水洗膜修复**：跳过报警检测（泵停止期间无水流导致读数无效） |
 | 1.2.9 | 2026-05-22 | **ESP32-C3专用优化**：简化pm_manager移除DFS死代码（ESP32-C3不支持动态频率调节），CPU固定160MHz；**管理页面**：新增重启按钮（二次确认），调整控制面板按钮顺序避免红色按钮相邻 |
 | 2.2.1 | 2026-05-21 | **固件优化**：编译器SIZE优化、禁用GDB stub、禁用mbedTLS证书捆绑包（节省~50KB）、日志缓冲区4KB、生产级日志级别INFO；**代码清理**：删除6个废弃函数、NVS错误处理简化、pm_manager ESP32-C3 DFS跳过；**Web日志页**：级别解析修复、浅色背景；**版本管理**：手动版本号（CMake VERSION） |
+| 2.2.5 | 2026-05-24 | **Web日志缓冲区修复**：snprintf返回值溢出修复（防止缓冲区填满时内容丢失）、日志拦截器提前启动（捕获全部初始化日志）；**OTA状态修复**：ESP_OTA_IMG_NEW状态处理、异常状态自动标记有效、错误状态显示修复；**Flash保存周期**：新增4小时选项；**日志级别**：完善全部OTA状态显示（NEW/PENDING_VERIFY/VALID/INVALID/ABORTED） |
+| 2.3.0 | 2026-05-24 | **NVS架构统一**：废弃独立命名空间（wifi/mqtt_config/wp_rt），统一到water_purifier/wp_filters/history/daily_stats四命名空间；**迁移机制**：首次启动自动迁移旧数据并清理废弃命名空间；**数据一致性**：消除总用水量761L vs 218L等重复存储问题；**代码简化**：WiFi/MQTT模块改用config_manager接口，移除wp_rt运行数据持久化（改为临时状态） |；**Web Basic Auth**：管理页面/OTA/日志需认证，首页/WiFi配网公开；Session Cookie 24小时滑动过期；管理页面新增认证配置开关；**日志优化**：10KB HTML缓冲区、正向读取（新日志在底部）、智能跳过旧日志、内存检查保护；**HTTP稳定性**：接收/发送超时10秒；**Web日志显示优化**：两阶段扫描（逆向计算+正向输出），确保新日志完整显示，跳过提示"... (跳过X条旧日志，显示最新Y条)"；**OTA回滚配置**：启用CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE，bootloader自动转换NEW→PENDING_VERIFY状态；**OTA状态处理**：NEW状态显式处理，改进错误日志提示 |
 
 ---
 
