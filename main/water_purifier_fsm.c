@@ -284,13 +284,7 @@ static void transition_to_pure_flush(void)
              fsm_ctx.water_hammer_pump_stop_delay_ms,
              fsm_ctx.water_hammer_valve_close_delay_ms);
 
-    // 记录常规冲洗阶段的时长（换芯冲洗不计入统计）
-    uint64_t normal_flush_sec = 0;
-    if (fsm_ctx.flush_start_time > 0 && !fsm_ctx.filter_flush_mode) {
-        normal_flush_sec = (esp_timer_get_time() - fsm_ctx.flush_start_time) / 1000000;
-        fsm_ctx.runtime_data.total_flush_time_sec += normal_flush_sec;
-        ESP_LOGI(TAG, "常规冲洗时长: %lu秒，已计入总冲洗时间", (uint32_t)normal_flush_sec);
-    }
+    // 冲洗时长已在execute_normal_flush中统计，此处无需重复
 
     // 重置flush_start_time，纯水洗膜阶段重新计时
     fsm_ctx.flush_start_time = esp_timer_get_time();
@@ -430,6 +424,34 @@ static void transition_to(fsm_state_t new_state)
         }
     }
 
+    /* 常规冲洗 -> 纯水洗膜：包含冲洗时长 */
+    if (new_state == FSM_STATE_PURE_FLUSH && old_state == FSM_STATE_NORMAL_FLUSH) {
+        uint64_t flush_sec = 0;
+        if (fsm_ctx.flush_start_time > 0) {
+            flush_sec = get_elapsed_sec(fsm_ctx.flush_start_time);
+        }
+        ESP_LOGI(TAG, "状态转换: 常规冲洗(%lu秒) -> 纯水洗膜",
+                 (uint32_t)flush_sec);
+        if (fsm_ctx.state_callback) {
+            fsm_ctx.state_callback(old_state, new_state);
+        }
+        return;
+    }
+
+    /* 纯水洗膜 -> 待机：包含洗膜时长 */
+    if (new_state == FSM_STATE_STANDBY && old_state == FSM_STATE_PURE_FLUSH) {
+        uint64_t flush_sec = 0;
+        if (fsm_ctx.flush_start_time > 0) {
+            flush_sec = get_elapsed_sec(fsm_ctx.flush_start_time);
+        }
+        ESP_LOGI(TAG, "状态转换: 纯水洗膜(%lu秒) -> 待机",
+                 (uint32_t)flush_sec);
+        if (fsm_ctx.state_callback) {
+            fsm_ctx.state_callback(old_state, new_state);
+        }
+        return;
+    }
+
     /* 进入水满状态时，也要累计制水水量（防止execute_tank_full被事件中断） */
     if (new_state == FSM_STATE_TANK_FULL && old_state == FSM_STATE_PRODUCTION) {
         if (fsm_ctx.production_start_time > 0) {
@@ -445,13 +467,18 @@ static void transition_to(fsm_state_t new_state)
             if (pre_liters > 0.1f || post_liters > 0.1f) {
                 filter_mgr_update_water_usage_dual(pre_liters, post_liters);
                 history_update_daily_production((uint32_t)prod_sec);
-                ESP_LOGI(TAG, "水满转换统计: %.1f 升(RO), 前三级过水: %.1f 升", post_liters, pre_liters);
+                // 统计信息合并到状态转换日志中，包含制水时长
+                ESP_LOGI(TAG, "状态转换: 制水(%lu秒, RO %.1f升, 过水 %.1f升) -> 水满",
+                         (uint32_t)prod_sec, post_liters, pre_liters);
+            } else {
+                ESP_LOGI(TAG, "状态转换: 制水(%lu秒) -> 水满", (uint32_t)prod_sec);
             }
 
             // 短制水判断（标记供execute_tank_full使用）
             fsm_ctx.short_production = (prod_sec < fsm_ctx.short_prod_threshold_sec);
             fsm_ctx.runtime_dirty = true;
-            // 注意：不清除production_start_time，让execute_tank_full再次检查并清除
+            fsm_ctx.production_start_time = 0;  // 统计完成后清除
+            return;  // 已输出日志，跳过通用状态转换日志
         }
     }
 
@@ -645,7 +672,7 @@ static void execute_normal_flush(void)
                 return;
             }
 
-            ESP_LOGI(TAG, "常规冲洗完成（%lu秒），进入纯水洗膜过渡", (uint32_t)elapsed);
+            ESP_LOGD(TAG, "常规冲洗完成，进入纯水洗膜过渡");
 
             // 常规冲洗水量计入前三级滤芯（后两级不经过）
             if (fsm_ctx.flush_start_time > 0) {
@@ -722,7 +749,7 @@ static void execute_pure_flush(void)
         uint32_t flush_dur = fsm_ctx.short_production ? 5 : fsm_ctx.pure_flush_duration_sec;
 
         if (elapsed >= flush_dur) {
-            ESP_LOGI(TAG, "纯水洗膜完成（%lu秒）", flush_dur);
+            ESP_LOGD(TAG, "纯水洗膜完成");
             stop_all_outputs();
 
             // 更新冲洗时间统计（换芯冲洗不计入，保持数据一致性）

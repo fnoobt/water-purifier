@@ -25,6 +25,7 @@
 #include "cJSON.h"
 #include "mbedtls/base64.h"
 #include <string.h>
+#include <stdlib.h>
 #include <time.h>
 #include <stdbool.h>
 
@@ -841,7 +842,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
         return httpd_resp_send(req, "<span style='color:#f57c00'>内存不足，无法显示详细日志</span>", HTTPD_RESP_USE_STRLEN);
     }
 
-    static char buf[LOG_BUF_SIZE + 2048];
+    static char buf[LOG_BUF_SIZE + 8192];  // 16384 字节，覆盖全部日志场景
     int pos = 0;
 
     // 解析查询参数中的日志级别过滤
@@ -862,71 +863,39 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     uint32_t tail = s_log_tail;
     uint32_t head = s_log_head;
 
-    // ==================== 第一阶段：逆向扫描 ====================
-    // 从 head 逆向扫描，计算能显示多少行（确保新日志完整）
-    #define HTML_OUTPUT_LIMIT 9000  // 预留1KB给头部和尾部JS
-    #define HTML_LINE_OVERHEAD 80   // 每行HTML开销（span标签+时间戳+换行）
+    // ==================== 第一阶段：逆向扫描（记录每行位置）====================
+    // 不进行估算，直接在第二阶段正向输出边写入边检查
 
+    #define MAX_LOG_LINES 200  // 最多记录200行位置
+    static uint32_t line_starts[MAX_LOG_LINES];  // 每行的起始位置
+    int line_count = 0;
     uint32_t scan_pos = head;
-    uint32_t output_start = tail;  // 默认从tail开始
-    int html_accum = 0;
-    int output_lines = 0;
-    int total_lines = 0;
-
-    // 临时缓冲区读取一行（逆向扫描时）
-    char scan_line[300];
     int scan_line_len = 0;
 
-    while (scan_pos != tail && html_accum < HTML_OUTPUT_LIMIT) {
-        // 逆向移动一个位置
+    // 逆向扫描，记录每行的起始位置
+    // 逆向扫描从 head(最新) 到 tail(最旧)，所以：
+    // line_starts[0] = 最新日志，line_starts[line_count-1] = 最旧日志
+    while (scan_pos != tail && line_count < MAX_LOG_LINES) {
         scan_pos = (scan_pos == 0) ? (LOG_BUF_SIZE - 1) : (scan_pos - 1);
         char c = s_log_buf[scan_pos];
 
         if (c == '\n' || c == '\r') {
             if (scan_line_len > 0) {
-                // 找到一行，解析级别
-                scan_line[scan_line_len] = '\0';
-                char lvl = 0;
-                if (scan_line_len >= 1) {
-                    char first = scan_line[scan_line_len - 1];  // 逆向存储，最后一个是第一个字符
-                    if (first == 'E' || first == 'W' || first == 'I' || first == 'D') {
-                        lvl = first;
-                    }
-                }
-
-                // 检查级别过滤
-                bool show_line = (strcmp(level_filter, "all") == 0);
-                if (!show_line && lvl) {
-                    for (int i = 0; level_filter[i]; i++) {
-                        if (level_filter[i] == lvl) { show_line = true; break; }
-                    }
-                }
-
-                if (show_line) {
-                    // 计算这一行的HTML大小
-                    int html_size = scan_line_len * 2 + HTML_LINE_OVERHEAD;  // 保守估算
-                    if (html_accum + html_size <= HTML_OUTPUT_LIMIT) {
-                        html_accum += html_size;
-                        output_lines++;
-                        output_start = scan_pos + 1;  // 这一行开始的位置
-                        if (output_start >= LOG_BUF_SIZE) output_start = 0;
-                    }
-                }
-                total_lines++;
+                uint32_t line_start = scan_pos + 1;
+                if (line_start >= LOG_BUF_SIZE) line_start = 0;
+                line_starts[line_count] = line_start;
+                line_count++;
                 scan_line_len = 0;
             }
         } else {
-            // 逆向存储字符（反向）
             if (scan_line_len < 299) {
-                scan_line[scan_line_len++] = c;
+                scan_line_len++;
             }
         }
     }
 
-    int skip_count = total_lines - output_lines;
-
-    // ==================== 第二阶段：正向输出 ====================
-    // 从 output_start 正向读取到 head
+    // ==================== 第二阶段：正向输出（从最旧到最新）====================
+    // 最旧日志在最上方，最新日志在最下方
 
     pos = snprintf(buf, sizeof(buf),
         "<style>.ts{color:#888;margin-right:4px}.E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}</style>"
@@ -936,108 +905,111 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
         has_wall_time ? "时间戳已同步" : "时间戳未同步",
         level_filter);
 
-    // 如果跳过了旧日志，显示提示
-    if (skip_count > 0) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "<span style='color:#888;font-size:11px'>... (跳过%d条旧日志，显示最新%d条)</span>\n",
-            skip_count, output_lines);
-    }
+    // ==================== 第二阶段：Chronological 输出（oldest → newest）====================
+    // 直接从 oldest 向 newest 输出，逐行写入检查
+    // 缓冲区满时自然停止
 
-    // 从 output_start 正向读取
-    uint32_t read_pos = output_start;
+    int output_lines = 0;
+    int skipped_by_filter = 0;
     char line_buf[300];
     int line_len = 0;
+    int limit = (int)sizeof(buf) - 100;
 
-    while (read_pos != head && pos < (int)sizeof(buf) - 100) {
-        char c = s_log_buf[read_pos];
-        read_pos = (read_pos + 1) % LOG_BUF_SIZE;
+    // 从 oldest (line_count-1) 向 newest (0) 输出
+    for (int i = line_count - 1; i >= 0 && pos < limit; i--) {
+        uint32_t line_start = line_starts[i];
+        uint32_t read_pos = line_start;
+        line_len = 0;
 
-        if (c == '\n' || c == '\r') {
-            if (line_len > 0) {
-                line_buf[line_len] = '\0';
-
-                // 解析日志级别
-                char lvl = 0;
-                uint32_t boot_ms = 0;
-                if (line_len >= 5 &&
-                    (line_buf[0] == 'E' || line_buf[0] == 'W' || line_buf[0] == 'I' || line_buf[0] == 'D')) {
-                    lvl = line_buf[0];
-                    if (line_buf[1] == ' ' && line_buf[2] == '(') {
-                        int ts_end = 3;
-                        while (ts_end < line_len && line_buf[ts_end] != ')') ts_end++;
-                        if (ts_end < line_len && line_buf[ts_end] == ')') {
-                            char ts_str[16] = {0};
-                            int ts_len = ts_end - 3;
-                            if (ts_len > 0 && ts_len < 16) {
-                                memcpy(ts_str, line_buf + 3, ts_len);
-                                boot_ms = (uint32_t)atoi(ts_str);
-                            }
-                        }
-                    }
-                }
-
-                // 检查日志级别过滤
-                bool show_log = (strcmp(level_filter, "all") == 0);
-                if (!show_log && lvl) {
-                    for (int i = 0; level_filter[i]; i++) {
-                        if (level_filter[i] == lvl) { show_log = true; break; }
-                    }
-                }
-
-                if (show_log) {
-                    int cls = 0;
-                    if (lvl) {
-                        memcpy(buf + pos, "<span class='", 13);
-                        pos += 13;
-                        buf[pos++] = lvl;
-                        memcpy(buf + pos, "'>", 2);
-                        pos += 2;
-                        cls = 1;
-                    }
-
-                    // 时间戳
-                    if (has_wall_time && boot_ms > 0 && cls) {
-                        time_t log_time = boot_wall + (boot_ms / 1000);
-                        struct tm tm_log;
-                        localtime_r(&log_time, &tm_log);
-                        pos += snprintf(buf + pos, sizeof(buf) - pos,
-                            "<span class='ts'>%04d-%02d-%02d %02d:%02d:%02d</span> ",
-                            tm_log.tm_year + 1900, tm_log.tm_mon + 1, tm_log.tm_mday,
-                            tm_log.tm_hour, tm_log.tm_min, tm_log.tm_sec);
-                    }
-
-                    // 输出日志内容
-                    int content_start = 0;
-                    if (lvl && line_len >= 5) {
-                        int paren_end = 2;
-                        while (paren_end < line_len && line_buf[paren_end] != ')') paren_end++;
-                        if (paren_end < line_len && paren_end + 3 < line_len) {
-                            buf[pos++] = lvl;
-                            buf[pos++] = ' ';
-                            content_start = paren_end + 1;
-                            if (content_start < line_len && line_buf[content_start] == ' ') content_start++;
-                        }
-                    }
-
-                    // HTML转义
-                    for (int i = content_start; i < line_len && pos < (int)sizeof(buf) - 10; i++) {
-                        char ch = line_buf[i];
-                        if (ch == '<') { buf[pos++] = '&'; buf[pos++] = 'l'; buf[pos++] = 't'; }
-                        else if (ch == '>') { buf[pos++] = '&'; buf[pos++] = 'g'; buf[pos++] = 't'; }
-                        else if (ch == '&') { buf[pos++] = '&'; buf[pos++] = 'a'; buf[pos++] = 'm'; buf[pos++] = 'p'; buf[pos++] = ';'; }
-                        else buf[pos++] = ch;
-                    }
-
-                    if (cls && pos + 8 < (int)sizeof(buf)) {
-                        memcpy(buf + pos, "</span>", 7);
-                        pos += 7;
-                    }
-                    buf[pos++] = '\n';
-                }
-                line_len = 0;
-            }
-        } else if (line_len < 299) {
+        // 读取这一行
+        while (read_pos != head && line_len < 299) {
+            char c = s_log_buf[read_pos];
+            if (c == '\n' || c == '\r') break;
             line_buf[line_len++] = c;
+            read_pos = (read_pos + 1) % LOG_BUF_SIZE;
+        }
+        line_buf[line_len] = '\0';
+
+        // 解析日志级别
+        char lvl = 0;
+        uint32_t boot_ms = 0;
+        if (line_len >= 5 &&
+            (line_buf[0] == 'E' || line_buf[0] == 'W' || line_buf[0] == 'I' || line_buf[0] == 'D')) {
+            lvl = line_buf[0];
+            if (line_buf[1] == ' ' && line_buf[2] == '(') {
+                int ts_end = 3;
+                while (ts_end < line_len && line_buf[ts_end] != ')') ts_end++;
+                if (ts_end < line_len && line_buf[ts_end] == ')') {
+                    char ts_str[16] = {0};
+                    int ts_len = ts_end - 3;
+                    if (ts_len > 0 && ts_len < 16) {
+                        memcpy(ts_str, line_buf + 3, ts_len);
+                        boot_ms = (uint32_t)atoi(ts_str);
+                    }
+                }
+            }
+        }
+
+        // 检查日志级别过滤
+        bool show_log = (strcmp(level_filter, "all") == 0);
+        if (!show_log && lvl) {
+            for (int j = 0; level_filter[j]; j++) {
+                if (level_filter[j] == lvl) { show_log = true; break; }
+            }
+        }
+
+        if (!show_log) {
+            skipped_by_filter++;  // 因级别过滤跳过
+        } else {
+            output_lines++;  // 计数输出的行数
+            int cls = 0;
+            if (lvl) {
+                memcpy(buf + pos, "<span class='", 13);
+                pos += 13;
+                buf[pos++] = lvl;
+                memcpy(buf + pos, "'>", 2);
+                pos += 2;
+                cls = 1;
+            }
+
+            // 时间戳
+            if (has_wall_time && boot_ms > 0 && cls) {
+                time_t log_time = boot_wall + (boot_ms / 1000);
+                struct tm tm_log;
+                localtime_r(&log_time, &tm_log);
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "<span class='ts'>%04d-%02d-%02d %02d:%02d:%02d</span> ",
+                    tm_log.tm_year + 1900, tm_log.tm_mon + 1, tm_log.tm_mday,
+                    tm_log.tm_hour, tm_log.tm_min, tm_log.tm_sec);
+            }
+
+            // 输出日志内容
+            int content_start = 0;
+            if (lvl && line_len >= 5) {
+                int paren_end = 2;
+                while (paren_end < line_len && line_buf[paren_end] != ')') paren_end++;
+                if (paren_end < line_len && paren_end + 3 < line_len) {
+                    buf[pos++] = lvl;
+                    buf[pos++] = ' ';
+                    content_start = paren_end + 1;
+                    if (content_start < line_len && line_buf[content_start] == ' ') content_start++;
+                }
+            }
+
+            // HTML转义
+            for (int k = content_start; k < line_len && pos < (int)sizeof(buf) - 10; k++) {
+                char ch = line_buf[k];
+                if (ch == '<') { buf[pos++] = '&'; buf[pos++] = 'l'; buf[pos++] = 't'; }
+                else if (ch == '>') { buf[pos++] = '&'; buf[pos++] = 'g'; buf[pos++] = 't'; }
+                else if (ch == '&') { buf[pos++] = '&'; buf[pos++] = 'a'; buf[pos++] = 'm'; buf[pos++] = 'p'; buf[pos++] = ';'; }
+                else buf[pos++] = ch;
+            }
+
+            if (cls && pos + 8 < (int)sizeof(buf)) {
+                memcpy(buf + pos, "</span>", 7);
+                pos += 7;
+            }
+            buf[pos++] = '\n';
         }
     }
 
@@ -2423,7 +2395,7 @@ esp_err_t web_server_start(void)
     cfg.server_port = ctx.config.port;
     cfg.lru_purge_enable = true;
     cfg.max_uri_handlers = 26;
-    cfg.stack_size = 12288;  // 增加到12KB，handle_log_debug需要约9KB缓冲区
+    cfg.stack_size = 20480;  // 增加到20KB，handle_log_debug需要约17KB缓冲区
     cfg.max_open_sockets = 3;  // ESP-IDF v6.0限制：LWIP_MAX_SOCKETS=6，httpd内部占用3
     cfg.recv_wait_timeout = 10;    // 接收超时10秒（默认5秒）
     cfg.send_wait_timeout = 10;    // 发送超时10秒（默认5秒）
