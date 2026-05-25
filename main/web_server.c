@@ -848,7 +848,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
         return httpd_resp_send(req, "<span style='color:#f57c00'>内存不足，无法显示详细日志</span>", HTTPD_RESP_USE_STRLEN);
     }
 
-    static char buf[LOG_BUF_SIZE + 8192];  // 16384 字节，覆盖全部日志场景
+    static char buf[LOG_BUF_SIZE * 2 + 4096];  // 20480字节，容纳HTML膨胀(约2x)
     int pos = 0;
 
     // 解析查询参数中的日志级别过滤
@@ -2384,7 +2384,6 @@ static esp_err_t ota_rollback_handler(httpd_req_t *req)
 esp_err_t web_server_init(void)
 {
     if (ctx.initialized) return ESP_OK;
-    ESP_LOGI(TAG, "初始化Web服务器");
 
     // 抑制httpd_txrx模块的socket连接重置警告(error in recv: 104)
     // 这是浏览器关闭连接时的正常现象，无需警告

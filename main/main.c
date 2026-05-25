@@ -184,10 +184,7 @@ void app_main(void)
     // 提前启动日志拦截器，捕获所有初始化日志
     web_server_init_log_interceptor();
 
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  净水器主控板程序启动");
-    ESP_LOGI(TAG, "  硬件: ESP32-C3");
-    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "==== 净水器主控板程序启动，硬件: ESP32-C3 ====");
 
     // 0. 任务看门狗说明
     // ESP-IDF v6.0系统启动时已初始化看门狗（~5秒超时），无需重复初始化
@@ -280,10 +277,7 @@ void app_main(void)
         ESP_LOGE(TAG, "监控任务创建失败");
     }
 
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  系统初始化完成！");
-    ESP_LOGI(TAG, "  可用内存: %lu bytes", esp_get_free_heap_size());
-    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "==== 系统初始化完成！可用内存: %lu bytes ====", esp_get_free_heap_size());
 
     // 主循环
     while (1) {

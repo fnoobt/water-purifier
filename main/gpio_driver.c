@@ -83,8 +83,6 @@ esp_err_t gpio_driver_init_inputs(void)
 {
     esp_err_t ret;
 
-    ESP_LOGI(TAG, "初始化输入GPIO引脚...");
-
     // 配置低压开关 (GPIO6)
     ret = gpio_reset_pin(GPIO_LOW_PRESSURE_SWITCH);
     if (ret != ESP_OK) return ret;
@@ -114,8 +112,6 @@ esp_err_t gpio_driver_init_inputs(void)
 esp_err_t gpio_driver_init_outputs(void)
 {
     esp_err_t ret;
-
-    ESP_LOGI(TAG, "初始化输出GPIO引脚...");
 
     // 获取当前触发电平
     uint8_t inactive_level = output_state.relay_trigger_level ? 0 : 1;
@@ -167,8 +163,6 @@ esp_err_t gpio_driver_init_outputs(void)
 esp_err_t gpio_driver_init_leds(void)
 {
     esp_err_t ret;
-
-    ESP_LOGI(TAG, "初始化LED引脚...");
 
     // 配置LED D4 (GPIO12)
     ret = gpio_reset_pin(GPIO_LED_STATUS_1);

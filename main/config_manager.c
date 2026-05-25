@@ -62,8 +62,8 @@ static void config_manager_migrate_nvs(void)
             nvs_erase_all(erase_handle);
             nvs_commit(erase_handle);
             nvs_close(erase_handle);
+            ESP_LOGI(TAG, "已删除旧wifi命名空间");
         }
-        ESP_LOGI(TAG, "已删除旧wifi命名空间");
     }
 
     // 2. 迁移mqtt_config命名空间 → water_purifier
@@ -138,8 +138,8 @@ static void config_manager_migrate_nvs(void)
             nvs_erase_all(erase_handle);
             nvs_commit(erase_handle);
             nvs_close(erase_handle);
+            ESP_LOGI(TAG, "已删除旧wp_rt命名空间");
         }
-        ESP_LOGI(TAG, "已删除旧wp_rt命名空间");
     }
 
     // 4. 清理water_purifier中的废弃字段
@@ -295,8 +295,6 @@ esp_err_t config_manager_init(void)
     if (ctx.initialized) {
         return ESP_OK;
     }
-
-    ESP_LOGI(TAG, "初始化配置管理器...");
 
     // 初始化NVS（遇到损坏时自动擦除恢复）
     esp_err_t ret = nvs_flash_init();
@@ -558,7 +556,6 @@ esp_err_t config_manager_load(void)
         ctx.config_dirty = false;  // 降级处理
     }
 
-    ESP_LOGI(TAG, "配置已加载");
     return ESP_OK;
 }
 
@@ -1260,7 +1257,6 @@ void config_manager_print_config(void)
     ESP_LOGI(TAG, "继电平: %s", ctx.config.relay_trigger_level ? "高" : "低");
     ESP_LOGI(TAG, "TDS阈值: 进水%.0f/出水%.0f ppm",
              ctx.config.tds_inlet_threshold, ctx.config.tds_outlet_threshold);
-    ESP_LOGI(TAG, "===================");
 }
 
 // ==================== FSM运行统计同步 ====================

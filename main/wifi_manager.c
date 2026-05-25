@@ -194,8 +194,6 @@ esp_err_t wifi_manager_init(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "初始化WiFi管理器...");
-
     // 创建状态访问互斥锁
     ctx.state_mutex = xSemaphoreCreateMutex();
     if (!ctx.state_mutex) {

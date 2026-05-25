@@ -92,8 +92,6 @@ esp_err_t tds_sensor_init(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "初始化TDS传感器...");
-
     // 先配置GPIO引脚为模拟输入模式，禁用上拉/下拉
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << ADC_TDS_IN_GPIO) | (1ULL << ADC_TDS_OUT_GPIO),

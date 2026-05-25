@@ -458,8 +458,6 @@ esp_err_t filter_mgr_init(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "初始化滤芯管理模块...");
-
     // 创建互斥锁
     fctx.mutex = xSemaphoreCreateMutex();
     if (!fctx.mutex) {

@@ -32,9 +32,6 @@ esp_err_t pm_manager_init(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "初始化电源管理...");
-    ESP_LOGI(TAG, "ESP32-C3不支持DFS，CPU固定160MHz");
-
     taskENTER_CRITICAL(&pm_spinlock);
     s_ctx.current_wifi_tx_power = 80;  // 20dBm (80 * 0.25 = 20)
     s_ctx.wifi_tx_adjusted = false;

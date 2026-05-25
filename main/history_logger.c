@@ -208,8 +208,6 @@ esp_err_t history_logger_init(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "初始化历史记录模块...");
-
     ctx.mutex = xSemaphoreCreateMutex();
     if (!ctx.mutex) {
         ESP_LOGE(TAG, "创建互斥锁失败");

@@ -1215,8 +1215,6 @@ esp_err_t fsm_init(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "初始化状态机...");
-
     fsm_ctx.event_queue = xQueueCreate(16, sizeof(fsm_event_t));
     if (!fsm_ctx.event_queue) {
         ESP_LOGE(TAG, "创建事件队列失败");

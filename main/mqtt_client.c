@@ -131,8 +131,6 @@ esp_err_t mqtt_client_init(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "初始化MQTT客户端...");
-
     // 尝试从NVS加载配置
     if (mqtt_client_load_config() != ESP_OK) {
         ESP_LOGI(TAG, "无保存的MQTT配置，使用默认值");
@@ -153,8 +151,6 @@ esp_err_t mqtt_client_deinit(void)
     if (!mqtt_ctx.initialized) {
         return ESP_OK;
     }
-
-    ESP_LOGI(TAG, "反初始化MQTT客户端...");
     mqtt_ctx.initialized = false;
     return ESP_OK;
 }

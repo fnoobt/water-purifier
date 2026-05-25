@@ -543,12 +543,12 @@ water-purifier/set/flush           # 冲洗控制
 - 8KB环形缓冲区 `s_log_buf[LOG_BUF_SIZE]`，存储ESP-IDF原始日志
 - `log_vprintf_hook()` 通过 `esp_log_set_vprintf()` 拦截所有 `ESP_LOG*` 输出
 - 日志拦截器在初始化最开始启动，捕获全部初始化日志
-- `handle_log_debug()` 正向输出（旧→新），最新日志显示在底部
-- 动态空间估算，缓冲区不足时跳过旧日志确保新日志完整
+- `handle_log_debug()` 简单正向读取（旧→新），最新日志显示在底部
+- 输出缓冲区16KB（`LOG_BUF_SIZE * 2`），容纳HTML格式化后的日志（约2-3倍膨胀）
 - 内存检查：可用堆 < 20KB时返回简单错误消息
 
 **HTTP服务器配置**:
-- 任务栈: 12KB（handle_log_debug需要约10KB缓冲区）
+- 任务栈: 12KB（buf是static不占用栈，足够HTTP处理）
 - 接收/发送超时: 10秒（默认5秒）
 - 最大socket: 3（ESP-IDF v6.0 LWIP限制）
 - 最大URI处理器: 26
@@ -1064,6 +1064,7 @@ POST /api/ota/rollback
 | 2.2.5 | 2026-05-24 | **Web日志缓冲区修复**：snprintf返回值溢出修复（防止缓冲区填满时内容丢失）、日志拦截器提前启动（捕获全部初始化日志）；**OTA状态修复**：ESP_OTA_IMG_NEW状态处理、异常状态自动标记有效、错误状态显示修复；**Flash保存周期**：新增4小时选项；**日志级别**：完善全部OTA状态显示（NEW/PENDING_VERIFY/VALID/INVALID/ABORTED） |
 | 2.3.0 | 2026-05-24 | **NVS架构统一**：废弃独立命名空间（wifi/mqtt_config/wp_rt），统一到water_purifier/wp_filters/history/daily_stats四命名空间；**迁移机制**：首次启动自动迁移旧数据并清理废弃命名空间；**数据一致性**：消除总用水量761L vs 218L等重复存储问题；**代码简化**：WiFi/MQTT模块改用config_manager接口，移除wp_rt运行数据持久化（改为临时状态）；**Web Basic Auth**：管理页面/OTA/日志需认证，首页/WiFi配网公开；Session Cookie 24小时滑动过期；管理页面新增认证配置开关；**日志优化**：10KB HTML缓冲区、正向读取（新日志在底部）、智能跳过旧日志、内存检查保护；**HTTP稳定性**：接收/发送超时10秒；**Web日志显示优化**：两阶段扫描（逆向计算+正向输出），确保新日志完整显示，跳过提示"... (跳过X条旧日志，显示最新Y条)"；**OTA回滚配置**：启用CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE，bootloader自动转换NEW→PENDING_VERIFY状态；**OTA状态处理**：NEW状态显式处理，改进错误日志提示 |
 | 2.3.1 | 2026-05-25 | **电源管理模块完善**：pm_manager WiFi TX功率滞回算法文档完善（5档功率表+滞回阈值说明）、初始化流程添加步骤6 pm_manager_init() |
+| 2.3.4 | 2026-05-26 | **日志显示修复**：简化读取逻辑（移除复杂两阶段扫描+重试），输出缓冲区扩大至16KB（容纳HTML格式化后的日志）。原generation计数器验证不完整（仅检测缓冲区溢出，不检测绕回写入导致的数据损坏） |
 
 ---
 
@@ -1099,7 +1100,7 @@ POST /api/ota/rollback
 | main_task | 3.5 KB | 1 | ESP-IDF默认 |
 | event_task | 4 KB | 1 | WiFi/系统事件处理 |
 | fsm_task | 3 KB | 5 | 状态机主循环 |
-| httpd | 12 KB | 5 | Web服务器（handle_log_debug需要9KB） |
+| httpd | 12 KB | 5 | Web服务器（静态buf不占用栈） |
 | wifi_reconnect | 4 KB | 5 | WiFi指数退避重连 |
 | mqtt_reconnect | 4 KB | 4 | MQTT指数退避重连 |
 | tds_task | 2 KB | 4 | TDS传感器测量 |
