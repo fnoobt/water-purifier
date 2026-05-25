@@ -66,10 +66,8 @@ static struct {
     uint32_t total_water_used;
 
     // 用水量累积器（整数，单位mL，避免浮点精度误差）
-    // 前三级（PP棉、颗粒碳、压缩碳）共享pre_pump累加器
-    // 后两级（RO膜、后置炭）共享post_pump累加器
-    uint32_t pre_pump_accumulator_ml;   // 前三级累加器(毫升)
-    uint32_t post_pump_accumulator_ml;  // 后两级累加器(毫升)
+    // 每级滤芯独立累加器，重置时仅清除对应滤芯的累加器
+    uint32_t filter_accumulator_ml[FILTER_COUNT];  // 每级滤芯独立累加器(mL)
 
     // RO制水速率（升/小时）
     float production_rate_lph;
@@ -98,11 +96,10 @@ static struct {
     .mutex = NULL,
     .total_water_used = 0,
     .total_production_water = 0,
-    .pre_pump_accumulator_ml = 0,
-    .post_pump_accumulator_ml = 0,
+    .filter_accumulator_ml = {0, 0, 0, 0, 0},  // 五级滤芯独立累加器初始化为0
     .production_rate_lph = 12.0f,  // 默认汇通75G
     .waste_flow_lph = 18.0f,       // 默认300CC (300*60/1000)
-    .pump_flow_lph = 24.0f,        // 默认冲洗流量
+    .pump_flow_lph = 33.0f,        // 默认三角洲50G增压泵 (0.55L/min × 60)
     .filter_total_liters = 3000,
     .filter_used_liters = 0,
     .filter_install_time = 0,
@@ -116,7 +113,7 @@ static void load_from_nvs(void);
 static esp_err_t save_to_nvs_locked(void);  // 假定已持有锁
 static void fixup_filter_time_on_ntp_sync_locked(void);  // 假定已持有锁
 static void update_filter_time_percentage_locked(void);  // 假定已持有锁
-static void commit_accumulators_locked(void);  // 提交累加器水量
+static bool commit_accumulators_locked(void);  // 提交累加器水量，返回是否实际提交
 
 // ==================== 辅助宏 ====================
 
@@ -162,9 +159,40 @@ static void load_from_nvs(void)
     // 加载总制水量（新增字段，不存在时使用默认值0）
     nvs_get_u32(handle, "total_prod", &fctx.total_production_water);
 
-    // 加载累加器（新增字段，不存在时使用默认值0）
-    nvs_get_u32(handle, "pre_acc", &fctx.pre_pump_accumulator_ml);
-    nvs_get_u32(handle, "post_acc", &fctx.post_pump_accumulator_ml);
+    // 加载累加器（新格式：每级滤芯独立）
+    bool has_new_acc = false;
+    for (int i = 0; i < FILTER_COUNT; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "acc_%d", i);
+        if (nvs_get_u32(handle, key, &fctx.filter_accumulator_ml[i]) == ESP_OK) {
+            has_new_acc = true;
+        } else {
+            fctx.filter_accumulator_ml[i] = 0;
+        }
+    }
+
+    // 兼容旧格式：如果新字段不存在，加载旧格式并迁移
+    if (!has_new_acc) {
+        uint32_t old_pre_acc = 0, old_post_acc = 0;
+        bool has_old_pre = (nvs_get_u32(handle, "pre_acc", &old_pre_acc) == ESP_OK);
+        bool has_old_post = (nvs_get_u32(handle, "post_acc", &old_post_acc) == ESP_OK);
+
+        if (has_old_pre || has_old_post) {
+            ESP_LOGI(TAG, "迁移旧累加器格式: pre=%lu, post=%lu", old_pre_acc, old_post_acc);
+            // 前三级共享旧pre_acc（串联关系，处理相同水量）
+            for (int i = 0; i <= 2; i++) {
+                fctx.filter_accumulator_ml[i] = old_pre_acc;
+            }
+            // 后两级共享旧post_acc
+            for (int i = 3; i <= 4; i++) {
+                fctx.filter_accumulator_ml[i] = old_post_acc;
+            }
+            // 清除旧字段（延迟删除，等待save时提交）
+            nvs_erase_key(handle, "pre_acc");
+            nvs_erase_key(handle, "post_acc");
+            nvs_commit(handle);
+        }
+    }
 
     // 加载制水速率
     int32_t rate_i32;
@@ -223,9 +251,10 @@ static void load_from_nvs(void)
     fctx.filter_install_time = fctx.filters[FILTER_RO_MEMBRANE].last_reset_time;
 
     nvs_close(handle);
-    ESP_LOGI(TAG, "滤芯数据已加载: 总用水%luL, 总制水%luL, RO换后已制水%luL, 累加器pre=%lumL post=%lumL",
-             fctx.total_water_used, fctx.total_production_water, fctx.filters[FILTER_RO_MEMBRANE].used_liters,
-             fctx.pre_pump_accumulator_ml, fctx.post_pump_accumulator_ml);
+    ESP_LOGI(TAG, "滤芯数据已加载: 总用水%luL, 总制水%luL, 累加器[%lu,%lu,%lu,%lu,%lu]mL",
+             fctx.total_water_used, fctx.total_production_water,
+             fctx.filter_accumulator_ml[0], fctx.filter_accumulator_ml[1], fctx.filter_accumulator_ml[2],
+             fctx.filter_accumulator_ml[3], fctx.filter_accumulator_ml[4]);
 }
 
 // 内部保存函数（假定已持有锁）
@@ -241,9 +270,12 @@ static esp_err_t save_to_nvs_locked(void)
     nvs_set_u32(handle, "total_water", fctx.total_water_used);
     nvs_set_u32(handle, "total_prod", fctx.total_production_water);  // 保存总制水量
 
-    // 保存累加器（新增字段）
-    nvs_set_u32(handle, "pre_acc", fctx.pre_pump_accumulator_ml);
-    nvs_set_u32(handle, "post_acc", fctx.post_pump_accumulator_ml);
+    // 保存独立累加器（新格式）
+    for (int i = 0; i < FILTER_COUNT; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "acc_%d", i);
+        nvs_set_u32(handle, key, fctx.filter_accumulator_ml[i]);
+    }
 
     nvs_set_i32(handle, "prod_rate", (int32_t)(fctx.production_rate_lph * 100));
 
@@ -372,57 +404,50 @@ static void update_filter_time_percentage_locked(void)
 /**
  * @brief 提交累加器中的水量到各滤芯
  * @note 假定已持有锁，将累加器水量分配给所有对应滤芯
+ * @return true 本次有实际水量提交（>=1L）
  */
-static void commit_accumulators_locked(void)
+static bool commit_accumulators_locked(void)
 {
-    // 提交前三级累加器
-    if (fctx.pre_pump_accumulator_ml >= ACCUMULATOR_COMMIT_THRESHOLD) {
-        uint32_t pre_liters = fctx.pre_pump_accumulator_ml / 1000;  // 转换为升
-        fctx.pre_pump_accumulator_ml %= 1000;
+    bool did_commit = false;
 
-        for (int i = 0; i <= 2; i++) {  // PP棉、颗粒碳、压缩碳
-            if (UINT32_MAX - fctx.filters[i].used_liters >= pre_liters) {
-                fctx.filters[i].used_liters += pre_liters;
+    // 逐个滤芯提交独立累加器
+    for (int i = 0; i < FILTER_COUNT; i++) {
+        if (fctx.filter_accumulator_ml[i] >= ACCUMULATOR_COMMIT_THRESHOLD) {
+            did_commit = true;
+            uint32_t liters = fctx.filter_accumulator_ml[i] / 1000;
+            fctx.filter_accumulator_ml[i] %= 1000;
+
+            // 增加该滤芯已用水量
+            if (UINT32_MAX - fctx.filters[i].used_liters >= liters) {
+                fctx.filters[i].used_liters += liters;
             }
+
+            // 更新剩余寿命百分比
             if (fctx.filters[i].total_liters > 0) {
                 float remaining = 1.0f - (float)fctx.filters[i].used_liters / fctx.filters[i].total_liters;
                 if (remaining < 0) remaining = 0;
                 if (remaining > 1) remaining = 1;
                 fctx.filters[i].percentage = (uint8_t)(remaining * 100);
             }
-        }
 
-        // 更新总用水量
-        if (UINT32_MAX - fctx.total_water_used >= pre_liters) {
-            fctx.total_water_used += pre_liters;
+            // 累加到总用水量/制水量
+            if (i <= 2) {  // 前三级计入总用水量
+                if (UINT32_MAX - fctx.total_water_used >= liters) {
+                    fctx.total_water_used += liters;
+                }
+            } else {  // 后两级计入总制水量
+                if (UINT32_MAX - fctx.total_production_water >= liters) {
+                    fctx.total_production_water += liters;
+                }
+                // 兼容字段（RO膜）
+                if (UINT32_MAX - fctx.filter_used_liters >= liters) {
+                    fctx.filter_used_liters += liters;
+                }
+            }
         }
     }
 
-    // 提交后两级累加器
-    if (fctx.post_pump_accumulator_ml >= ACCUMULATOR_COMMIT_THRESHOLD) {
-        uint32_t post_liters = fctx.post_pump_accumulator_ml / 1000;
-        fctx.post_pump_accumulator_ml %= 1000;
-
-        for (int i = 3; i <= 4; i++) {  // RO膜、后置炭
-            if (UINT32_MAX - fctx.filters[i].used_liters >= post_liters) {
-                fctx.filters[i].used_liters += post_liters;
-            }
-            if (fctx.filters[i].total_liters > 0) {
-                float remaining = 1.0f - (float)fctx.filters[i].used_liters / fctx.filters[i].total_liters;
-                if (remaining < 0) remaining = 0;
-                if (remaining > 1) remaining = 1;
-                fctx.filters[i].percentage = (uint8_t)(remaining * 100);
-            }
-        }
-
-        // 更新总制水量和兼容字段
-        if (UINT32_MAX - fctx.total_production_water >= post_liters) {
-            fctx.total_production_water += post_liters;
-        }
-        if (UINT32_MAX - fctx.filter_used_liters >= post_liters) {
-            fctx.filter_used_liters += post_liters;
-        }
-    }
+    return did_commit;
 }
 
 // ==================== 初始化 ====================
@@ -535,29 +560,37 @@ esp_err_t filter_mgr_update_water_usage_dual(float pre_liters, float post_liters
     uint32_t pre_ml = (uint32_t)(pre_liters * 1000.0f);  // 升转毫升
     uint32_t post_ml = (uint32_t)(post_liters * 1000.0f);
 
-    // 累加到累加器
+    // 前三级各自累加（串联关系，每级都处理相同水量）
     if (pre_ml > 0) {
-        if (UINT32_MAX - fctx.pre_pump_accumulator_ml >= pre_ml) {
-            fctx.pre_pump_accumulator_ml += pre_ml;
-        } else {
-            fctx.pre_pump_accumulator_ml = UINT32_MAX;  // 防止溢出
+        for (int i = 0; i <= 2; i++) {
+            if (UINT32_MAX - fctx.filter_accumulator_ml[i] >= pre_ml) {
+                fctx.filter_accumulator_ml[i] += pre_ml;
+            } else {
+                fctx.filter_accumulator_ml[i] = UINT32_MAX;  // 防止溢出
+            }
         }
     }
+    // 后两级各自累加（串联关系，每级都处理相同水量）
     if (post_ml > 0) {
-        if (UINT32_MAX - fctx.post_pump_accumulator_ml >= post_ml) {
-            fctx.post_pump_accumulator_ml += post_ml;
-        } else {
-            fctx.post_pump_accumulator_ml = UINT32_MAX;
+        for (int i = 3; i <= 4; i++) {
+            if (UINT32_MAX - fctx.filter_accumulator_ml[i] >= post_ml) {
+                fctx.filter_accumulator_ml[i] += post_ml;
+            } else {
+                fctx.filter_accumulator_ml[i] = UINT32_MAX;
+            }
         }
     }
 
-    // 提交累加器（>=1L时提交）
-    commit_accumulators_locked();
+    // 提交累加器（>=1L时提交），仅在实际提交时设置脏标志
+    bool did_commit = commit_accumulators_locked();
 
     // 更新时间维度寿命
     update_filter_time_percentage_locked();
 
-    fctx.save_needed = true;
+    // 仅在实际提交水量时标记需要保存（减少无意义脏标志）
+    if (did_commit) {
+        fctx.save_needed = true;
+    }
 
     LOCK_GIVE();
     return ESP_OK;
@@ -664,9 +697,13 @@ esp_err_t filter_mgr_reset_filter(filter_type_t filter_type)
 
     LOCK_GET(100);
 
-    // 修复：先提交累加器水量到所有滤芯（包括即将重置的滤芯）
+    // 先提交累加器水量到所有滤芯（包括即将重置的滤芯）
     // 这样重置后，累加器归零，下次累积的水量只属于未重置的滤芯
-    commit_accumulators_locked();
+    (void)commit_accumulators_locked();  // 忽略返回值，重置操作本身会触发保存
+
+    // 只清除被重置滤芯的独立累加器（不影响其他滤芯）
+    fctx.filter_accumulator_ml[filter_type] = 0;
+    ESP_LOGD(TAG, "清除滤芯%d独立累加器", filter_type);
 
     // 重置指定滤芯
     time_t now_sec = time(NULL);
@@ -701,9 +738,10 @@ esp_err_t filter_mgr_reset_all_filters(void)
 {
     LOCK_GET(100);
 
-    // 清除累加器
-    fctx.pre_pump_accumulator_ml = 0;
-    fctx.post_pump_accumulator_ml = 0;
+    // 清除所有独立累加器
+    for (int i = 0; i < FILTER_COUNT; i++) {
+        fctx.filter_accumulator_ml[i] = 0;
+    }
 
     time_t now_sec = time(NULL);
     uint32_t reset_time = (now_sec > 1) ? (uint32_t)now_sec : 0;

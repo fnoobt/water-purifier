@@ -66,6 +66,12 @@ typedef struct {
     bool web_auth_enabled;
     char web_username[32];
     char web_password[32];
+
+    // FSM运行统计（持久化）
+    uint32_t fsm_prod_cycles;       // 总制水周期数
+    uint32_t fsm_flush_cycles;      // 总冲洗周期数
+    uint64_t fsm_prod_time_sec;     // 总制水时间（秒）
+    uint64_t fsm_flush_time_sec;    // 总冲洗时间（秒）
 } system_config_t;
 
 // ==================== 初始化接口 ====================
@@ -202,6 +208,28 @@ bool config_manager_has_wifi_config(void);
  * @return true 有配置
  */
 bool config_manager_has_mqtt_config(void);
+
+// ==================== FSM运行统计同步 ====================
+
+/**
+ * @brief 同步FSM运行统计到配置（带变化检测，避免无意义写入）
+ * @param prod_cycles 总制水周期数
+ * @param flush_cycles 总冲洗周期数
+ * @param prod_time_sec 总制水时间（秒）
+ * @param flush_time_sec 总冲洗时间（秒）
+ */
+void config_manager_sync_fsm_stats(uint32_t prod_cycles, uint32_t flush_cycles,
+                                   uint64_t prod_time_sec, uint64_t flush_time_sec);
+
+/**
+ * @brief 获取FSM运行统计
+ * @param prod_cycles 输出：总制水周期数
+ * @param flush_cycles 输出：总冲洗周期数
+ * @param prod_time_sec 输出：总制水时间（秒）
+ * @param flush_time_sec 输出：总冲洗时间（秒）
+ */
+void config_manager_get_fsm_stats(uint32_t *prod_cycles, uint32_t *flush_cycles,
+                                  uint64_t *prod_time_sec, uint64_t *flush_time_sec);
 
 // ==================== 调试接口 ====================
 

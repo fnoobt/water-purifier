@@ -106,13 +106,14 @@ WaterPurifier/
 4. fsm_init()              -> 状态机初始化
    fsm_start()             -> FSM任务（100ms周期）
 5. history_logger_init()   -> 历史记录初始化
-6. wifi_manager_init()     -> WiFi初始化
+6. pm_manager_init()       -> 电源管理初始化（WiFi TX初始20dBm）
+7. wifi_manager_init()     -> WiFi初始化
    wifi_manager_start()    -> STA/AP模式
-7. mqtt_client_init()      -> MQTT客户端初始化
-8. ota_update_init()       -> OTA模块初始化（异常状态自动标记有效）
-9. web_server_init()       -> HTTP服务器初始化
-   web_server_start()      -> 启动Web服务
-10. monitor_task           -> 监控任务（30秒周期）
+8. mqtt_client_init()      -> MQTT客户端初始化
+9. ota_update_init()       -> OTA模块初始化（异常状态自动标记有效）
+10. web_server_init()      -> HTTP服务器初始化
+    web_server_start()     -> 启动Web服务
+11. monitor_task           -> 监控任务（30秒周期）
     pm_manager_check_heap()-> 堆内存检查
 ```
 
@@ -734,15 +735,35 @@ esp_err_t ota_update_rollback(void);
 
 ### 11. 电源管理 (pm_manager.c/h)
 
-**职责**: WiFi TX功率调整、堆内存监控（ESP32-C3不支持DFS动态频率）
+**职责**: WiFi TX功率动态调整、堆内存监控
 
-**ESP32-C3限制**: 该芯片不支持DFS动态频率调节，代码自动检测并跳过相关配置。
+**ESP32-C3限制**: 该芯片不支持DFS动态频率调节，CPU固定160MHz。`pm_manager_set_cpu_mode()` 函数保留接口兼容性但不执行操作。
 
-**WiFi TX功率**: 滞回窗口机制，RSSI < -55dBm升功率至20dBm，RSSI > -48dBm降至8dBm。
+**WiFi TX功率调整（滞回算法）**:
+
+| 功率档位 | 升功率阈值(RSSI<) | 降功率阈值(RSSI>=) | 目标功率 |
+|---------|------------------|-------------------|---------|
+| 8 dBm | -55 dBm | -48 dBm | 8 dBm |
+| 12 dBm | -60 dBm | -50 dBm | 12 dBm |
+| 15 dBm | -65 dBm | -53 dBm | 15 dBm |
+| 19 dBm | -75 dBm | -58 dBm | 19 dBm |
+| 20 dBm | -99 dBm | -68 dBm | 20 dBm |
+
+- **滞回效果**: RSSI在边界附近波动时保持当前功率，只有信号明显变化（跨越滞回窗口）才切换功率
+- **调用时机**: WiFi连接后定期调用 `pm_manager_adjust_wifi_tx_power(rssi)`
+- **示例**: 当前12dBm时，RSSI<-60升至15dBm，RSSI>=-50降至8dBm
 
 **堆内存监控**:
-- < 30KB 输出警告
-- < 15KB 自动重启
+- 可用堆 < 30KB → 输出警告日志
+- 可用堆 < 15KB → 立即重启（跳过NVS保存，避免内存进一步消耗）
+
+**主要函数**:
+```c
+esp_err_t pm_manager_init(void);
+esp_err_t pm_manager_set_cpu_mode(bool low_power);  // ESP32-C3无效果
+esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi);
+esp_err_t pm_manager_check_heap(void);
+```
 
 ---
 
@@ -1041,7 +1062,8 @@ POST /api/ota/rollback
 | 1.2.9 | 2026-05-22 | **ESP32-C3专用优化**：简化pm_manager移除DFS死代码（ESP32-C3不支持动态频率调节），CPU固定160MHz；**管理页面**：新增重启按钮（二次确认），调整控制面板按钮顺序避免红色按钮相邻 |
 | 2.2.1 | 2026-05-21 | **固件优化**：编译器SIZE优化、禁用GDB stub、禁用mbedTLS证书捆绑包（节省~50KB）、日志缓冲区4KB、生产级日志级别INFO；**代码清理**：删除6个废弃函数、NVS错误处理简化、pm_manager ESP32-C3 DFS跳过；**Web日志页**：级别解析修复、浅色背景；**版本管理**：手动版本号（CMake VERSION） |
 | 2.2.5 | 2026-05-24 | **Web日志缓冲区修复**：snprintf返回值溢出修复（防止缓冲区填满时内容丢失）、日志拦截器提前启动（捕获全部初始化日志）；**OTA状态修复**：ESP_OTA_IMG_NEW状态处理、异常状态自动标记有效、错误状态显示修复；**Flash保存周期**：新增4小时选项；**日志级别**：完善全部OTA状态显示（NEW/PENDING_VERIFY/VALID/INVALID/ABORTED） |
-| 2.3.0 | 2026-05-24 | **NVS架构统一**：废弃独立命名空间（wifi/mqtt_config/wp_rt），统一到water_purifier/wp_filters/history/daily_stats四命名空间；**迁移机制**：首次启动自动迁移旧数据并清理废弃命名空间；**数据一致性**：消除总用水量761L vs 218L等重复存储问题；**代码简化**：WiFi/MQTT模块改用config_manager接口，移除wp_rt运行数据持久化（改为临时状态） |；**Web Basic Auth**：管理页面/OTA/日志需认证，首页/WiFi配网公开；Session Cookie 24小时滑动过期；管理页面新增认证配置开关；**日志优化**：10KB HTML缓冲区、正向读取（新日志在底部）、智能跳过旧日志、内存检查保护；**HTTP稳定性**：接收/发送超时10秒；**Web日志显示优化**：两阶段扫描（逆向计算+正向输出），确保新日志完整显示，跳过提示"... (跳过X条旧日志，显示最新Y条)"；**OTA回滚配置**：启用CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE，bootloader自动转换NEW→PENDING_VERIFY状态；**OTA状态处理**：NEW状态显式处理，改进错误日志提示 |
+| 2.3.0 | 2026-05-24 | **NVS架构统一**：废弃独立命名空间（wifi/mqtt_config/wp_rt），统一到water_purifier/wp_filters/history/daily_stats四命名空间；**迁移机制**：首次启动自动迁移旧数据并清理废弃命名空间；**数据一致性**：消除总用水量761L vs 218L等重复存储问题；**代码简化**：WiFi/MQTT模块改用config_manager接口，移除wp_rt运行数据持久化（改为临时状态）；**Web Basic Auth**：管理页面/OTA/日志需认证，首页/WiFi配网公开；Session Cookie 24小时滑动过期；管理页面新增认证配置开关；**日志优化**：10KB HTML缓冲区、正向读取（新日志在底部）、智能跳过旧日志、内存检查保护；**HTTP稳定性**：接收/发送超时10秒；**Web日志显示优化**：两阶段扫描（逆向计算+正向输出），确保新日志完整显示，跳过提示"... (跳过X条旧日志，显示最新Y条)"；**OTA回滚配置**：启用CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE，bootloader自动转换NEW→PENDING_VERIFY状态；**OTA状态处理**：NEW状态显式处理，改进错误日志提示 |
+| 2.3.1 | 2026-05-25 | **电源管理模块完善**：pm_manager WiFi TX功率滞回算法文档完善（5档功率表+滞回阈值说明）、初始化流程添加步骤6 pm_manager_init() |
 
 ---
 

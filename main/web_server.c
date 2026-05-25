@@ -79,6 +79,7 @@ static struct {
 static char s_log_buf[LOG_BUF_SIZE];
 static volatile uint32_t s_log_head = 0;
 static volatile uint32_t s_log_tail = 0;
+static volatile uint32_t s_log_generation = 0;  // 生成计数器，用于检测缓冲区覆盖
 static portMUX_TYPE s_log_lock = portMUX_INITIALIZER_UNLOCKED;
 static vprintf_like_t s_original_vprintf = NULL;
 
@@ -90,6 +91,7 @@ static void log_buf_write(const char *data, size_t len)
         s_log_head = (s_log_head + 1) % LOG_BUF_SIZE;
         if (s_log_head == s_log_tail) {
             s_log_tail = (s_log_tail + 1) % LOG_BUF_SIZE;
+            s_log_generation++;  // 缓冲区覆盖，递增生成计数器
         }
     }
     taskEXIT_CRITICAL(&s_log_lock);
@@ -863,40 +865,42 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     time_t boot_wall = wifi_manager_get_boot_wall_clock_time();
     bool has_wall_time = (boot_wall > 0);
 
-    // 快照当前缓冲区状态
-    uint32_t tail = s_log_tail;
-    uint32_t head = s_log_head;
-
-    // ==================== 第一阶段：逆向扫描（记录每行位置）====================
-    // 不进行估算，直接在第二阶段正向输出边写入边检查
-
     #define MAX_LOG_LINES 300  // 最多记录300行位置
     static uint32_t line_starts[MAX_LOG_LINES];  // 每行的起始位置
-    int line_count = 0;
-    uint32_t scan_pos = head;
-    int scan_line_len = 0;
+    char line_buf[300];
 
-    // 逆向扫描，记录每行的起始位置
-    // 逆向扫描从 head(最新) 到 tail(最旧)，所以：
-    // line_starts[0] = 最新日志，line_starts[line_count-1] = 最旧日志
-    while (scan_pos != tail && line_count < MAX_LOG_LINES) {
-        scan_pos = (scan_pos == 0) ? (LOG_BUF_SIZE - 1) : (scan_pos - 1);
-        char c = s_log_buf[scan_pos];
+    // 重试循环：防止缓冲区覆盖导致读取不一致
+    int retry_count = 0;
+    bool scan_success = false;
+    int limit = (int)sizeof(buf) - 100;
 
-        if (c == '\n' || c == '\r') {
-            if (scan_line_len > 0) {
-                uint32_t line_start = scan_pos + 1;
-                if (line_start >= LOG_BUF_SIZE) line_start = 0;
-                line_starts[line_count] = line_start;
-                line_count++;
-                scan_line_len = 0;
-            }
-        } else {
-            if (scan_line_len < 299) {
-                scan_line_len++;
+    do {
+        // 快照当前缓冲区状态（包括生成计数器）
+        uint32_t gen_before = s_log_generation;
+        uint32_t tail = s_log_tail;
+        uint32_t head = s_log_head;
+
+        // ==================== 第一阶段：逆向扫描（记录每行位置）===================
+        int line_count = 0;
+        uint32_t scan_pos = head;
+        int scan_line_len = 0;
+
+        while (scan_pos != tail && line_count < MAX_LOG_LINES) {
+            scan_pos = (scan_pos == 0) ? (LOG_BUF_SIZE - 1) : (scan_pos - 1);
+            char c = s_log_buf[scan_pos];
+
+            if (c == '\n' || c == '\r') {
+                if (scan_line_len > 0) {
+                    uint32_t line_start = scan_pos + 1;
+                    if (line_start >= LOG_BUF_SIZE) line_start = 0;
+                    line_starts[line_count] = line_start;
+                    line_count++;
+                    scan_line_len = 0;
+                }
+            } else {
+                if (scan_line_len < 299) scan_line_len++;
             }
         }
-    }
 
     // ==================== 第二阶段：正向输出（从最旧到最新）====================
     // 最旧日志在最上方，最新日志在最下方
@@ -915,9 +919,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
 
     int output_lines = 0;
     int skipped_by_filter = 0;
-    char line_buf[300];
     int line_len = 0;
-    int limit = (int)sizeof(buf) - 100;
 
     // 从 oldest (line_count-1) 向 newest (0) 输出
     for (int i = line_count - 1; i >= 0 && pos < limit; i--) {
@@ -1015,6 +1017,22 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
             }
             buf[pos++] = '\n';
         }
+    }
+
+        // 验证生成计数器是否一致
+        uint32_t gen_after = s_log_generation;
+        if (gen_before == gen_after) {
+            scan_success = true;
+            break;  // 成功，退出循环
+        }
+
+        retry_count++;
+        ESP_LOGD(TAG, "日志扫描冲突，重试 #%d", retry_count);
+
+    } while (retry_count < 3);  // 最多重试3次
+
+    if (!scan_success) {
+        ESP_LOGW(TAG, "日志扫描多次冲突，显示可能不完整");
     }
 
     buf[pos] = '\0';

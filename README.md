@@ -69,7 +69,7 @@ WATER_SHORTAGE  ←────────  (任意状态 → LEAK_ALARM/STOP �
 | MQTT | Home Assistant 自动发现 |
 | Config | NVS 持久化配置 |
 | OTA | 固件升级 + 回滚保护 + 恢复出厂（bootloader自动状态转换） |
-| PM | CPU频率/WiFi功率管理 |
+| PM | WiFi TX功率动态调整(滞回算法) + 堆内存监控(告警/自动重启) |
 | History | 事件日志 + 每日统计 |
 
 详细文档见 [DOCUMENTATION.md](DOCUMENTATION.md)，开发指南见 [CLAUDE.md](CLAUDE.md)。

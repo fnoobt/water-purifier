@@ -538,6 +538,16 @@ esp_err_t config_manager_load(void)
     }
     ctx.config.web_password[sizeof(ctx.config.web_password) - 1] = '\0';
 
+    // FSM运行统计
+    err = nvs_get_u32(handle, "fsm_prod_cyc", &ctx.config.fsm_prod_cycles);
+    if (err == ESP_ERR_NVS_NOT_FOUND) ctx.config.fsm_prod_cycles = 0;
+    err = nvs_get_u32(handle, "fsm_flush_cyc", &ctx.config.fsm_flush_cycles);
+    if (err == ESP_ERR_NVS_NOT_FOUND) ctx.config.fsm_flush_cycles = 0;
+    err = nvs_get_u64(handle, "fsm_prod_time", &ctx.config.fsm_prod_time_sec);
+    if (err == ESP_ERR_NVS_NOT_FOUND) ctx.config.fsm_prod_time_sec = 0;
+    err = nvs_get_u64(handle, "fsm_flush_time", &ctx.config.fsm_flush_time_sec);
+    if (err == ESP_ERR_NVS_NOT_FOUND) ctx.config.fsm_flush_time_sec = 0;
+
     nvs_close(handle);
 
     // 使用mutex保护dirty标志清除
@@ -635,6 +645,12 @@ esp_err_t config_manager_save(void)
     nvs_set_u8(handle, "web_auth", config_copy.web_auth_enabled);
     nvs_set_str(handle, "web_user", config_copy.web_username);
     nvs_set_str(handle, "web_pass", config_copy.web_password);
+
+    // FSM运行统计
+    nvs_set_u32(handle, "fsm_prod_cyc", config_copy.fsm_prod_cycles);
+    nvs_set_u32(handle, "fsm_flush_cyc", config_copy.fsm_flush_cycles);
+    nvs_set_u64(handle, "fsm_prod_time", config_copy.fsm_prod_time_sec);
+    nvs_set_u64(handle, "fsm_flush_time", config_copy.fsm_flush_time_sec);
 
     err = nvs_commit(handle);
     nvs_close(handle);
@@ -1245,4 +1261,47 @@ void config_manager_print_config(void)
     ESP_LOGI(TAG, "TDS阈值: 进水%.0f/出水%.0f ppm",
              ctx.config.tds_inlet_threshold, ctx.config.tds_outlet_threshold);
     ESP_LOGI(TAG, "===================");
+}
+
+// ==================== FSM运行统计同步 ====================
+
+void config_manager_sync_fsm_stats(uint32_t prod_cycles, uint32_t flush_cycles,
+                                   uint64_t prod_time_sec, uint64_t flush_time_sec)
+{
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // 仅在数据变化时更新并设置脏标志（避免无意义写入）
+        if (ctx.config.fsm_prod_cycles != prod_cycles ||
+            ctx.config.fsm_flush_cycles != flush_cycles ||
+            ctx.config.fsm_prod_time_sec != prod_time_sec ||
+            ctx.config.fsm_flush_time_sec != flush_time_sec) {
+            ctx.config.fsm_prod_cycles = prod_cycles;
+            ctx.config.fsm_flush_cycles = flush_cycles;
+            ctx.config.fsm_prod_time_sec = prod_time_sec;
+            ctx.config.fsm_flush_time_sec = flush_time_sec;
+            ctx.config_dirty = true;
+            ESP_LOGD(TAG, "FSM统计已更新: 制水%lu周期, 冲洗%lu周期, 制水%llu秒",
+                     prod_cycles, flush_cycles, prod_time_sec);
+        }
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        ESP_LOGW(TAG, "sync_fsm_stats: mutex获取超时");
+    }
+}
+
+void config_manager_get_fsm_stats(uint32_t *prod_cycles, uint32_t *flush_cycles,
+                                  uint64_t *prod_time_sec, uint64_t *flush_time_sec)
+{
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        *prod_cycles = ctx.config.fsm_prod_cycles;
+        *flush_cycles = ctx.config.fsm_flush_cycles;
+        *prod_time_sec = ctx.config.fsm_prod_time_sec;
+        *flush_time_sec = ctx.config.fsm_flush_time_sec;
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        ESP_LOGW(TAG, "get_fsm_stats: mutex获取超时，返回默认值");
+        *prod_cycles = 0;
+        *flush_cycles = 0;
+        *prod_time_sec = 0;
+        *flush_time_sec = 0;
+    }
 }

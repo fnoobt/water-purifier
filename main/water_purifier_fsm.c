@@ -1145,6 +1145,16 @@ static void fsm_task(void *arg)
         // 最小保存间隔为1分钟(600 ticks)，防止配置为0时频繁写入磨损Flash
         if (save_ticks < 600) save_ticks = 600;  // 600 * 100ms = 60秒
         if (periodic_save_counter >= save_ticks) {
+            // FSM运行统计脏时才同步（避免无意义调用）
+            if (fsm_ctx.runtime_dirty) {
+                config_manager_sync_fsm_stats(
+                    fsm_ctx.runtime_data.total_production_cycles,
+                    fsm_ctx.runtime_data.total_flush_cycles,
+                    fsm_ctx.runtime_data.total_production_time_sec,
+                    fsm_ctx.runtime_data.total_flush_time_sec
+                );
+                fsm_ctx.runtime_dirty = false;  // 清除脏标志
+            }
             // 调用统一保存接口（滤芯+历史记录）
             config_manager_periodic_save_all(save_interval_sec);
             periodic_save_counter = 0;
@@ -1243,8 +1253,24 @@ esp_err_t fsm_init(void)
     filter_mgr_set_waste_flow_lph(waste_lph);
     ESP_LOGI(TAG, "废水阀流量: %uCC (%.1f L/h)", cfg.waste_valve_flow_cc, waste_lph);
 
-    // 增压泵流量默认（制水状态设置后更新）
-    filter_mgr_set_pump_flow_lph(24.0f);  // 默认值，fsm_set_production_rate_by_membrane会覆盖
+    // 加载FSM运行统计（持久化）
+    uint32_t prod_cycles, flush_cycles;
+    uint64_t prod_time_sec, flush_time_sec;
+    config_manager_get_fsm_stats(&prod_cycles, &flush_cycles, &prod_time_sec, &flush_time_sec);
+    fsm_ctx.runtime_data.total_production_cycles = prod_cycles;
+    fsm_ctx.runtime_data.total_flush_cycles = flush_cycles;
+    fsm_ctx.runtime_data.total_production_time_sec = prod_time_sec;
+    fsm_ctx.runtime_data.total_flush_time_sec = flush_time_sec;
+    ESP_LOGI(TAG, "运行统计: 制水%lu周期, 冲洗%lu周期, 制水%llu秒",
+             prod_cycles, flush_cycles, prod_time_sec);
+
+    // 增压泵流量根据泵类型设置（冲洗状态前三级滤芯过水量）
+    // 泵流量数组(L/h)：三角洲50G=33(0.55), 75G=51(0.85), 100G=66(1.1), 200G=96(1.6), 300G=120(2.0), 400G=150(2.5)
+    static const float pump_rates[] = {33.0f, 51.0f, 66.0f, 96.0f, 120.0f, 150.0f};
+    float pump_lph = (cfg.pump_type < sizeof(pump_rates) / sizeof(pump_rates[0])) ?
+                     pump_rates[cfg.pump_type] : 33.0f;  // 默认三角洲50G
+    filter_mgr_set_pump_flow_lph(pump_lph);
+    ESP_LOGI(TAG, "增压泵冲洗流量: %.1f L/h (类型%d)", pump_lph, cfg.pump_type);
 
     fsm_ctx.current_state = FSM_STATE_STANDBY;
     fsm_ctx.leak_detected = false;
@@ -1635,11 +1661,10 @@ esp_err_t fsm_set_production_rate_by_membrane(uint8_t ro_type)
 
     filter_mgr_set_production_rate(rates[ro_type]);
 
-    // 增压泵流量 = RO通量 × 2（冲洗时废水阀全开，泵流量约双倍）
-    float pump_lph = rates[ro_type] * 2.0f;
-    filter_mgr_set_pump_flow_lph(pump_lph);
+    // 泵冲洗流量由fsm_init根据pump_type配置，此处不再重复设置
+    float pump_lph = filter_mgr_get_pump_flow_lph();
 
-    ESP_LOGI(TAG, "RO膜制水速率: %.1f L/h, 泵冲洗流量: %.1f L/h",
+    ESP_LOGI(TAG, "RO膜制水速率: %.1f L/h, 增压泵冲洗流量: %.1f L/h",
              rates[ro_type], pump_lph);
     return ESP_OK;
 }
