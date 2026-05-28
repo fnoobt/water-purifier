@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_chip_info.h"  // 芯片信息
 #include "esp_wifi.h"
 #include "esp_task_wdt.h"  // 任务看门狗
 
@@ -184,7 +185,26 @@ void app_main(void)
     // 提前启动日志拦截器，捕获所有初始化日志
     web_server_init_log_interceptor();
 
-    ESP_LOGI(TAG, "==== 净水器主控板程序启动，硬件: ESP32-C3 ====");
+    // 获取芯片信息
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    const char *chip_model;
+    switch (chip_info.model) {
+        case CHIP_ESP32:    chip_model = "ESP32"; break;
+        case CHIP_ESP32C2:  chip_model = "ESP32-C2"; break;
+        case CHIP_ESP32C3:  chip_model = "ESP32-C3"; break;
+        case CHIP_ESP32C6:  chip_model = "ESP32-C6"; break;
+        case CHIP_ESP32H2:  chip_model = "ESP32-H2"; break;
+        case CHIP_ESP32P4:  chip_model = "ESP32-P4"; break;
+        case CHIP_ESP32S2:  chip_model = "ESP32-S2"; break;
+        case CHIP_ESP32S3:  chip_model = "ESP32-S3"; break;
+        default:            chip_model = "未知"; break;
+    }
+
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "  净水器主控板程序启动");
+    ESP_LOGI(TAG, "  硬件: %s (%d核)", chip_model, chip_info.cores);
+    ESP_LOGI(TAG, "========================================");
 
     // 0. 任务看门狗说明
     // ESP-IDF v6.0系统启动时已初始化看门狗（~5秒超时），无需重复初始化
@@ -277,8 +297,9 @@ void app_main(void)
         ESP_LOGE(TAG, "监控任务创建失败");
     }
 
-    ESP_LOGI(TAG, "==== 系统初始化完成！可用内存: %lu bytes ====", esp_get_free_heap_size());
-
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "  系统初始化完成！可用内存: %lu bytes", esp_get_free_heap_size());
+    ESP_LOGI(TAG, "========================================");
     // 主循环
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(60000));  // 1分钟

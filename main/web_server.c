@@ -561,7 +561,6 @@ static const char html_log_page[] =
 ".toggle-label{display:flex;align-items:center;gap:8px;font-size:14px;color:#333;cursor:pointer}"
 ".toggle-label input[type='checkbox']{width:18px;height:18px;cursor:pointer}"
 "#logContent{background:#f8f9fa;color:#333;font-family:'Cascadia Code','Fira Code',monospace;font-size:12px;padding:12px;border-radius:8px;white-space:pre-wrap;word-break:break-all;line-height:1.6;overflow-y:auto;max-height:65vh;border:1px solid #e0e0e0}"
-".ts{color:#888;margin-right:8px}"
 ".E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}"
 "</style></head><body>"
 "<div class='container'>"
@@ -848,7 +847,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
         return httpd_resp_send(req, "<span style='color:#f57c00'>内存不足，无法显示详细日志</span>", HTTPD_RESP_USE_STRLEN);
     }
 
-    static char buf[LOG_BUF_SIZE * 2 + 4096];  // 20480字节，容纳HTML膨胀(约2x)
+    static char buf[LOG_BUF_SIZE * 2 + 2048];  // 18432字节，约2.2x膨胀(分析值14582)
     int pos = 0;
 
     // 解析查询参数中的日志级别过滤
@@ -906,7 +905,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     // 最旧日志在最上方，最新日志在最下方
 
     pos = snprintf(buf, sizeof(buf),
-        "<style>.ts{color:#888;margin-right:4px}.E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}</style>"
+        "<style>.E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}</style>"
         "<div style='padding:4px 8px;border-bottom:1px solid #e0e0e0;font-size:10px;color:#888;background:#f0f0f0'>缓冲区 %lu/%lu 字节 | %s | 过滤: %s</div>",
         (unsigned long)(head >= tail ? head - tail : LOG_BUF_SIZE - tail + head),
         (unsigned long)LOG_BUF_SIZE,
@@ -978,14 +977,14 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
                 cls = 1;
             }
 
-            // 时间戳
+            // 时间戳（无span包装，节省空间）
             if (has_wall_time && boot_ms > 0 && cls) {
                 time_t log_time = boot_wall + (boot_ms / 1000);
                 struct tm tm_log;
                 localtime_r(&log_time, &tm_log);
                 pos += snprintf(buf + pos, sizeof(buf) - pos,
-                    "<span class='ts'>%04d-%02d-%02d %02d:%02d:%02d</span> ",
-                    tm_log.tm_year + 1900, tm_log.tm_mon + 1, tm_log.tm_mday,
+                    "[%02d-%02d %02d:%02d:%02d] ",
+                    tm_log.tm_mon + 1, tm_log.tm_mday,
                     tm_log.tm_hour, tm_log.tm_min, tm_log.tm_sec);
             }
 

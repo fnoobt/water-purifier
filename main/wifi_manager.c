@@ -308,8 +308,10 @@ esp_err_t wifi_manager_stop(void)
 {
     if (!ctx.started) return ESP_OK;
 
-    // 取消重连任务
+    // 取消重连任务（先清除标志，再删除任务）
     if (ctx.reconnect_task_handle) {
+        ctx.reconnect_active = false;
+        ctx.active_reconnect_seq = 0;
         vTaskDelete(ctx.reconnect_task_handle);
         ctx.reconnect_task_handle = NULL;
     }
@@ -601,8 +603,8 @@ static void set_state(wifi_state_t state)
 /**
  * @brief WiFi重连任务（独立FreeRTOS任务，不在事件回调中延时）
  *
- * 策略：指数退避重连，初始1s，最大30s，总计约5分钟
- * 失败后进入AP模式并退出任务，下次断开时自动重建重连任务
+ * 策略：指数退避重连，1s→2s→4s→8s→16s→30s→60s（上限）
+ * 15次失败后进入AP模式，总计约10分钟
  *
  * @param arg 重连序列号（用于检测是否仍是活跃任务）
  */
@@ -611,14 +613,15 @@ static void wifi_reconnect_task(void *arg)
 {
     uint32_t my_seq = (uint32_t)arg;  // 本任务的序列号
     int retry = 0;
-    const int max_retries = 20;
+    const int max_retries = 15;  // 15次失败后进入AP模式（约10分钟）
     const TickType_t delays[] = {
         pdMS_TO_TICKS(1000),   // 第1次：1s
         pdMS_TO_TICKS(2000),   // 第2次：2s
         pdMS_TO_TICKS(4000),   // 第3次：4s
         pdMS_TO_TICKS(8000),   // 第4次：8s
         pdMS_TO_TICKS(16000),  // 第5次：16s
-        pdMS_TO_TICKS(30000),  // 第6+次：30s（上限）
+        pdMS_TO_TICKS(30000),  // 第6次：30s
+        pdMS_TO_TICKS(60000),  // 第7+次：60s（上限）
     };
     const int delay_count = sizeof(delays) / sizeof(delays[0]);
 
