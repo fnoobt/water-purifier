@@ -372,13 +372,29 @@ esp_err_t wifi_manager_start_ap_mode(void)
     strncpy((char*)ap_cfg.ap.password, AP_PASSWORD, sizeof(ap_cfg.ap.password));
     ap_cfg.ap.ssid_len = strlen(ctx.ap_ssid);
 
+    // 切换到APSTA模式前，确保STA配置仍然有效
+    wifi_config_t sta_cfg = {0};
+    if (strlen(ctx.ssid) > 0) {
+        strncpy((char*)sta_cfg.sta.ssid, ctx.ssid, sizeof(sta_cfg.sta.ssid));
+        strncpy((char*)sta_cfg.sta.password, ctx.password, sizeof(sta_cfg.sta.password));
+        sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    }
+
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
 
-    // WiFi可能已启动（STA模式），esp_wifi_start在ESP-IDF v6.0中如果已启动返回ESP_OK
+    // 重新设置STA配置（切换模式后可能需要）
+    if (strlen(ctx.ssid) > 0) {
+        esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    }
+
+    // WiFi可能已启动（STA模式），esp_wifi_start如果已启动会返回ESP_OK
     esp_err_t start_ret = esp_wifi_start();
     if (start_ret != ESP_OK) {
-        ESP_LOGW(TAG, "AP模式启动失败: %s", esp_err_to_name(start_ret));
+        ESP_LOGE(TAG, "AP模式启动失败: %s", esp_err_to_name(start_ret));
+        ctx.is_ap_mode = false;  // 启动失败，不设置AP模式标志
+        set_state(WIFI_STATE_ERROR);
+        return start_ret;
     }
 
     ctx.is_ap_mode = true;
@@ -582,7 +598,6 @@ static void set_state(wifi_state_t state)
             if (callback) {
                 callback(state);
             }
-            ESP_LOGI(TAG, "状态: %s", state_names[state]);
         } else {
             xSemaphoreGive(ctx.state_mutex);
         }
@@ -593,7 +608,6 @@ static void set_state(wifi_state_t state)
             if (ctx.callback) {
                 ctx.callback(state);
             }
-            ESP_LOGW(TAG, "状态变更(无锁): %s", state_names[state]);
         }
     }
 }
@@ -603,8 +617,11 @@ static void set_state(wifi_state_t state)
 /**
  * @brief WiFi重连任务（独立FreeRTOS任务，不在事件回调中延时）
  *
- * 策略：指数退避重连，1s→2s→4s→8s→16s→30s→60s（上限）
- * 15次失败后进入AP模式，总计约10分钟
+ * 策略：
+ * 1. 指数退避重连：1s→2s→4s→8s→16s→30s→60s（上限）
+ * 2. 15次失败后进入AP模式，但继续后台重连（每300秒）
+ * 3. 路由器恢复时自动重连并关闭AP模式
+ * 4. 用户手动配置新WiFi时，任务会因序列号不匹配而退出
  *
  * @param arg 重连序列号（用于检测是否仍是活跃任务）
  */
@@ -630,39 +647,18 @@ static void wifi_reconnect_task(void *arg)
     // 注册看门狗
     esp_task_wdt_add(NULL);
 
+    // ===== 第一阶段：指数退避重连 =====
     while (retry < max_retries) {
         TickType_t delay = delays[(retry < delay_count) ? retry : delay_count - 1];
-        ESP_LOGD(TAG, "尝试重连 %d/%d，等待 %lums...", retry + 1, max_retries, pdTICKS_TO_MS(delay));
-        esp_task_wdt_reset();
-        vTaskDelay(delay);
+        int delay_seconds = pdTICKS_TO_MS(delay) / 1000;
 
-        // 使用mutex保护的状态检查
+        // 分段等待延迟期间，每秒检查状态（及时检测已连接）
         bool is_connected = false;
         bool still_active = false;
-        if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            is_connected = (ctx.state == WIFI_STATE_CONNECTED);
-            still_active = (ctx.active_reconnect_seq == my_seq);
-            xSemaphoreGive(ctx.state_mutex);
-        }
-
-        // 如果已连接或不再是活跃任务，退出
-        if (is_connected || !still_active) {
-            ESP_LOGD(TAG, "重连任务退出 seq=%lu (connected=%d, active=%d)", my_seq, is_connected, still_active);
-            goto exit_task;
-        }
-
-        esp_err_t ret = esp_wifi_connect();
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "重连发起失败: %s", esp_err_to_name(ret));
-        }
-        retry++;
-
-        // 等待连接结果（最多等10秒，路由器重启通常需几秒到十几秒）
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < delay_seconds; i++) {
             esp_task_wdt_reset();
             vTaskDelay(pdMS_TO_TICKS(1000));
 
-            // mutex保护的状态检查
             if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 is_connected = (ctx.state == WIFI_STATE_CONNECTED);
                 still_active = (ctx.active_reconnect_seq == my_seq);
@@ -670,13 +666,44 @@ static void wifi_reconnect_task(void *arg)
             }
 
             if (is_connected || !still_active) {
-                ESP_LOGD(TAG, "重连任务退出 seq=%lu (connected=%d, active=%d)", my_seq, is_connected, still_active);
+                goto exit_task;
+            }
+        }
+
+        // 再次检查状态
+        if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            is_connected = (ctx.state == WIFI_STATE_CONNECTED);
+            still_active = (ctx.active_reconnect_seq == my_seq);
+            xSemaphoreGive(ctx.state_mutex);
+        }
+
+        if (is_connected || !still_active) {
+            goto exit_task;
+        }
+
+        // 每次重试一条日志
+        ESP_LOGI(TAG, "重连尝试 %d/%d (%lds间隔)", retry + 1, max_retries, (long)delay_seconds);
+        esp_wifi_connect();
+        retry++;
+
+        // 等待连接结果（最多等10秒），每秒检查状态
+        for (int i = 0; i < 10; i++) {
+            esp_task_wdt_reset();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+
+            if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                is_connected = (ctx.state == WIFI_STATE_CONNECTED);
+                still_active = (ctx.active_reconnect_seq == my_seq);
+                xSemaphoreGive(ctx.state_mutex);
+            }
+
+            if (is_connected || !still_active) {
                 goto exit_task;
             }
         }
     }
 
-    // 在进入AP模式前，再次确认仍是活跃任务且未连接
+    // ===== 第二阶段：进入AP模式并继续后台重连 =====
     bool is_connected = false;
     bool still_active = false;
 
@@ -687,19 +714,51 @@ static void wifi_reconnect_task(void *arg)
     }
 
     if (still_active && !is_connected) {
-        ESP_LOGW(TAG, "WiFi重连失败%d次，进入AP模式", retry);
-        set_state(WIFI_STATE_DISCONNECTED);
+        ESP_LOGW(TAG, "WiFi重连失败%d次，进入AP模式并继续后台重连", retry);
         wifi_manager_start_ap_mode();
+        // 不退出任务，进入后台重连阶段
+    } else {
+        goto exit_task;
+    }
+
+    // ===== 后台重连阶段：每300秒尝试一次 =====
+    while (true) {
+        // 分段等待，每秒检查状态（及时检测已连接）
+        for (int i = 0; i < 300; i++) {
+            esp_task_wdt_reset();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+
+            if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                is_connected = (ctx.state == WIFI_STATE_CONNECTED);
+                still_active = (ctx.active_reconnect_seq == my_seq);
+                xSemaphoreGive(ctx.state_mutex);
+            }
+
+            if (is_connected || !still_active) {
+                goto exit_task;
+            }
+        }
+
+        // 再次检查状态
+        if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            is_connected = (ctx.state == WIFI_STATE_CONNECTED);
+            still_active = (ctx.active_reconnect_seq == my_seq);
+            xSemaphoreGive(ctx.state_mutex);
+        }
+
+        if (is_connected || !still_active) {
+            goto exit_task;
+        }
+
+        ESP_LOGI(TAG, "后台重连尝试 (AP模式)");
+        esp_wifi_connect();
     }
 
 exit_task:
     // 清除活跃标志（使用mutex保护）
     if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        // 只有当前序列号仍匹配时才清除标志
-        if (ctx.active_reconnect_seq == my_seq) {
-            ctx.reconnect_active = false;
-            ctx.reconnect_task_handle = NULL;
-        }
+        ctx.reconnect_active = false;
+        ctx.reconnect_task_handle = NULL;
         xSemaphoreGive(ctx.state_mutex);
     }
 
@@ -733,11 +792,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
 
                 // 使用mutex保护重连任务创建，避免竞态条件
                 if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    // 递增序列号，用于追踪每次断开事件
-                    ctx.reconnect_sequence++;
-
                     // 如果没有活跃的重连任务，创建新任务
                     if (!ctx.reconnect_active) {
+                        ctx.reconnect_sequence++;
                         ctx.reconnect_active = true;
                         ctx.active_reconnect_seq = ctx.reconnect_sequence;
                         xSemaphoreGive(ctx.state_mutex);
@@ -748,31 +805,27 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
                                                      4096, (void*)ctx.active_reconnect_seq, 5,
                                                      &ctx.reconnect_task_handle);
                         if (ret != pdPASS) {
-                            ESP_LOGE(TAG, "创建重连任务失败");
+                            ESP_LOGE(TAG, "创建重连任务失败，进入AP模式");
                             // 创建失败时重置标志
                             if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                                 ctx.reconnect_active = false;
                                 xSemaphoreGive(ctx.state_mutex);
                             }
+                            // 进入AP模式作为降级处理
+                            set_state(WIFI_STATE_DISCONNECTED);
+                            wifi_manager_start_ap_mode();
                         }
                     } else {
-                        // 任务已运行 - 更新活跃序列号，让旧任务继续处理新的断开事件
-                        ctx.active_reconnect_seq = ctx.reconnect_sequence;
-                        ESP_LOGI(TAG, "重连任务已运行，更新序列号=%lu", ctx.reconnect_sequence);
+                        // 任务已运行 - 不更新序列号，让现有任务继续处理退避逻辑
+                        // 连接断开事件是正常的重连过程，不需要干预
                         xSemaphoreGive(ctx.state_mutex);
                     }
                 } else {
                     // mutex获取失败时的降级处理（不应发生，但做防御性编程）
-                    ESP_LOGW(TAG, "无法获取mutex，降级创建重连任务");
-                    set_state(WIFI_STATE_RECONNECTING);
-                    if (!ctx.reconnect_active) {
-                        ctx.reconnect_active = true;
-                        ctx.reconnect_sequence++;
-                        ctx.active_reconnect_seq = ctx.reconnect_sequence;
-                        xTaskCreate(wifi_reconnect_task, "wifi_reconnect",
-                                   4096, (void*)ctx.active_reconnect_seq, 5,
-                                   &ctx.reconnect_task_handle);
-                    }
+                    ESP_LOGW(TAG, "无法获取mutex，直接进入AP模式");
+                    // 不再尝试创建重连任务，直接进入AP模式作为安全降级
+                    set_state(WIFI_STATE_DISCONNECTED);
+                    wifi_manager_start_ap_mode();
                 }
                 break;
             }
