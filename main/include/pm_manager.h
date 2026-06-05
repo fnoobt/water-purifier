@@ -30,11 +30,21 @@ esp_err_t pm_manager_set_cpu_mode(bool low_power);
 
 /**
  * @brief 根据RSSI动态调整WiFi TX功率
- * @note RSSI > -60dBm 降低功率, RSSI < -75dBm 恢复最大功率
+ * @note ESP32-C3只支持离散功率值: 8, 11, 15, 18, 20 dBm
+ *       使用滞回算法避免频繁切换：
+ *       - RSSI < up_rssi: 升一档功率（信号变差）
+ *       - RSSI >= down_rssi: 降一档功率（信号变好）
  * @param rssi 当前RSSI值(dBm)
  * @return ESP_OK 成功
  */
 esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi);
+
+/**
+ * @brief 获取当前WiFi TX功率
+ * @return 当前功率(0.25dBm单位)，如34=8.5dBm实际8dBm，80=20dBm
+ *         返回0表示未初始化
+ */
+uint8_t pm_manager_get_wifi_tx_power(void);
 
 /**
  * @brief 检查堆内存使用情况

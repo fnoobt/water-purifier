@@ -11,6 +11,7 @@
 #include "gpio_driver.h"
 #include "wifi_manager.h"
 #include "config_manager.h"
+#include "pm_manager.h"
 #include "history_logger.h"
 #include "ota_update.h"
 #include "esp_ota_ops.h"
@@ -28,6 +29,8 @@
 #include <stdlib.h>
 #include <time.h>
 #include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "WEB";
 
@@ -195,6 +198,16 @@ static const char html_page[] =
 "<div class='grid'>"
 "<div class='stat'><div class='stat-label'>WiFi状态</div><div id='wifiState' class='stat-value'>-</div></div>"
 "<div class='stat'><div class='stat-label'>IP地址</div><div id='wifiIP' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>信号强度</div><div id='wifiRSSI' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>发射功率</div><div id='wifiTXPower' class='stat-value'>-</div></div>"
+"</div></div>"
+
+"<div class='card'><h3>系统状态</h3>"
+"<div class='grid'>"
+"<div class='stat'><div class='stat-label'>可用内存</div><div id='freeHeap' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>历史最低</div><div id='minHeap' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>FSM栈</div><div id='stackFSM' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>HTTP栈</div><div id='stackHTTP' class='stat-value'>-</div></div>"
 "</div></div>"
 
 "<button class='btn btn-primary' onclick=\"location.href='/admin'\">管理设置</button>"
@@ -223,6 +236,17 @@ static const char html_page[] =
 "var u=d.uptime||0,h=Math.floor(u/3600),m=Math.floor((u%3600)/60);if(h>=24){$('uptime').textContent=Math.floor(h/24)+'天'+(h%24)+'时';}else if(h>0){$('uptime').textContent=h+'时'+m+'分';}else{$('uptime').textContent=m+'分';}"
 "$('wifiState').textContent=d.wifiState;"
 "$('wifiIP').textContent=d.ip||'-';"
+"$('wifiRSSI').textContent=d.rssi?d.rssi+'dBm':'-';"
+"$('wifiRSSI').className='stat-value '+((d.rssi&&d.rssi>-60)?'good':(d.rssi&&d.rssi>-75)?'warn':'error');"
+"$('wifiTXPower').textContent=d.txPower?d.txPower+'dBm':'-';"
+"$('freeHeap').textContent=d.freeHeap?(d.freeHeap/1024).toFixed(1)+'KB':'-';"
+"$('freeHeap').className='stat-value '+((d.freeHeap&&d.freeHeap>30720)?'good':(d.freeHeap&&d.freeHeap>15360)?'warn':'error');"
+"$('minHeap').textContent=d.minHeap?(d.minHeap/1024).toFixed(1)+'KB':'-';"
+"$('minHeap').className='stat-value '+((d.minHeap&&d.minHeap>30720)?'good':(d.minHeap&&d.minHeap>15360)?'warn':'error');"
+"$('stackFSM').textContent=d.stackFSM?d.stackFSM+'B':'-';"
+"$('stackFSM').className='stat-value '+((d.stackFSM&&d.stackFSM>512)?'good':(d.stackFSM&&d.stackFSM>256)?'warn':'error');"
+"$('stackHTTP').textContent=d.stackHTTP?d.stackHTTP+'B':'-';"
+"$('stackHTTP').className='stat-value '+((d.stackHTTP&&d.stackHTTP>2048)?'good':(d.stackHTTP&&d.stackHTTP>1024)?'warn':'error');"
 "})}"
 "setInterval(update,3000);update();"
 "</script></body></html>";
@@ -1234,11 +1258,27 @@ static esp_err_t handle_status(httpd_req_t *req)
         "\"totalWater\":%lu,"
         "\"wifiState\":\"%s\","
         "\"ssid\":\"%s\","
-        "\"ip\":\"%s\"}",
+        "\"ip\":\"%s\","
+        "\"rssi\":%d,"
+        "\"txPower\":%d,"
+        "\"freeHeap\":%u,"
+        "\"minHeap\":%u,"
+        "\"stackFSM\":%u,"
+        "\"stackMon\":%u,"
+        "\"stackHTTP\":%u,"
+        "\"stackWiFi\":%u}",
         (unsigned long)filters_status.total_water_used,
         wifi_manager_get_state_name(wifi_manager_get_state()),
         wifi_manager_get_ssid(),
-        ip);
+        ip,
+        wifi_manager_get_rssi(),
+        pm_manager_get_wifi_tx_power() / 4,  // 转换为dBm
+        (unsigned)esp_get_free_heap_size(),
+        (unsigned)esp_get_minimum_free_heap_size(),
+        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("fsm")),
+        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("monitor")),
+        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("httpd")),
+        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("wifi")));
 
     httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;

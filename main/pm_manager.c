@@ -32,14 +32,24 @@ esp_err_t pm_manager_init(void)
         return ESP_OK;
     }
 
+    // 注意：PM manager在WiFi之前初始化，无法读取实际功率值
+    // 初始值设为80(20dBm)，后续由adjust_wifi_tx_power()读取实际值
     taskENTER_CRITICAL(&pm_spinlock);
-    s_ctx.current_wifi_tx_power = 80;  // 20dBm (80 * 0.25 = 20)
+    s_ctx.current_wifi_tx_power = 80;  // 20dBm默认值，WiFi启动后会被实际值替换
     s_ctx.wifi_tx_adjusted = false;
     s_ctx.initialized = true;
     taskEXIT_CRITICAL(&pm_spinlock);
 
-    ESP_LOGI(TAG, "电源管理已启用: WiFi TX初始20dBm");
+    ESP_LOGI(TAG, "电源管理已启用: WiFi TX默认20dBm");
     return ESP_OK;
+}
+
+uint8_t pm_manager_get_wifi_tx_power(void)
+{
+    taskENTER_CRITICAL(&pm_spinlock);
+    uint8_t power = s_ctx.current_wifi_tx_power;
+    taskEXIT_CRITICAL(&pm_spinlock);
+    return power;
 }
 
 esp_err_t pm_manager_set_cpu_mode(bool low_power)
@@ -55,9 +65,17 @@ esp_err_t pm_manager_set_cpu_mode(bool low_power)
 /**
  * @brief WiFi TX功率滞回表
  *
+ * ESP32-C3只支持特定的离散功率值，API输入值与实际功率有映射关系：
+ * - 输入范围[34,43] → 实际值34 → 8dBm
+ * - 输入范围[44,51] → 实际值44 → 11dBm
+ * - 输入范围[60,65] → 实际值60 → 15dBm
+ * - 输入范围[72,79] → 实际值72 → 18dBm
+ * - 输入范围[80,84] → 实际值80 → 20dBm
+ *
  * up_rssi: 低于此值 → 升一档功率（信号变差确认）
  * down_rssi: 高于此值 → 降一档功率（信号变好确认）
- * tx_dbm:  该档位的目标功率(dBm)
+ * tx_dbm:  该档位的目标功率(dBm)，使用ESP32-C3支持的离散值
+ * tx_qdbm: API输入值(0.25dBm单位)，直接传给esp_wifi_set_max_tx_power()
  *
  * 滞回效果：RSSI在边界附近波动时保持当前功率，
  * 只有信号明显变化（跨越滞回窗口）才切换功率。
@@ -65,13 +83,14 @@ esp_err_t pm_manager_set_cpu_mode(bool low_power)
 static const struct {
     int8_t up_rssi;    // 升功率阈值（低于此值升一档）
     int8_t down_rssi;  // 降功率阈值（高于此值降一档）
-    int8_t tx_dbm;     // 目标功率(dBm)
+    int8_t tx_dbm;     // 目标功率(dBm) - ESP32-C3支持的离散值
+    uint8_t tx_qdbm;   // API输入值(0.25dBm) - 直接传给API
 } s_pwr_table[] = {
-    { -55, -48,  8 },   // 8dBm:  RSSI<-55升到12, >=-48保持
-    { -60, -50, 12 },   // 12dBm: RSSI<-60升到15, >=-50降到8
-    { -65, -53, 15 },   // 15dBm: RSSI<-65升到19, >=-53降到12
-    { -75, -58, 19 },   // 19dBm: RSSI<-75升到20, >=-58降到15
-    { -99, -68, 20 },   // 20dBm: >=-68降到19, 不自动升更高
+    { -55, -48,  8,  34 },  // 8dBm:  RSSI<-55升到11dBm, >=-48保持
+    { -60, -50, 11,  44 },  // 11dBm: RSSI<-60升到15dBm, >=-50降到8dBm
+    { -65, -53, 15,  60 },  // 15dBm: RSSI<-65升到18dBm, >=-53降到11dBm
+    { -75, -58, 18,  72 },  // 18dBm: RSSI<-75升到20dBm, >=-58降到15dBm
+    { -99, -68, 20,  80 },  // 20dBm: >=-68降到18dBm, 不自动升更高
 };
 
 #define PWR_TABLE_SIZE (sizeof(s_pwr_table) / sizeof(s_pwr_table[0]))
@@ -83,44 +102,62 @@ esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
         taskEXIT_CRITICAL(&pm_spinlock);
         return ESP_ERR_INVALID_STATE;
     }
-
-    // 根据当前功率档位，用滞回判断是否切换
-    int8_t current_dbm = s_ctx.current_wifi_tx_power / 4;
     taskEXIT_CRITICAL(&pm_spinlock);
 
-    int8_t new_dbm = current_dbm;
+    // 获取当前实际功率值（直接从WiFi驱动读取）
+    int8_t actual_power = 0;
+    esp_err_t ret = esp_wifi_get_max_tx_power(&actual_power);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "无法获取当前TX功率: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
+    // 查找当前功率档位
+    int current_idx = -1;
     for (int i = 0; i < PWR_TABLE_SIZE; i++) {
-        if (s_pwr_table[i].tx_dbm == current_dbm) {
-            if (rssi < s_pwr_table[i].up_rssi) {
-                // 信号变差，升一档功率
-                new_dbm = (i + 1 < PWR_TABLE_SIZE) ? s_pwr_table[i + 1].tx_dbm : current_dbm;
-            } else if (rssi >= s_pwr_table[i].down_rssi) {
-                // 信号变好，降一档功率
-                new_dbm = (i > 0) ? s_pwr_table[i - 1].tx_dbm : current_dbm;
-            }
+        if (s_pwr_table[i].tx_qdbm == actual_power) {
+            current_idx = i;
             break;
         }
     }
 
-    if (new_dbm == current_dbm) {
-        return ESP_OK;
+    if (current_idx < 0) {
+        // 当前功率不在表中，默认使用最大功率档
+        current_idx = PWR_TABLE_SIZE - 1;
+        ESP_LOGD(TAG, "当前功率%d(%.2fdBm)不在表中，默认最大档",
+                 actual_power, actual_power / 4.0f);
     }
 
-    uint8_t tx_power_qdbm = (uint8_t)(new_dbm * 4);
-    esp_err_t ret = esp_wifi_set_max_tx_power(tx_power_qdbm);
+    // 滞回判断
+    int new_idx = current_idx;
+    if (rssi < s_pwr_table[current_idx].up_rssi) {
+        // 信号变差，升一档功率
+        new_idx = (current_idx + 1 < PWR_TABLE_SIZE) ? current_idx + 1 : current_idx;
+    } else if (rssi >= s_pwr_table[current_idx].down_rssi) {
+        // 信号变好，降一档功率
+        new_idx = (current_idx > 0) ? current_idx - 1 : current_idx;
+    }
+
+    if (new_idx == current_idx) {
+        return ESP_OK;  // 无需调整
+    }
+
+    // 设置新功率（使用正确的API输入值）
+    uint8_t new_power = s_pwr_table[new_idx].tx_qdbm;
+    ret = esp_wifi_set_max_tx_power(new_power);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi TX功率设置失败: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "TX功率设置失败: %s", esp_err_to_name(ret));
         return ret;
     }
 
     // 更新状态
     taskENTER_CRITICAL(&pm_spinlock);
-    s_ctx.current_wifi_tx_power = tx_power_qdbm;
+    s_ctx.current_wifi_tx_power = new_power;
     s_ctx.wifi_tx_adjusted = true;
     taskEXIT_CRITICAL(&pm_spinlock);
 
-    ESP_LOGD(TAG, "WiFi TX功率调整: RSSI=%ddBm -> %ddBm", rssi, new_dbm);
+    ESP_LOGI(TAG, "WiFi TX功率调整: RSSI=%ddBm, %ddBm→%ddBm",
+             rssi, s_pwr_table[current_idx].tx_dbm, s_pwr_table[new_idx].tx_dbm);
     return ESP_OK;
 }
 
