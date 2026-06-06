@@ -102,8 +102,11 @@ int8_t wifi_manager_get_rssi(void);
 
 /**
  * @brief 获取当前连接的SSID
+ * @param buf 调用者提供的缓冲区
+ * @param buf_len 缓冲区长度（至少33字节以容纳最大SSID）
+ * @return ESP_OK成功，ESP_ERR_INVALID_ARG参数无效
  */
-const char* wifi_manager_get_ssid(void);
+esp_err_t wifi_manager_get_ssid(char *buf, size_t buf_len);
 
 // ==================== 存储接口 ====================
 

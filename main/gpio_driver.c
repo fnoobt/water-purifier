@@ -113,47 +113,81 @@ esp_err_t gpio_driver_init_outputs(void)
 {
     esp_err_t ret;
 
-    // 获取当前触发电平
-    uint8_t inactive_level = output_state.relay_trigger_level ? 0 : 1;
+    // 首先创建输出状态互斥锁（确保后续访问都有保护）
+    if (!output_mutex) {
+        output_mutex = xSemaphoreCreateMutex();
+        if (!output_mutex) {
+            ESP_LOGE(TAG, "创建输出互斥锁失败");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    // 获取当前触发电平（此时已有mutex保护）
+    uint8_t trigger_level = gpio_driver_get_relay_trigger_level();
+    uint8_t inactive_level = trigger_level ? 0 : 1;
 
     // 配置进水电磁阀 (GPIO0)
     ret = gpio_reset_pin(GPIO_INLET_VALVE);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        vSemaphoreDelete(output_mutex);
+        output_mutex = NULL;
+        return ret;
+    }
     ret = gpio_set_direction(GPIO_INLET_VALVE, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        vSemaphoreDelete(output_mutex);
+        output_mutex = NULL;
+        return ret;
+    }
     gpio_set_level(GPIO_INLET_VALVE, inactive_level);
 
     // 配置废水电磁阀 (GPIO1)
     ret = gpio_reset_pin(GPIO_WASTE_VALVE);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        vSemaphoreDelete(output_mutex);
+        output_mutex = NULL;
+        return ret;
+    }
     ret = gpio_set_direction(GPIO_WASTE_VALVE, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        vSemaphoreDelete(output_mutex);
+        output_mutex = NULL;
+        return ret;
+    }
     gpio_set_level(GPIO_WASTE_VALVE, inactive_level);
 
     // 配置回水电磁阀 (GPIO4)
     ret = gpio_reset_pin(GPIO_RETURN_VALVE);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        vSemaphoreDelete(output_mutex);
+        output_mutex = NULL;
+        return ret;
+    }
     ret = gpio_set_direction(GPIO_RETURN_VALVE, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        vSemaphoreDelete(output_mutex);
+        output_mutex = NULL;
+        return ret;
+    }
     gpio_set_level(GPIO_RETURN_VALVE, inactive_level);
 
     // 配置增压泵 (GPIO5)
     ret = gpio_reset_pin(GPIO_BOOST_PUMP);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        vSemaphoreDelete(output_mutex);
+        output_mutex = NULL;
+        return ret;
+    }
     ret = gpio_set_direction(GPIO_BOOST_PUMP, GPIO_MODE_OUTPUT);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        vSemaphoreDelete(output_mutex);
+        output_mutex = NULL;
+        return ret;
+    }
     gpio_set_level(GPIO_BOOST_PUMP, inactive_level);
 
     ESP_LOGD(TAG, "输出GPIO初始化完成 (触发电平: %s)",
-             output_state.relay_trigger_level ? "高电平" : "低电平");
-
-    // 创建输出状态互斥锁
-    if (!output_mutex) {
-        output_mutex = xSemaphoreCreateMutex();
-        if (!output_mutex) {
-            ESP_LOGW(TAG, "创建输出互斥锁失败");
-        }
-    }
+             trigger_level ? "高电平" : "低电平");
 
     return ESP_OK;
 }
@@ -325,10 +359,14 @@ esp_err_t gpio_driver_set_inlet_valve(bool state)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "进水阀GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
-        // 使用mutex保护状态更新
+        // GPIO设置成功后必须更新状态（保持硬件与内存一致）
         if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             output_state.inlet_valve = state;
             xSemaphoreGive(output_mutex);
+        } else {
+            // mutex获取失败时仍需更新状态（非关键数据，降级处理）
+            output_state.inlet_valve = state;
+            ESP_LOGD(TAG, "进水阀状态更新无锁");
         }
         ESP_LOGD(TAG, "进水阀: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
@@ -343,9 +381,13 @@ esp_err_t gpio_driver_set_waste_valve(bool state)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "废水阀GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
+        // GPIO设置成功后必须更新状态（保持硬件与内存一致）
         if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             output_state.waste_valve = state;
             xSemaphoreGive(output_mutex);
+        } else {
+            output_state.waste_valve = state;
+            ESP_LOGD(TAG, "废水阀状态更新无锁");
         }
         ESP_LOGD(TAG, "废水阀: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
@@ -360,9 +402,13 @@ esp_err_t gpio_driver_set_return_valve(bool state)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "回水阀GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
+        // GPIO设置成功后必须更新状态（保持硬件与内存一致）
         if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             output_state.return_valve = state;
             xSemaphoreGive(output_mutex);
+        } else {
+            output_state.return_valve = state;
+            ESP_LOGD(TAG, "回水阀状态更新无锁");
         }
         ESP_LOGD(TAG, "回水阀: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
@@ -377,9 +423,13 @@ esp_err_t gpio_driver_set_boost_pump(bool state)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "增压泵GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
+        // GPIO设置成功后必须更新状态（保持硬件与内存一致）
         if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             output_state.boost_pump = state;
             xSemaphoreGive(output_mutex);
+        } else {
+            output_state.boost_pump = state;
+            ESP_LOGD(TAG, "增压泵状态更新无锁");
         }
         ESP_LOGD(TAG, "增压泵: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
@@ -422,7 +472,14 @@ esp_err_t gpio_driver_set_led1(bool state)
 {
     esp_err_t ret = gpio_set_level(GPIO_LED_STATUS_1, state ? 1 : 0);
     if (ret == ESP_OK) {
-        output_state.led1 = state;
+        // LED状态更新使用mutex保护，避免竞态
+        if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            output_state.led1 = state;
+            xSemaphoreGive(output_mutex);
+        } else {
+            // 降级处理：LED状态非关键，直接更新
+            output_state.led1 = state;
+        }
     }
     return ret;
 }
@@ -431,7 +488,14 @@ esp_err_t gpio_driver_set_led2(bool state)
 {
     esp_err_t ret = gpio_set_level(GPIO_LED_STATUS_2, state ? 1 : 0);
     if (ret == ESP_OK) {
-        output_state.led2 = state;
+        // LED状态更新使用mutex保护，避免竞态
+        if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            output_state.led2 = state;
+            xSemaphoreGive(output_mutex);
+        } else {
+            // 降级处理：LED状态非关键，直接更新
+            output_state.led2 = state;
+        }
     }
     return ret;
 }

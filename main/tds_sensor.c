@@ -319,18 +319,32 @@ esp_err_t tds_sensor_measure(tds_sensor_id_t sensor_id, tds_measurement_t *measu
     // 转换为电压（mV），12位ADC，3.3V参考
     float voltage = (adc_raw / 4095.0f) * 3300.0f;
 
-    // 计算TDS
-    float tds = calculate_tds(voltage, tds_ctx.temperature);
+    // 获取mutex保护读取共享数据（temperature和calibration）
+    float temperature = 25.0f;
+    float cal_scale = 1.0f;
+    float cal_offset = 0.0f;
+
+    if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        temperature = tds_ctx.temperature;
+        cal_scale = tds_ctx.calibration[sensor_id].scale;
+        cal_offset = tds_ctx.calibration[sensor_id].offset;
+        xSemaphoreGive(tds_ctx.data_mutex);
+    } else {
+        ESP_LOGW(TAG, "获取mutex失败，使用默认值计算TDS");
+    }
+
+    // 计算TDS（使用mutex保护下的值）
+    float tds = calculate_tds(voltage, temperature);
 
     // 应用校准
-    tds = tds * tds_ctx.calibration[sensor_id].scale + tds_ctx.calibration[sensor_id].offset;
+    tds = tds * cal_scale + cal_offset;
     if (tds < 0) tds = 0;
 
     // 填充结果
     measurement->voltage = voltage;
     measurement->tds_value = sensor_connected ? tds : 0.0f;  // 传感器未连接时显示0
     measurement->ec_value = sensor_connected ? voltage_to_ec(voltage) : 0.0f;
-    measurement->temperature = tds_ctx.temperature;
+    measurement->temperature = temperature;
     measurement->valid = sensor_connected;  // 传感器未连接时标记为无效
     measurement->timestamp = esp_timer_get_time();
 
@@ -433,10 +447,16 @@ esp_err_t tds_sensor_set_calibration(tds_sensor_id_t sensor_id, const tds_calibr
         return ESP_ERR_INVALID_ARG;
     }
 
-    tds_ctx.calibration[sensor_id] = *calibration;
-    ESP_LOGI(TAG, "%s校准: offset=%.2f, scale=%.4f",
-             sensor_names[sensor_id], calibration->offset, calibration->scale);
-    return ESP_OK;
+    // 使用mutex保护校准数据更新
+    if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        tds_ctx.calibration[sensor_id] = *calibration;
+        xSemaphoreGive(tds_ctx.data_mutex);
+        ESP_LOGI(TAG, "%s校准: offset=%.2f, scale=%.4f",
+                 sensor_names[sensor_id], calibration->offset, calibration->scale);
+        return ESP_OK;
+    }
+    ESP_LOGE(TAG, "set_calibration: mutex获取失败");
+    return ESP_ERR_TIMEOUT;
 }
 
 esp_err_t tds_sensor_get_calibration(tds_sensor_id_t sensor_id, tds_calibration_t *calibration)
@@ -445,8 +465,14 @@ esp_err_t tds_sensor_get_calibration(tds_sensor_id_t sensor_id, tds_calibration_
         return ESP_ERR_INVALID_ARG;
     }
 
-    *calibration = tds_ctx.calibration[sensor_id];
-    return ESP_OK;
+    // 使用mutex保护校准数据读取
+    if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        *calibration = tds_ctx.calibration[sensor_id];
+        xSemaphoreGive(tds_ctx.data_mutex);
+        return ESP_OK;
+    }
+    ESP_LOGE(TAG, "get_calibration: mutex获取失败");
+    return ESP_ERR_TIMEOUT;
 }
 
 esp_err_t tds_sensor_calibrate(tds_sensor_id_t sensor_id, float standard_value)
@@ -461,13 +487,20 @@ esp_err_t tds_sensor_calibrate(tds_sensor_id_t sensor_id, float standard_value)
         return ESP_FAIL;
     }
 
-    // 计算比例系数
+    // 计算比例系数并更新（需要mutex保护）
     if (meas.tds_value > 1.0f) {
-        tds_ctx.calibration[sensor_id].scale = standard_value / meas.tds_value;
-        ESP_LOGI(TAG, "%s校准完成: 测量值=%.1f, 标准值=%.1f, scale=%.4f",
-                 sensor_names[sensor_id], meas.tds_value, standard_value,
-                 tds_ctx.calibration[sensor_id].scale);
-        return ESP_OK;
+        // 校准系数 = 标准值 / 测量值（修正：测量值偏大时scale<1，偏小时scale>1）
+        float new_scale = standard_value / meas.tds_value;
+
+        if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            tds_ctx.calibration[sensor_id].scale = new_scale;
+            xSemaphoreGive(tds_ctx.data_mutex);
+            ESP_LOGI(TAG, "%s校准完成: 测量值=%.1f, 标准值=%.1f, scale=%.4f",
+                     sensor_names[sensor_id], meas.tds_value, standard_value, new_scale);
+            return ESP_OK;
+        }
+        ESP_LOGE(TAG, "calibrate: mutex获取失败");
+        return ESP_ERR_TIMEOUT;
     }
 
     return ESP_ERR_INVALID_STATE;
@@ -479,10 +512,16 @@ esp_err_t tds_sensor_reset_calibration(tds_sensor_id_t sensor_id)
         return ESP_ERR_INVALID_ARG;
     }
 
-    tds_ctx.calibration[sensor_id].offset = 0.0f;
-    tds_ctx.calibration[sensor_id].scale = 1.0f;
-    ESP_LOGI(TAG, "%s校准已重置", sensor_names[sensor_id]);
-    return ESP_OK;
+    // 使用mutex保护校准重置
+    if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        tds_ctx.calibration[sensor_id].offset = 0.0f;
+        tds_ctx.calibration[sensor_id].scale = 1.0f;
+        xSemaphoreGive(tds_ctx.data_mutex);
+        ESP_LOGI(TAG, "%s校准已重置", sensor_names[sensor_id]);
+        return ESP_OK;
+    }
+    ESP_LOGE(TAG, "reset_calibration: mutex获取失败");
+    return ESP_ERR_TIMEOUT;
 }
 
 // ==================== 报警 ====================
@@ -529,9 +568,16 @@ bool tds_sensor_is_alarm(tds_sensor_id_t sensor_id)
 
 void tds_sensor_set_skip_alarm_detection(bool skip)
 {
-    tds_ctx.skip_alarm_detection = skip;
-    if (skip) {
-        ESP_LOGD(TAG, "跳过报警检测（纯水洗膜期间）");
+    // 使用mutex保护标志更新
+    if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        tds_ctx.skip_alarm_detection = skip;
+        xSemaphoreGive(tds_ctx.data_mutex);
+        if (skip) {
+            ESP_LOGD(TAG, "跳过报警检测（纯水洗膜期间）");
+        }
+    } else {
+        // 降级处理：直接更新（非关键标志）
+        tds_ctx.skip_alarm_detection = skip;
     }
 }
 
@@ -539,12 +585,27 @@ void tds_sensor_set_skip_alarm_detection(bool skip)
 
 esp_err_t tds_sensor_set_temperature(float temperature)
 {
+    // 使用mutex保护温度更新
+    if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        tds_ctx.temperature = temperature;
+        xSemaphoreGive(tds_ctx.data_mutex);
+        return ESP_OK;
+    }
+    // 降级处理：直接更新（温度补偿非关键功能）
     tds_ctx.temperature = temperature;
     return ESP_OK;
 }
 
 float tds_sensor_get_temperature(void)
 {
+    // 使用mutex保护温度读取
+    float temp = 25.0f;  // 默认值
+    if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        temp = tds_ctx.temperature;
+        xSemaphoreGive(tds_ctx.data_mutex);
+        return temp;
+    }
+    // 降级处理：直接读取（非关键功能）
     return tds_ctx.temperature;
 }
 
@@ -552,6 +613,7 @@ float tds_sensor_get_temperature(void)
 
 bool tds_sensor_is_running(void)
 {
+    // running标志在init/stop中设置，读取无需mutex（原子bool）
     return tds_ctx.running;
 }
 

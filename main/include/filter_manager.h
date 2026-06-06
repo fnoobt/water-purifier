@@ -48,8 +48,7 @@ typedef struct {
     uint32_t used_liters;         // 已处理水量（升）
     uint32_t total_liters;        // 滤芯总容量（升）
     uint32_t time_limit_hours;    // 时间寿命上限（小时）
-    uint32_t install_time;        // 安装时间戳（Unix秒，NTP墙钟）
-    uint32_t last_reset_time;     // 上次重置时间戳（Unix秒，NTP墙钟）
+    uint32_t last_reset_time;     // 上次重置时间戳（Unix秒，用于日历寿命计算）
     bool replacement_needed;       // 是否需要更换
     char name[16];                // 滤芯名称
 } filter_info_t;
@@ -62,17 +61,6 @@ typedef struct {
     uint32_t total_water_used;             // 总用水量（升）
     bool any_filter_needs_replacement;     // 是否有滤芯需要更换
 } filters_status_t;
-
-/**
- * @brief 滤芯寿命信息结构体（兼容旧接口）
- */
-typedef struct {
-    uint8_t percentage;       // 剩余寿命百分比（0-100）
-    uint32_t used_liters;     // 已处理水量（升）
-    uint32_t total_liters;    // 滤芯总容量（升）
-    uint32_t install_time;    // 安装时间戳（Unix秒，NTP墙钟）
-    bool replacement_needed;  // 是否需要更换
-} filter_life_t;
 
 // ==================== 初始化 ====================
 

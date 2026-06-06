@@ -11,6 +11,8 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "water_purifier_fsm.h"  // FSM模块
+#include "wifi_manager.h"        // WiFi模块
 
 static const char *TAG = "PM";
 
@@ -22,6 +24,8 @@ static struct {
     bool initialized;
     uint8_t current_wifi_tx_power; // 当前WiFi TX功率(0.25dBm单位)
     bool wifi_tx_adjusted;         // 是否已调整过WiFi功率
+    int8_t pending_direction;      // 待调整方向: 0=无, 1=升, -1=降
+    uint8_t pending_count;         // 连续超出阈值的次数计数
 } s_ctx = {0};
 
 // ==================== 初始化 ====================
@@ -46,6 +50,11 @@ esp_err_t pm_manager_init(void)
 
 uint8_t pm_manager_get_wifi_tx_power(void)
 {
+    // 检查是否已初始化，避免返回未定义值
+    if (!s_ctx.initialized) {
+        ESP_LOGW(TAG, "pm_manager未初始化，返回默认功率值");
+        return 80;  // 返回默认值20dBm (80 * 0.25)
+    }
     taskENTER_CRITICAL(&pm_spinlock);
     uint8_t power = s_ctx.current_wifi_tx_power;
     taskEXIT_CRITICAL(&pm_spinlock);
@@ -77,8 +86,8 @@ esp_err_t pm_manager_set_cpu_mode(bool low_power)
  * tx_dbm:  该档位的目标功率(dBm)，使用ESP32-C3支持的离散值
  * tx_qdbm: API输入值(0.25dBm单位)，直接传给esp_wifi_set_max_tx_power()
  *
- * 滞回效果：RSSI在边界附近波动时保持当前功率，
- * 只有信号明显变化（跨越滞回窗口）才切换功率。
+ * 滞回设计原则：相邻档位的阈值至少相差10dB，防止边界波动频繁切换
+ * 连续确认机制：RSSI需连续3次超出阈值才触发调整
  */
 static const struct {
     int8_t up_rssi;    // 升功率阈值（低于此值升一档）
@@ -86,11 +95,11 @@ static const struct {
     int8_t tx_dbm;     // 目标功率(dBm) - ESP32-C3支持的离散值
     uint8_t tx_qdbm;   // API输入值(0.25dBm) - 直接传给API
 } s_pwr_table[] = {
-    { -55, -48,  8,  34 },  // 8dBm:  RSSI<-55升到11dBm, >=-48保持
-    { -60, -50, 11,  44 },  // 11dBm: RSSI<-60升到15dBm, >=-50降到8dBm
-    { -65, -53, 15,  60 },  // 15dBm: RSSI<-65升到18dBm, >=-53降到11dBm
-    { -75, -58, 18,  72 },  // 18dBm: RSSI<-75升到20dBm, >=-58降到15dBm
-    { -99, -68, 20,  80 },  // 20dBm: >=-68降到18dBm, 不自动升更高
+    { -60, -45,  8,  34 },  // 8dBm:  RSSI<-60升到11dBm, >=-45保持
+    { -70, -50, 11,  44 },  // 11dBm: RSSI<-70升到15dBm, >=-50降到8dBm
+    { -80, -55, 15,  60 },  // 15dBm: RSSI<-80升到18dBm, >=-55降到11dBm
+    { -90, -60, 18,  72 },  // 18dBm: RSSI<-90升到20dBm, >=-60降到15dBm
+    { -99, -70, 20,  80 },  // 20dBm: >=-70降到18dBm, 不自动升更高
 };
 
 #define PWR_TABLE_SIZE (sizeof(s_pwr_table) / sizeof(s_pwr_table[0]))
@@ -130,19 +139,48 @@ esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
 
     // 滞回判断
     int new_idx = current_idx;
+    int8_t direction = 0;  // 0=无变化, 1=升功率, -1=降功率
     if (rssi < s_pwr_table[current_idx].up_rssi) {
-        // 信号变差，升一档功率
+        // 信号变差，需要升功率
         new_idx = (current_idx + 1 < PWR_TABLE_SIZE) ? current_idx + 1 : current_idx;
+        direction = 1;
     } else if (rssi >= s_pwr_table[current_idx].down_rssi) {
-        // 信号变好，降一档功率
+        // 信号变好，需要降功率
         new_idx = (current_idx > 0) ? current_idx - 1 : current_idx;
+        direction = -1;
     }
 
     if (new_idx == current_idx) {
+        // RSSI在滞回窗口内，重置计数器
+        taskENTER_CRITICAL(&pm_spinlock);
+        s_ctx.pending_direction = 0;
+        s_ctx.pending_count = 0;
+        taskEXIT_CRITICAL(&pm_spinlock);
         return ESP_OK;  // 无需调整
     }
 
-    // 设置新功率（使用正确的API输入值）
+    // 连续确认机制：需要连续3次超出阈值才触发调整
+    taskENTER_CRITICAL(&pm_spinlock);
+    if (s_ctx.pending_direction != direction) {
+        // 方向改变，重置计数器
+        s_ctx.pending_direction = direction;
+        s_ctx.pending_count = 1;
+        taskEXIT_CRITICAL(&pm_spinlock);
+        ESP_LOGD(TAG, "RSSI=%ddBm超出阈值，方向=%s，计数=1/3",
+                 rssi, direction > 0 ? "升功率" : "降功率");
+        return ESP_OK;  // 需要继续观察
+    }
+
+    s_ctx.pending_count++;
+    if (s_ctx.pending_count < 3) {
+        taskEXIT_CRITICAL(&pm_spinlock);
+        ESP_LOGD(TAG, "RSSI=%ddBm超出阈值，方向=%s，计数=%d/3",
+                 rssi, direction > 0 ? "升功率" : "降功率", s_ctx.pending_count);
+        return ESP_OK;  // 需要继续观察
+    }
+    taskEXIT_CRITICAL(&pm_spinlock);
+
+    // 连续3次确认，执行功率调整
     uint8_t new_power = s_pwr_table[new_idx].tx_qdbm;
     ret = esp_wifi_set_max_tx_power(new_power);
     if (ret != ESP_OK) {
@@ -150,13 +188,15 @@ esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
         return ret;
     }
 
-    // 更新状态
+    // 更新状态并重置计数器
     taskENTER_CRITICAL(&pm_spinlock);
     s_ctx.current_wifi_tx_power = new_power;
     s_ctx.wifi_tx_adjusted = true;
+    s_ctx.pending_direction = 0;
+    s_ctx.pending_count = 0;
     taskEXIT_CRITICAL(&pm_spinlock);
 
-    ESP_LOGI(TAG, "WiFi TX功率调整: RSSI=%ddBm, %ddBm→%ddBm",
+    ESP_LOGI(TAG, "WiFi TX功率调整: RSSI=%ddBm, %ddBm→%ddBm (连续3次确认)",
              rssi, s_pwr_table[current_idx].tx_dbm, s_pwr_table[new_idx].tx_dbm);
     return ESP_OK;
 }
@@ -168,10 +208,21 @@ esp_err_t pm_manager_check_heap(void)
     size_t free_heap = esp_get_free_heap_size();
     size_t min_ever_heap = esp_get_minimum_free_heap_size();
 
-    // 低于15KB立即重启（跳过NVS保存，避免进一步消耗内存）
+    // 低于15KB立即重启（先清理关键资源，避免重启过程中访问已释放资源）
     if (free_heap < 15360) {
-        ESP_LOGE(TAG, "堆内存严重不足! 可用=%u bytes, 历史最低=%u bytes, 即将重启",
+        ESP_LOGE(TAG, "堆内存严重不足! 可用=%u bytes, 历史最低=%u bytes, 先停止关键任务再重启",
                  (unsigned)free_heap, (unsigned)min_ever_heap);
+
+        // 停止FSM任务（避免重启过程中FSM继续操作硬件）
+        fsm_send_event(FSM_EVENT_SHUTDOWN);
+
+        // 停止WiFi（避免重启过程中网络操作）
+        wifi_manager_stop();
+
+        // 短暂延时让任务退出
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        ESP_LOGE(TAG, "资源清理完成，执行重启");
         esp_restart();
         return ESP_ERR_NO_MEM;
     }

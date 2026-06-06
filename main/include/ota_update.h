@@ -89,6 +89,18 @@ esp_err_t ota_update_revert_to_factory(void);
  */
 esp_err_t ota_update_rollback(void);
 
+/**
+ * @brief 预览固件信息（解析头部版本信息，不执行升级）
+ * @param data 固件头部数据（至少256字节）
+ * @param len 数据长度
+ * @param version 输出版本字符串（需32字节缓冲区）
+ * @param date 输出编译日期（需16字节缓冲区）
+ * @param time 输出编译时间（需16字节缓冲区）
+ * @return ESP_OK 解析成功，ESP_ERR_INVALID_ARG 数据不足或格式错误
+ */
+esp_err_t ota_update_preview(const uint8_t *data, size_t len,
+                             char *version, char *date, char *time);
+
 #ifdef __cplusplus
 }
 #endif

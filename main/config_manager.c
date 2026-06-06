@@ -31,6 +31,18 @@ static void config_manager_migrate_nvs(void)
     esp_err_t err;
     bool migrated = false;
 
+    // 检查是否已完成迁移（避免每次重启重复迁移）
+    uint8_t migration_done = 0;
+    err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        if (nvs_get_u8(handle, "nvs_migrated", &migration_done) == ESP_OK && migration_done == 1) {
+            nvs_close(handle);
+            ESP_LOGD(TAG, "NVS迁移已完成，跳过");
+            return;  // 已迁移，直接返回
+        }
+        nvs_close(handle);
+    }
+
     // 1. 迁移wifi命名空间 → water_purifier
     err = nvs_open("wifi", NVS_READONLY, &handle);
     if (err == ESP_OK) {
@@ -107,8 +119,8 @@ static void config_manager_migrate_nvs(void)
             nvs_erase_all(erase_handle);
             nvs_commit(erase_handle);
             nvs_close(erase_handle);
+            ESP_LOGI(TAG, "已删除旧mqtt_config命名空间");
         }
-        ESP_LOGI(TAG, "已删除旧mqtt_config命名空间");
     }
 
     // 3. 迁移wp_rt命名空间 → wp_filters（仅total_water）
@@ -172,6 +184,14 @@ static void config_manager_migrate_nvs(void)
 
     if (migrated) {
         ESP_LOGI(TAG, "NVS迁移完成，旧数据已统一到新结构");
+    }
+
+    // 设置迁移完成标志（无论是否有迁移，都标记为已完成）
+    nvs_handle_t wp_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &wp_handle) == ESP_OK) {
+        nvs_set_u8(wp_handle, "nvs_migrated", 1);
+        nvs_commit(wp_handle);
+        nvs_close(wp_handle);
     }
 }
 
@@ -331,6 +351,12 @@ esp_err_t config_manager_deinit(void)
 {
     if (!ctx.initialized) {
         return ESP_OK;
+    }
+
+    // 保存未写入的配置变更（避免数据丢失）
+    if (ctx.config_dirty) {
+        ESP_LOGI(TAG, "反初始化时保存未写入的配置");
+        config_manager_save();
     }
 
     ctx.initialized = false;
@@ -567,7 +593,9 @@ esp_err_t config_manager_save(void)
         is_dirty = ctx.config_dirty;
         xSemaphoreGive(ctx.mutex);
     } else {
-        is_dirty = ctx.config_dirty;  // 降级处理
+        /* mutex获取失败，拒绝操作以避免数据不一致 */
+        ESP_LOGE(TAG, "save: mutex获取超时(检查dirty)，拒绝操作");
+        return ESP_ERR_TIMEOUT;
     }
 
     if (!is_dirty) {
@@ -652,16 +680,17 @@ esp_err_t config_manager_save(void)
     err = nvs_commit(handle);
     nvs_close(handle);
 
-    // 使用mutex保护脏标志清除
-    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        if (err == ESP_OK) {
+    // 使用mutex保护脏标志清除（确保一致性）
+    if (err == ESP_OK) {
+        if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             ctx.config_dirty = false;
+            xSemaphoreGive(ctx.mutex);
             ESP_LOGI(TAG, "配置已保存");
-        }
-        xSemaphoreGive(ctx.mutex);
-    } else {
-        if (err == ESP_OK) {
-            ctx.config_dirty = false;
+        } else {
+            /* mutex获取失败，保持dirty标志为true，下次保存时会再次尝试
+             * 这样避免了竞态：如果另一个任务正在设置dirty，强制清除会丢失更新 */
+            ESP_LOGW(TAG, "保存成功但mutex获取失败(清除dirty)，保持脏标志以便下次保存");
+            // 不清除dirty标志，下次save会重新保存
         }
     }
     return err;
@@ -1163,7 +1192,9 @@ bool config_manager_has_wifi_config(void)
         has_config = (strlen(ctx.config.wifi_ssid) > 0);
         xSemaphoreGive(ctx.mutex);
     } else {
-        has_config = (strlen(ctx.config.wifi_ssid) > 0);
+        // mutex获取失败时返回false（保守估计，避免无锁访问共享数据）
+        // 调用者应该在连接前再次确认配置状态
+        ESP_LOGW(TAG, "has_wifi_config: mutex获取失败，返回false");
     }
     return has_config;
 }
@@ -1175,7 +1206,8 @@ bool config_manager_has_mqtt_config(void)
         has_config = (strlen(ctx.config.mqtt_broker) > 0);
         xSemaphoreGive(ctx.mutex);
     } else {
-        has_config = (strlen(ctx.config.mqtt_broker) > 0);
+        // mutex获取失败时返回false（保守估计，避免无锁访问共享数据）
+        ESP_LOGW(TAG, "has_mqtt_config: mutex获取失败，返回false");
     }
     return has_config;
 }

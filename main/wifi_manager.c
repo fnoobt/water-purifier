@@ -308,12 +308,29 @@ esp_err_t wifi_manager_stop(void)
 {
     if (!ctx.started) return ESP_OK;
 
-    // 取消重连任务（先清除标志，再删除任务）
-    if (ctx.reconnect_task_handle) {
+    // 取消重连任务（使用mutex保护，避免竞态条件）
+    if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (ctx.reconnect_task_handle) {
+            ctx.reconnect_active = false;
+            ctx.active_reconnect_seq = 0;
+            TaskHandle_t task = ctx.reconnect_task_handle;
+            ctx.reconnect_task_handle = NULL;
+            xSemaphoreGive(ctx.state_mutex);
+            vTaskDelete(task);
+        } else {
+            xSemaphoreGive(ctx.state_mutex);
+        }
+    } else {
+        // mutex获取失败：先设置标志通知任务退出，等待一小段时间
         ctx.reconnect_active = false;
-        ctx.active_reconnect_seq = 0;
-        vTaskDelete(ctx.reconnect_task_handle);
-        ctx.reconnect_task_handle = NULL;
+        if (ctx.reconnect_task_handle) {
+            ESP_LOGW(TAG, "获取mutex失败，等待任务退出");
+            vTaskDelay(pdMS_TO_TICKS(100));  // 给任务100ms退出时间
+            // 如果任务仍未退出，强制删除（最后手段）
+            TaskHandle_t task = ctx.reconnect_task_handle;
+            ctx.reconnect_task_handle = NULL;
+            vTaskDelete(task);
+        }
     }
 
     if (ctx.is_ap_mode) {
@@ -408,15 +425,32 @@ esp_err_t wifi_manager_stop_ap_mode(void)
 {
     if (!ctx.is_ap_mode) return ESP_OK;
 
-    ESP_LOGI(TAG, "停止AP模式");
-    esp_wifi_set_mode(WIFI_MODE_STA);
+    ESP_LOGI(TAG, "停止AP模式，切换到STA模式");
 
+    // 切换到STA模式
+    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "切换WiFi模式失败: %s", esp_err_to_name(ret));
+    }
+
+    // 销毁AP网络接口
     if (ctx.ap_netif) {
         esp_netif_destroy(ctx.ap_netif);
         ctx.ap_netif = NULL;
     }
 
     ctx.is_ap_mode = false;
+
+    // 如果有保存的WiFi配置，尝试连接
+    if (strlen(ctx.ssid) > 0) {
+        ESP_LOGI(TAG, "AP模式停止后尝试连接到 %s", ctx.ssid);
+        set_state(WIFI_STATE_CONNECTING);
+        esp_wifi_connect();
+    } else {
+        ESP_LOGD(TAG, "无保存的WiFi配置，AP模式停止后保持待机");
+        set_state(WIFI_STATE_DISCONNECTED);
+    }
+
     return ESP_OK;
 }
 
@@ -484,23 +518,26 @@ int8_t wifi_manager_get_rssi(void)
 
 /**
  * @brief 获取当前WiFi SSID
- * @return SSID字符串指针
- * @warning 返回值指向静态缓冲区，多线程调用会互相覆盖。调用者应立即复制结果，不要长期持有指针。
+ * @param buf 调用者提供的缓冲区
+ * @param buf_len 缓冲区长度（至少33字节）
+ * @return ESP_OK成功，ESP_ERR_INVALID_ARG参数无效
  */
-const char* wifi_manager_get_ssid(void)
+esp_err_t wifi_manager_get_ssid(char *buf, size_t buf_len)
 {
-    // 使用静态缓冲区返回SSID（避免返回可能被修改的内部缓冲区指针）
-    // 注意：多线程环境下不安全，调用者应立即复制结果
-    static char ssid_copy[33] = {0};
+    if (!buf || buf_len < 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        strncpy(ssid_copy, ctx.ssid, sizeof(ssid_copy) - 1);
-        ssid_copy[sizeof(ssid_copy) - 1] = '\0';
+        strncpy(buf, ctx.ssid, buf_len - 1);
+        buf[buf_len - 1] = '\0';
         xSemaphoreGive(ctx.state_mutex);
     } else {
-        strncpy(ssid_copy, ctx.ssid, sizeof(ssid_copy) - 1);
-        ssid_copy[sizeof(ssid_copy) - 1] = '\0';
+        // mutex获取失败时仍返回数据（降级处理）
+        strncpy(buf, ctx.ssid, buf_len - 1);
+        buf[buf_len - 1] = '\0';
     }
-    return ssid_copy;
+    return ESP_OK;
 }
 
 // ==================== 存储 ====================
@@ -644,8 +681,16 @@ static void wifi_reconnect_task(void *arg)
 
     ESP_LOGI(TAG, "WiFi重连任务启动 seq=%lu", my_seq);
 
-    // 注册看门狗
-    esp_task_wdt_add(NULL);
+    // 注册看门狗（先尝试删除可能残留的注册，再添加新的）
+    // 注意：esp_task_wdt_add对同一任务重复调用会返回错误，但不影响功能
+    esp_err_t wdt_ret = esp_task_wdt_add(NULL);
+    if (wdt_ret == ESP_OK) {
+        ESP_LOGD(TAG, "重连任务已注册看门狗");
+    } else if (wdt_ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGD(TAG, "重连任务已在看门狗列表中，继续执行");
+    } else {
+        ESP_LOGW(TAG, "看门狗注册失败: %s", esp_err_to_name(wdt_ret));
+    }
 
     // ===== 第一阶段：指数退避重连 =====
     while (retry < max_retries) {

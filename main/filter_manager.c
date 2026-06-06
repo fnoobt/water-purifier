@@ -81,11 +81,6 @@ static struct {
     // 总制水量（仅PRODUCTION状态产出的纯水，用于RO膜/后置炭寿命计算和显示）
     uint32_t total_production_water;
 
-    // 兼容旧接口的单滤芯状态
-    uint32_t filter_total_liters;
-    uint32_t filter_used_liters;
-    uint32_t filter_install_time;
-
     // NVS写入控制（按周期检查，不每次写入）
     bool save_needed;
 
@@ -100,9 +95,6 @@ static struct {
     .production_rate_lph = 12.0f,  // 默认汇通75G
     .waste_flow_lph = 18.0f,       // 默认300CC (300*60/1000)
     .pump_flow_lph = 33.0f,        // 默认三角洲50G增压泵 (0.55L/min × 60)
-    .filter_total_liters = 3000,
-    .filter_used_liters = 0,
-    .filter_install_time = 0,
     .save_needed = false,
     .save_fail_count = 0,
 };
@@ -215,11 +207,9 @@ static void load_from_nvs(void)
             // 验证时间戳有效性（> 2020-01-01）
             if (reset_time > 1577836800UL) {
                 fctx.filters[i].last_reset_time = reset_time;
-                fctx.filters[i].install_time = reset_time;
             } else {
                 // 无效时间戳，标记为0等待fixup
                 fctx.filters[i].last_reset_time = 0;
-                fctx.filters[i].install_time = 0;
             }
         }
 
@@ -245,10 +235,6 @@ static void load_from_nvs(void)
             fctx.filters[i].percentage = (uint8_t)(remaining * 100);
         }
     }
-
-    // 兼容旧接口数据
-    fctx.filter_used_liters = fctx.filters[FILTER_RO_MEMBRANE].used_liters;
-    fctx.filter_install_time = fctx.filters[FILTER_RO_MEMBRANE].last_reset_time;
 
     nvs_close(handle);
     ESP_LOGI(TAG, "滤芯数据已加载: 总用水%luL, 总制水%luL, 累加器[%lu,%lu,%lu,%lu,%lu]mL",
@@ -315,8 +301,8 @@ static esp_err_t save_to_nvs_locked(void)
 // ==================== 辅助函数（假定已持有锁） ====================
 
 /**
- * @brief 在NTP同步后回补滤芯安装时间戳
- * @note 假定已持有锁，初始化时install_time=0表示未同步
+ * @brief 在NTP同步后回补滤芯重置时间戳
+ * @note 假定已持有锁，初始化时last_reset_time=0表示未同步
  */
 static void fixup_filter_time_on_ntp_sync_locked(void)
 {
@@ -328,14 +314,8 @@ static void fixup_filter_time_on_ntp_sync_locked(void)
         // 时间戳<=1表示未同步，需要修正（0或1都是无效值）
         if (fctx.filters[i].last_reset_time <= 1) {
             fctx.filters[i].last_reset_time = (uint32_t)now_sec;
-            fctx.filters[i].install_time = (uint32_t)now_sec;
             fixed = true;
         }
-    }
-    // 兼容字段检查
-    if (fctx.filter_install_time <= 1) {
-        fctx.filter_install_time = (uint32_t)now_sec;
-        fixed = true;
     }
     if (fixed) {
         ESP_LOGI(TAG, "NTP已同步，修正滤芯日历时间戳为%lu", (uint32_t)now_sec);
@@ -417,9 +397,13 @@ static bool commit_accumulators_locked(void)
             uint32_t liters = fctx.filter_accumulator_ml[i] / 1000;
             fctx.filter_accumulator_ml[i] %= 1000;
 
-            // 增加该滤芯已用水量
+            // 增加该滤芯已用水量（检查溢出）
             if (UINT32_MAX - fctx.filters[i].used_liters >= liters) {
                 fctx.filters[i].used_liters += liters;
+            } else {
+                // 溢出保护：设置最大值并输出警告
+                ESP_LOGW(TAG, "滤芯%d已用水量溢出，设置为最大值", i + 1);
+                fctx.filters[i].used_liters = UINT32_MAX;
             }
 
             // 更新剩余寿命百分比
@@ -430,24 +414,84 @@ static bool commit_accumulators_locked(void)
                 fctx.filters[i].percentage = (uint8_t)(remaining * 100);
             }
 
-            // 累加到总用水量/制水量
+            // 累加到总用水量/制水量（检查溢出）
             if (i <= 2) {  // 前三级计入总用水量
                 if (UINT32_MAX - fctx.total_water_used >= liters) {
                     fctx.total_water_used += liters;
+                } else {
+                    ESP_LOGW(TAG, "总用水量溢出，设置为最大值");
+                    fctx.total_water_used = UINT32_MAX;
                 }
             } else {  // 后两级计入总制水量
                 if (UINT32_MAX - fctx.total_production_water >= liters) {
                     fctx.total_production_water += liters;
-                }
-                // 兼容字段（RO膜）
-                if (UINT32_MAX - fctx.filter_used_liters >= liters) {
-                    fctx.filter_used_liters += liters;
+                } else {
+                    ESP_LOGW(TAG, "总制水量溢出，设置为最大值");
+                    fctx.total_production_water = UINT32_MAX;
                 }
             }
         }
     }
 
     return did_commit;
+}
+
+/**
+ * @brief 强制提交指定滤芯的全部累加器水量（包括<1L余数）
+ * @note 用于重置滤芯前，确保不丢失水量。余数向上舍入到1L（只要有余数就进位）。
+ * @param filter_idx 滤芯索引
+ */
+static void force_commit_accumulator_locked(int filter_idx)
+{
+    uint32_t ml = fctx.filter_accumulator_ml[filter_idx];
+    if (ml == 0) return;
+
+    // 整升数
+    uint32_t liters = ml / 1000;
+
+    // 余数向上舍入到1L（只要有余数就进位，确保不丢失水量）
+    uint32_t remainder = ml % 1000;
+    uint32_t total_liters = liters + (remainder > 0 ? 1 : 0);
+
+    // 检查溢出并更新used_liters
+    if (UINT32_MAX - fctx.filters[filter_idx].used_liters >= total_liters) {
+        fctx.filters[filter_idx].used_liters += total_liters;
+    } else {
+        fctx.filters[filter_idx].used_liters = UINT32_MAX;
+        ESP_LOGW(TAG, "滤芯%d已用水量溢出，设置为最大值", filter_idx + 1);
+    }
+
+    // 更新剩余寿命百分比
+    if (fctx.filters[filter_idx].total_liters > 0) {
+        float remaining = 1.0f - (float)fctx.filters[filter_idx].used_liters / fctx.filters[filter_idx].total_liters;
+        if (remaining < 0) remaining = 0;
+        if (remaining > 1) remaining = 1;
+        fctx.filters[filter_idx].percentage = (uint8_t)(remaining * 100);
+    }
+
+    // 累加到总用水量/制水量（检查溢出）
+    if (filter_idx <= 2) {  // 前三级计入总用水量
+        if (UINT32_MAX - fctx.total_water_used >= total_liters) {
+            fctx.total_water_used += total_liters;
+        } else {
+            ESP_LOGW(TAG, "总用水量溢出，设置为最大值");
+            fctx.total_water_used = UINT32_MAX;
+        }
+    } else {  // 后两级计入总制水量
+        if (UINT32_MAX - fctx.total_production_water >= total_liters) {
+            fctx.total_production_water += total_liters;
+        } else {
+            ESP_LOGW(TAG, "总制水量溢出，设置为最大值");
+            fctx.total_production_water = UINT32_MAX;
+        }
+    }
+
+    // 清零累加器
+    fctx.filter_accumulator_ml[filter_idx] = 0;
+    fctx.save_needed = true;
+
+    ESP_LOGD(TAG, "滤芯%d强制提交 %luml → %luL（余数进位）",
+             filter_idx + 1, (unsigned long)ml, (unsigned long)total_liters);
 }
 
 // ==================== 初始化 ====================
@@ -484,8 +528,7 @@ esp_err_t filter_mgr_init(void)
         fctx.filters[i].used_liters = 0;
         fctx.filters[i].total_liters = filter_default_capacities[i];
         fctx.filters[i].time_limit_hours = filter_default_time_hours[i];
-        fctx.filters[i].install_time = init_time;  // 0表示未同步，等待fixup修正
-        fctx.filters[i].last_reset_time = init_time;
+        fctx.filters[i].last_reset_time = init_time;  // 0表示未同步，等待fixup修正
         fctx.filters[i].replacement_needed = false;
         strncpy(fctx.filters[i].name, filter_names[i], sizeof(fctx.filters[i].name) - 1);
     }
@@ -515,6 +558,13 @@ esp_err_t filter_mgr_deinit(void)
     if (!fctx.initialized) {
         return ESP_OK;
     }
+
+    // 强制提交所有滤芯的累加器余数（防止断电丢失）
+    LOCK_GET(100);
+    for (int i = 0; i < FILTER_COUNT; i++) {
+        force_commit_accumulator_locked(i);
+    }
+    LOCK_GIVE();
 
     // 保存未写入的数据
     if (fctx.save_needed) {
@@ -601,6 +651,7 @@ esp_err_t filter_mgr_set_waste_flow_lph(float lph)
     }
     LOCK_GET(50);
     fctx.waste_flow_lph = lph;
+    fctx.save_needed = true;  // 标记需要保存，避免配置丢失
     LOCK_GIVE();
     return ESP_OK;
 }
@@ -621,6 +672,7 @@ esp_err_t filter_mgr_set_pump_flow_lph(float lph)
     }
     LOCK_GET(50);
     fctx.pump_flow_lph = lph;
+    fctx.save_needed = true;  // 标记需要保存，避免配置丢失
     LOCK_GIVE();
     return ESP_OK;
 }
@@ -695,13 +747,12 @@ esp_err_t filter_mgr_reset_filter(filter_type_t filter_type)
 
     LOCK_GET(100);
 
-    // 先提交累加器水量到所有滤芯（包括即将重置的滤芯）
-    // 这样重置后，累加器归零，下次累积的水量只属于未重置的滤芯
-    (void)commit_accumulators_locked();  // 忽略返回值，重置操作本身会触发保存
+    // 强制提交该滤芯的全部累加器水量（包括<1L余数，向上舍入）
+    // 确保重置前不丢失水量
+    force_commit_accumulator_locked(filter_type);
 
-    // 只清除被重置滤芯的独立累加器（不影响其他滤芯）
-    fctx.filter_accumulator_ml[filter_type] = 0;
-    ESP_LOGD(TAG, "清除滤芯%d独立累加器", filter_type);
+    // 提交其他滤芯的正常水量（>=1L）
+    (void)commit_accumulators_locked();
 
     // 重置指定滤芯
     time_t now_sec = time(NULL);
@@ -711,15 +762,8 @@ esp_err_t filter_mgr_reset_filter(filter_type_t filter_type)
     fctx.filters[filter_type].time_percentage = 100;
     fctx.filters[filter_type].effective_percentage = 100;
     fctx.filters[filter_type].used_liters = 0;
-    fctx.filters[filter_type].install_time = reset_time;
-    fctx.filters[filter_type].last_reset_time = reset_time;
+    fctx.filters[filter_type].last_reset_time = reset_time;  // 更新为本次重置时间
     fctx.filters[filter_type].replacement_needed = false;
-
-    // 更新兼容字段
-    if (filter_type == FILTER_RO_MEMBRANE) {
-        fctx.filter_used_liters = 0;
-        fctx.filter_install_time = reset_time;
-    }
 
     fctx.save_needed = true;
 
@@ -749,15 +793,11 @@ esp_err_t filter_mgr_reset_all_filters(void)
         fctx.filters[i].time_percentage = 100;
         fctx.filters[i].effective_percentage = 100;
         fctx.filters[i].used_liters = 0;
-        fctx.filters[i].install_time = reset_time;
-        fctx.filters[i].last_reset_time = reset_time;
+        fctx.filters[i].last_reset_time = reset_time;  // 更新为本次重置时间
         fctx.filters[i].replacement_needed = false;
     }
     fctx.total_water_used = 0;
     fctx.total_production_water = 0;
-    fctx.filter_used_liters = 0;
-    fctx.filter_install_time = reset_time;
-    fctx.filter_total_liters = fctx.filters[FILTER_RO_MEMBRANE].total_liters;
 
     fctx.save_needed = true;
     esp_err_t ret = save_to_nvs_locked();
@@ -768,7 +808,9 @@ esp_err_t filter_mgr_reset_all_filters(void)
     return ret;
 }
 
-/**
+/**编译成功！烧录失败是因为COM3端口被占用。
+
+编译结果
  * @brief 批量设置所有滤芯容量（一次NVs写入）
  * @param capacities 容量数组，长度必须为FILTER_COUNT
  * @return ESP_OK 成功
@@ -795,7 +837,6 @@ esp_err_t filter_mgr_set_all_filter_capacity(const uint32_t capacities[FILTER_CO
         fctx.filters[i].replacement_needed = (fctx.filters[i].effective_percentage < 10);
     }
 
-    fctx.filter_total_liters = capacities[FILTER_RO_MEMBRANE];
     fctx.save_needed = true;
     esp_err_t ret = save_to_nvs_locked();
 

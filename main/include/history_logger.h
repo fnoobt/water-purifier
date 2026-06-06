@@ -1,7 +1,7 @@
 /**
  * @file history_logger.h
  * @brief 历史记录日志模块接口
- * @note 记录状态变化、停止、冲洗等事件，支持50条记录
+ * @note 记录状态变化、停止、冲洗等事件，支持15条记录
  */
 
 #ifndef HISTORY_LOGGER_H
@@ -17,7 +17,7 @@ extern "C" {
 
 // ==================== 配置参数 ====================
 
-#define HISTORY_MAX_RECORDS     20      // 最大历史记录数（优化NVS空间）
+#define HISTORY_MAX_RECORDS     15      // 最大历史记录数（优化NVS空间）
 
 // ==================== 事件类型枚举 ====================
 

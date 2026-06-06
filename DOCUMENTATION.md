@@ -154,11 +154,13 @@ WaterPurifier/
 esp_err_t gpio_driver_init_inputs(void);
 esp_err_t gpio_driver_init_outputs(void);
 esp_err_t gpio_driver_init_leds(void);
+esp_err_t gpio_driver_deinit(void);
 
 // 读取状态
 bool gpio_driver_read_low_pressure(void);
 bool gpio_driver_read_tank_pressure(void);
 bool gpio_driver_read_water_leak(void);
+esp_err_t gpio_driver_get_all_inputs(bool *low, bool *tank, bool *leak);
 
 // 控制输出
 esp_err_t gpio_driver_set_inlet_valve(bool state);
@@ -168,10 +170,10 @@ esp_err_t gpio_driver_set_boost_pump(bool state);
 esp_err_t gpio_driver_set_led1(bool state);
 esp_err_t gpio_driver_set_led2(bool state);
 esp_err_t gpio_driver_emergency_stop(void);
+esp_err_t gpio_driver_get_output_states(bool *inlet, bool *waste, bool *return, bool *pump);
 
 esp_err_t gpio_driver_set_relay_trigger_level(uint8_t level);
 uint8_t gpio_driver_get_relay_trigger_level(void);
-esp_err_t gpio_driver_get_output_states(bool *inlet, bool *waste, bool *return, bool *pump);
 ```
 
 ---
@@ -200,6 +202,7 @@ ADC原始值 → 电压转换(mV) → TDS计算 → 温度补偿 → 校准 → 
 esp_err_t tds_sensor_init(void);
 esp_err_t tds_sensor_start(void);
 esp_err_t tds_sensor_stop(void);
+esp_err_t tds_sensor_deinit(void);
 
 // 测量
 esp_err_t tds_sensor_measure(tds_sensor_id_t id, tds_measurement_t *result);
@@ -211,10 +214,13 @@ esp_err_t tds_sensor_get_latest_dual(tds_dual_measurement_t *dual);
 esp_err_t tds_sensor_calibrate(tds_sensor_id_t id, float standard_value);
 esp_err_t tds_sensor_set_calibration(tds_sensor_id_t id, const tds_calibration_t *cal);
 esp_err_t tds_sensor_reset_calibration(tds_sensor_id_t id);
+esp_err_t tds_sensor_get_calibration(tds_sensor_id_t id, tds_calibration_t *cal);
 
 // 报警
 esp_err_t tds_sensor_set_alarm_threshold(tds_sensor_id_t id, float threshold);
+esp_err_t tds_sensor_get_alarm_threshold(tds_sensor_id_t id, float *threshold);
 bool tds_sensor_is_alarm(tds_sensor_id_t id);
+esp_err_t tds_sensor_set_skip_alarm_detection(bool skip);  // 纯水冲洗期间跳过
 ```
 
 **数据结构**:
@@ -274,17 +280,28 @@ typedef struct {
 - `filter_mgr_set_all_filter_capacity()` — 批量设置5级滤芯，一次NVS写入
 - `filter_mgr_set_all_filter_times()` — 批量设置时间寿命，一次NVS写入
 
-**日历寿命**: `install_time` 和 `last_reset_time` 使用 `time(NULL)` Unix秒。NTP同步后自动回推安装时间，确保日历寿命准确。NTP未同步时使用启动时间估算。
+**日历寿命**: 使用 `last_reset_time` 记录上次重置时间戳（Unix秒）。NTP同步后自动修正时间，确保日历寿命准确。NTP未同步时使用启动时间估算。
 
 **时间计算修复**: NTP未同步时使用启动后经过的秒数（`esp_timer_get_time()/1e6`），而非错误地将微秒与秒级时间戳相减。
 
 **主要函数**:
 ```c
 esp_err_t filter_mgr_init(void);
-esp_err_t filter_mgr_update_water_usage(float liters);
+esp_err_t filter_mgr_deinit(void);
+
+// 水量更新（双路计量）
+esp_err_t filter_mgr_update_water_usage_dual(float pre_liters, float post_liters);
+
+// 水量统计
 uint32_t filter_mgr_get_total_water_usage(void);
+esp_err_t filter_mgr_set_total_water_usage(uint32_t liters);
+uint32_t filter_mgr_get_total_production_water(void);
+esp_err_t filter_mgr_set_total_production_water(uint32_t liters);
+
+// 定期保存
 bool filter_mgr_periodic_save(void);
 
+// 滤芯状态
 esp_err_t filter_mgr_get_filters_status(filters_status_t *status);
 esp_err_t filter_mgr_get_filter_info(filter_type_t type, filter_info_t *info);
 esp_err_t filter_mgr_reset_filter(filter_type_t type);
@@ -294,8 +311,15 @@ esp_err_t filter_mgr_set_all_filter_capacity(const uint32_t capacities[FILTER_CO
 esp_err_t filter_mgr_set_all_filter_times(const uint32_t time_hours[FILTER_COUNT]);
 bool filter_mgr_any_filter_needs_replacement(void);
 
+// 制水速率
 esp_err_t filter_mgr_set_production_rate(float lph);
 float filter_mgr_get_production_rate(void);
+
+// 泵/废水流量
+esp_err_t filter_mgr_set_pump_flow_lph(float lph);
+float filter_mgr_get_pump_flow_lph(void);
+esp_err_t filter_mgr_set_waste_flow_lph(float lph);
+float filter_mgr_get_waste_flow_lph(void);
 ```
 
 ---
@@ -383,18 +407,19 @@ float filter_mgr_get_production_rate(void);
 | LEAK_ALARM | 全部关闭 | 手动复位→STANDBY |
 | STOP | 全部关闭 | 手动复位→STANDBY |
 
-**水锤控制**:
-- **制水**: 开进水阀 → 延时 → 开增压泵（废水阀关闭）
-- **常规冲洗**: 检测进水阀是否已打开，未打开则先开阀延时再启泵
-- **常规冲洗→纯水洗膜**: 停泵 → 延时 → 关进水阀 → 延时 → 开回水阀+废水阀
+**水锤控制** (8阶段 `flush_phase_t`):
+- **制水启动**: 开进水阀 → 延时1000ms → 开增压泵（废水阀关闭）
+- **常规冲洗**: 检测进水阀是否已打开，未打开则先开阀延时再启泵，已打开则直接启泵
+- **常规冲洗→纯水洗膜**: 停泵 → 延时1000ms → 关进水阀 → 延时500ms → 开回水阀+废水阀
+- **阶段追踪**: 防止状态转换期间的水锤延时竞态
 
-**短制水处理**: 制水<3分钟时，冲洗自动缩短（10s常规+5s纯水）。
+**短制水处理**: 制水<180秒时，冲洗自动缩短（10s常规+5s纯水）。
 
 **纯水中断**: 纯水冲洗期间若用户用水（压力开关闭合），且处于FLUSH_PHASE_RUNNING阶段，立即转入待机。
 
 **待机行为**: 冲洗完成后设 `standby_manual=true`，压力桶缺水时清除标志自动恢复制水。
 
-**换芯冲洗**: 网页"换芯冲洗"触发仅普通冲洗持续20分钟（不切纯水，不计统计），可提前通过"待机"中断。
+**换芯冲洗**: 网页"换芯冲洗"触发1小时连续冲洗（不切纯水，不计统计），可提前通过"待机"中断。
 
 **停止历史**: 循环缓冲区16条记录，索引自动防止溢出（>256时回绕）。
 
@@ -424,6 +449,34 @@ typedef struct {
 ```
 
 **周期保存**: FSM任务循环中按配置的保存间隔（默认120分钟，可选10/60/120/240/360/720/1440分钟）统一调用 `config_manager_periodic_save_all()`，协调所有模块脏数据保存。
+
+**主要函数**:
+```c
+esp_err_t fsm_init(void);
+esp_err_t fsm_start(void);
+esp_err_t fsm_deinit(void);
+
+// 状态控制
+fsm_state_t fsm_get_state(void);
+const char *fsm_get_state_name(fsm_state_t state);
+esp_err_t fsm_send_event(fsm_event_t event);
+void fsm_register_state_callback(void (*callback)(fsm_state_t, fsm_state_t));
+
+// 手动控制
+esp_err_t fsm_manual_start_production(void);
+esp_err_t fsm_manual_start_normal_flush(void);
+esp_err_t fsm_manual_start_pure_flush(void);
+esp_err_t fsm_manual_start_filter_flush(void);
+esp_err_t fsm_force_standby(void);
+esp_err_t fsm_reset(void);
+
+// 制水速率
+esp_err_t fsm_set_production_rate_by_membrane(uint8_t membrane_type);
+float fsm_get_production_rate_lph(void);
+
+// 状态字符串
+esp_err_t fsm_get_status_string(char *buf, size_t buf_size);
+```
 
 ---
 
@@ -466,6 +519,17 @@ esp_err_t wifi_manager_save_config(void);
 - AP SSID: `WaterPurifier-XXXX`（基于MAC后4位）
 - AP密码: `12345678`
 - 配置URL: `http://192.168.4.1`
+
+**SNTP时间同步**:
+- 连接成功后自动同步Alibaba NTP服务器 `ntp.aliyun.com`
+- 用于滤芯日历寿命计算和日志时间戳转换
+- `wifi_manager_get_boot_wall_clock_time()` 获取启动时的墙钟时间
+- 未同步时使用启动后经过秒数估算
+
+**mDNS服务注册**:
+- Hostname: `waterpurifier.local`
+- 实例名: "ESP32净水器"
+- 服务类型: `_http._tcp`, 端口80
 
 ---
 
@@ -532,6 +596,8 @@ water-purifier/set/flush           # 冲洗控制
 - **Basic Auth**: 浏览器弹出认证框，输入用户名/密码
 - **Session Cookie**: 认证成功后生成32字节随机token，24小时有效
 - **滑动过期**: 每次请求自动刷新session时间，活跃用户不会过期
+- **HTTP超时**: 接收/发送超时10秒（默认5秒）
+- **max_open_sockets**: 3（ESP-IDF v6.0 LWIP限制）
 - **保护范围**: `/admin`, `/ota`, `/logs`, `/api/config`, `/api/control`, `/api/filter/*`, `/api/tds/*`, `/api/mqtt/*`, `/api/ota/*`, `/api/logs`
 - **公开范围**: `/`, `/api/status`, `/api/wifi`, `/api/wifi/scan`, `/favicon.ico`
 
@@ -545,7 +611,7 @@ water-purifier/set/flush           # 冲洗控制
 - `log_vprintf_hook()` 通过 `esp_log_set_vprintf()` 拦截所有 `ESP_LOG*` 输出
 - 日志拦截器在初始化最开始启动，捕获全部初始化日志
 - `handle_log_debug()` 简单正向读取（旧→新），最新日志显示在底部
-- 输出缓冲区16KB（`LOG_BUF_SIZE * 2`），容纳HTML格式化后的日志（约2-3倍膨胀）
+- 输出缓冲区18KB（`LOG_BUF_SIZE * 2 + 2048`），容纳HTML格式化后的日志（约2.2倍膨胀）
 - 内存检查：可用堆 < 20KB时返回简单错误消息
 
 **HTTP服务器配置**:
@@ -694,6 +760,34 @@ typedef struct {
 | `history` | 事件日志（20条循环） |
 | `daily_stats` | 每日统计（制水时间、TDS均值） |
 
+**主要函数**:
+```c
+esp_err_t config_manager_init(void);
+esp_err_t config_manager_deinit(void);
+
+// 配置读写
+esp_err_t config_manager_get_config(system_config_t *config);
+esp_err_t config_manager_set_config(const system_config_t *config);
+esp_err_t config_manager_validate(const system_config_t *config);
+
+// 单项读写
+esp_err_t config_manager_get_string(const char *key, char *value, size_t max_len);
+esp_err_t config_manager_set_string(const char *key, const char *value);
+esp_err_t config_manager_get_int(const char *key, int32_t *value);
+esp_err_t config_manager_set_int(const char *key, int32_t value);
+esp_err_t config_manager_get_bool(const char *key, bool *value);
+esp_err_t config_manager_set_bool(const char *key, bool value);
+
+// WiFi/MQTT配置检查
+bool config_manager_has_wifi_config(void);
+bool config_manager_has_mqtt_config(void);
+
+// 周期保存
+esp_err_t config_manager_periodic_save_all(void);
+esp_err_t config_manager_sync_fsm_stats(const fsm_runtime_data_t *data);
+esp_err_t config_manager_get_fsm_stats(fsm_runtime_data_t *data);
+```
+
 ---
 
 ### 10. OTA升级 (ota_update.c/h)
@@ -702,7 +796,7 @@ typedef struct {
 
 **工作流程**:
 1. `ota_update_begin()`: 获取OTA分区，初始化写入句柄
-2. `ota_update_write()`: 流式写入固件（4KB缓冲区），首次接收时解析镜像头做版本检测
+2. `ota_update_write()`: 流式写入固件（直接调用esp_ota_write，无固定缓冲区），首次接收时用512字节init_buf解析镜像头
 3. `ota_update_end()`: 验证镜像，设置启动分区，取消回滚倒计时
 4. Reboot: `esp_restart()` 重启进入新固件
 
@@ -745,14 +839,14 @@ esp_err_t ota_update_rollback(void);
 | 功率档位 | 升功率阈值(RSSI<) | 降功率阈值(RSSI>=) | 目标功率 |
 |---------|------------------|-------------------|---------|
 | 8 dBm | -55 dBm | -48 dBm | 8 dBm |
-| 12 dBm | -60 dBm | -50 dBm | 12 dBm |
+| 11 dBm | -60 dBm | -50 dBm | 11 dBm |
 | 15 dBm | -65 dBm | -53 dBm | 15 dBm |
-| 19 dBm | -75 dBm | -58 dBm | 19 dBm |
+| 18 dBm | -75 dBm | -58 dBm | 18 dBm |
 | 20 dBm | -99 dBm | -68 dBm | 20 dBm |
 
 - **滞回效果**: RSSI在边界附近波动时保持当前功率，只有信号明显变化（跨越滞回窗口）才切换功率
 - **调用时机**: WiFi连接后定期调用 `pm_manager_adjust_wifi_tx_power(rssi)`
-- **示例**: 当前12dBm时，RSSI<-60升至15dBm，RSSI>=-50降至8dBm
+- **示例**: 当前11dBm时，RSSI<-60升至15dBm，RSSI>=-50降至8dBm
 
 **堆内存监控**:
 - 可用堆 < 30KB → 输出警告日志
@@ -763,6 +857,7 @@ esp_err_t ota_update_rollback(void);
 esp_err_t pm_manager_init(void);
 esp_err_t pm_manager_set_cpu_mode(bool low_power);  // ESP32-C3无效果
 esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi);
+int8_t pm_manager_get_wifi_tx_power(void);
 esp_err_t pm_manager_check_heap(void);
 ```
 
@@ -774,7 +869,7 @@ esp_err_t pm_manager_check_heap(void);
 
 **事件类型**: 状态变化、开始/结束制水、开始/结束冲洗、缺水/恢复、水满、漏水报警、停止/清除、维护提醒、手动控制、系统启动，共14种。
 
-**最大记录数**: 20条（循环覆盖）。
+**最大记录数**: 15条（循环覆盖）。
 
 **每日统计**: 制水时间、冲洗次数、进/出水TDS平均值。
 
@@ -967,7 +1062,7 @@ POST /api/ota/rollback
 |------|------|------|
 | `count` | u32 | 日志总记录数 |
 | `index` | u32 | 环形缓冲区写入位置 |
-| `records` | blob | 20条事件记录数组 |
+| `records` | blob | 15条事件记录数组 |
 
 #### daily_stats（每日统计）
 
@@ -1066,6 +1161,7 @@ POST /api/ota/rollback
 | 2.3.0 | 2026-05-24 | **NVS架构统一**：废弃独立命名空间（wifi/mqtt_config/wp_rt），统一到water_purifier/wp_filters/history/daily_stats四命名空间；**迁移机制**：首次启动自动迁移旧数据并清理废弃命名空间；**数据一致性**：消除总用水量761L vs 218L等重复存储问题；**代码简化**：WiFi/MQTT模块改用config_manager接口，移除wp_rt运行数据持久化（改为临时状态）；**Web Basic Auth**：管理页面/OTA/日志需认证，首页/WiFi配网公开；Session Cookie 24小时滑动过期；管理页面新增认证配置开关；**日志优化**：10KB HTML缓冲区、正向读取（新日志在底部）、智能跳过旧日志、内存检查保护；**HTTP稳定性**：接收/发送超时10秒；**Web日志显示优化**：两阶段扫描（逆向计算+正向输出），确保新日志完整显示，跳过提示"... (跳过X条旧日志，显示最新Y条)"；**OTA回滚配置**：启用CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE，bootloader自动转换NEW→PENDING_VERIFY状态；**OTA状态处理**：NEW状态显式处理，改进错误日志提示 |
 | 2.3.1 | 2026-05-25 | **电源管理模块完善**：pm_manager WiFi TX功率滞回算法文档完善（5档功率表+滞回阈值说明）、初始化流程添加步骤6 pm_manager_init() |
 | 2.3.4 | 2026-05-26 | **日志显示修复**：简化读取逻辑（移除复杂两阶段扫描+重试），输出缓冲区扩大至16KB（容纳HTML格式化后的日志）。原generation计数器验证不完整（仅检测缓冲区溢出，不检测绕回写入导致的数据损坏） |
+| 2.3.5 | 2026-06-07 | **存储优化**：CSS样式合并优化（4个HTML页面统一使用SHARED_CSS/LOG_CSS宏，消除重复约5KB），历史记录数量优化（HISTORY_MAX_RECORDS从20改为15，节省约500字节RAM+NVS） |
 
 ---
 
@@ -1087,12 +1183,12 @@ POST /api/ota/rollback
 
 | 类别 | 大小 | 说明 |
 |------|------|------|
-| 静态缓冲区(BSS) | ~13.5 KB | 全局结构体、日志环形缓冲区 |
-| 任务栈 | ~34.5 KB | fsm(3KB), httpd(12KB), wifi_reconnect(4KB), mqtt_reconnect(4KB), 其他(11.5KB) |
+| 静态缓冲区(BSS) | ~30 KB | 日志环形缓冲区(8KB) + HTML输出缓冲区(18KB) + 日志页缓冲区(4KB) + 全局结构体 |
+| 任务栈 | ~42 KB | fsm(3KB), httpd(20KB), wifi_reconnect(4KB), mqtt_reconnect(4KB), 其他(11KB) |
 | WiFi/LWIP | ~25-30 KB | 协议栈缓冲区（动态分配） |
 | IDF系统开销 | ~20 KB | Heap管理器、定时器、系统任务 |
-| **已用总计** | ~93-98 KB | |
-| **可用堆内存** | ~300 KB | cJSON、临时缓冲区、动态分配 |
+| **已用总计** | ~117-122 KB | |
+| **可用堆内存** | ~280 KB | cJSON、临时缓冲区、动态分配 |
 
 ### 任务栈配置
 
@@ -1101,7 +1197,7 @@ POST /api/ota/rollback
 | main_task | 3.5 KB | 1 | ESP-IDF默认 |
 | event_task | 4 KB | 1 | WiFi/系统事件处理 |
 | fsm_task | 3 KB | 5 | 状态机主循环 |
-| httpd | 12 KB | 5 | Web服务器（静态buf不占用栈） |
+| httpd | 20 KB | 5 | Web服务器（静态buf不占用栈，但handle_log_debug需要较大栈空间） |
 | wifi_reconnect | 4 KB | 5 | WiFi指数退避重连 |
 | mqtt_reconnect | 4 KB | 4 | MQTT指数退避重连 |
 | tds_task | 2 KB | 4 | TDS传感器测量 |

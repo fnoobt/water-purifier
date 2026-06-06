@@ -128,34 +128,72 @@ esp_err_t web_server_init_log_interceptor(void)
 
 // ==================== HTML页面 ====================
 
+// ==================== 统一CSS样式（使用宏定义支持字符串拼接）====================
+
+#define SHARED_CSS \
+"*{box-sizing:border-box}" \
+"body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh}" \
+".container{max-width:600px;margin:0 auto}" \
+".card{background:rgba(255,255,255,0.95);padding:20px;margin:15px 0;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}" \
+"h1{color:#fff;text-align:center;margin-bottom:20px;text-shadow:0 2px 4px rgba(0,0,0,0.2)}" \
+"h3{color:#333;margin:0 0 15px 0;padding-bottom:10px;border-bottom:2px solid #eee}" \
+".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}" \
+".stat{background:#f8f9fa;padding:12px;border-radius:12px;text-align:center}" \
+".stat-label{color:#666;font-size:11px;margin-bottom:4px}" \
+".stat-value{color:#333;font-size:20px;font-weight:600}" \
+".stat-value.good{color:#28a745}.stat-value.warn{color:#ffc107}.stat-value.error{color:#dc3545}" \
+".btn{padding:12px 20px;margin:5px;border:none;border-radius:12px;cursor:pointer;color:#fff;font-size:14px;font-weight:500;transition:all .2s}" \
+".btn:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.2)}" \
+".btn-group{display:flex;flex-wrap:wrap;gap:8px}" \
+".btn-primary{background:linear-gradient(135deg,#667eea,#764ba2)}" \
+".btn-success{background:linear-gradient(135deg,#28a745,#20c997)}" \
+".btn-danger{background:linear-gradient(135deg,#dc3545,#c82333)}" \
+".btn-warning{background:linear-gradient(135deg,#ffc107,#fd7e14)}" \
+".btn-info{background:linear-gradient(135deg,#17a2b8,#20c997)}" \
+".btn-dark{background:linear-gradient(135deg,#343a40,#495057)}" \
+"input,select{padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:14px;transition:border-color .2s;width:100%}" \
+"input:focus,select:focus{outline:none;border-color:#667eea}" \
+".form-row{margin:10px 0}" \
+".form-row label{display:block;color:#555;margin-bottom:5px;font-size:13px}" \
+".form-row small{color:#999;font-size:11px}" \
+".back-btn{background:rgba(255,255,255,0.2);color:#fff;padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:10px}" \
+".back-btn:hover{background:rgba(255,255,255,0.3)}" \
+".filter-bar{height:8px;background:#e0e0e0;border-radius:4px;margin:4px 0;overflow:hidden}" \
+".filter-bar-fill{height:100%;border-radius:4px;transition:width .3s}" \
+".filter-bar-fill.good{background:linear-gradient(90deg,#28a745,#20c997)}" \
+".filter-bar-fill.warn{background:linear-gradient(90deg,#ffc107,#fd7e14)}" \
+".filter-bar-fill.error{background:linear-gradient(90deg,#dc3545,#c82333)}" \
+".filter-stat{text-align:center;padding:10px 5px}" \
+".filter-name{font-size:12px;color:#666;margin-bottom:4px}" \
+".filter-pct{font-size:18px;font-weight:600;margin-bottom:2px}" \
+".filter-sub{font-size:10px;color:#999}" \
+".dim-label{font-size:10px;color:#999}" \
+".wifi-item{background:#f0f0f0;padding:10px;margin:5px 0;border-radius:8px;cursor:pointer;transition:background .2s}" \
+".wifi-item:hover{background:#e0e0e0}" \
+".m0{margin:0}" \
+".fs14{font-size:14px}" \
+".btn-center{display:block;margin:20px auto;width:80%}" \
+".sel-auto{width:auto}"
+
+// 日志页特有样式
+#define LOG_CSS \
+".control-panel{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:10px;background:#f8f9fa;border-radius:12px;margin-bottom:10px}" \
+".control-panel>*{flex-shrink:0}" \
+".toggle-label{display:flex;align-items:center;gap:8px;font-size:14px;color:#333;cursor:pointer}" \
+".toggle-label input[type='checkbox']{width:18px;height:18px;cursor:pointer}" \
+"#logContent{background:#f8f9fa;color:#333;font-family:'Cascadia Code','Fira Code',monospace;font-size:12px;padding:12px;border-radius:8px;white-space:pre-wrap;word-break:break-all;line-height:1.6;overflow-y:auto;max-height:65vh;border:1px solid #e0e0e0}" \
+".E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}"
+
+// ==================== HTML页面定义 ====================
+
 // 首页 - 只读显示
 static const char html_page[] =
 "<!DOCTYPE html><html><head>"
 "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
 "<title>净水器状态</title>"
-"<style>"
-"*{box-sizing:border-box}"
-"body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh}"
-".container{max-width:600px;margin:0 auto}"
-".card{background:rgba(255,255,255,0.95);padding:20px;margin:15px 0;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}"
-"h1{color:#fff;text-align:center;margin-bottom:20px;text-shadow:0 2px 4px rgba(0,0,0,0.2)}"
-"h3{color:#333;margin:0 0 15px 0;padding-bottom:10px;border-bottom:2px solid #eee}"
-".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:10px}"
-".stat{background:#f8f9fa;padding:12px;border-radius:12px;text-align:center}"
-".stat-label{color:#666;font-size:11px;margin-bottom:4px}"
-".stat-value{color:#333;font-size:20px;font-weight:600}"
-".stat-value.good{color:#28a745}.stat-value.warn{color:#ffc107}.stat-value.error{color:#dc3545}"
-".btn{padding:14px 24px;margin:10px;border:none;border-radius:12px;cursor:pointer;color:#fff;font-size:16px;font-weight:500;transition:all .2s;width:100%}"
-".btn:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.2)}"
-".btn-primary{background:linear-gradient(135deg,#667eea,#764ba2)}"
-".filter-bar{height:8px;background:#e0e0e0;border-radius:4px;margin:8px 0;overflow:hidden}"
-".filter-bar-fill{height:100%;border-radius:4px;transition:width .3s}"
-".filter-bar-fill.good{background:linear-gradient(90deg,#28a745,#20c997)}"
-".filter-bar-fill.warn{background:linear-gradient(90deg,#ffc107,#fd7e14)}"
-".filter-bar-fill.error{background:linear-gradient(90deg,#dc3545,#c82333)}"
-"</style></head><body>"
+"<style>" SHARED_CSS "</style></head><body>"
 "<div class='container'>"
-"<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>净水器</h1>"
+"<h1>净水器</h1>"
 
 "<div class='card'><h3>系统状态</h3>"
 "<div class='grid'>"
@@ -210,7 +248,7 @@ static const char html_page[] =
 "<div class='stat'><div class='stat-label'>HTTP栈</div><div id='stackHTTP' class='stat-value'>-</div></div>"
 "</div></div>"
 
-"<button class='btn btn-primary' onclick=\"location.href='/admin'\">管理设置</button>"
+"<button class='btn btn-primary btn-center' onclick=\"location.href='/admin'\">管理设置</button>"
 
 "</div>"
 "<script>"
@@ -256,53 +294,14 @@ static const char html_admin_page[] =
 "<!DOCTYPE html><html><head>"
 "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
 "<title>净水器管理</title>"
-"<style>"
-"*{box-sizing:border-box}"
-"body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh}"
-".container{max-width:600px;margin:0 auto}"
-".card{background:rgba(255,255,255,0.95);padding:20px;margin:15px 0;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}"
-"h1{color:#fff;text-align:center;margin-bottom:20px;text-shadow:0 2px 4px rgba(0,0,0,0.2)}"
-"h3{color:#333;margin:0 0 15px 0;padding-bottom:10px;border-bottom:2px solid #eee}"
-".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}"
-".stat{background:#f8f9fa;padding:15px;border-radius:12px;text-align:center}"
-".stat-label{color:#666;font-size:12px;margin-bottom:5px}"
-".stat-value{color:#333;font-size:20px;font-weight:600}"
-".btn{padding:12px 20px;margin:5px;border:none;border-radius:10px;cursor:pointer;color:#fff;font-size:14px;font-weight:500;transition:all .2s}"
-".btn:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.2)}"
-".btn-primary{background:linear-gradient(135deg,#667eea,#764ba2)}"
-".btn-success{background:linear-gradient(135deg,#28a745,#20c997)}"
-".btn-danger{background:linear-gradient(135deg,#dc3545,#c82333)}"
-".btn-warning{background:linear-gradient(135deg,#ffc107,#fd7e14)}"
-".btn-info{background:linear-gradient(135deg,#17a2b8,#20c997)}"
-".btn-dark{background:linear-gradient(135deg,#343a40,#495057)}"
-".btn-group{display:flex;flex-wrap:wrap;gap:8px}"
-"input,select{padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:14px;transition:border-color .2s;width:100%}"
-"input:focus,select:focus{outline:none;border-color:#667eea}"
-".form-row{margin:10px 0}"
-".form-row label{display:block;color:#555;margin-bottom:5px;font-size:13px}"
-".form-row small{color:#999;font-size:11px}"
-".wifi-item{background:#f0f0f0;padding:10px;margin:5px 0;border-radius:8px;cursor:pointer;transition:background .2s}"
-".wifi-item:hover{background:#e0e0e0}"
-".back-btn{background:rgba(255,255,255,0.2);color:#fff;padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:10px}"
-".back-btn:hover{background:rgba(255,255,255,0.3)}"
-".filter-stat{text-align:center;padding:10px 5px}"
-".filter-name{font-size:12px;color:#666;margin-bottom:4px}"
-".filter-pct{font-size:18px;font-weight:600;margin-bottom:2px}"
-".filter-sub{font-size:10px;color:#999}"
-".filter-bar{height:8px;background:#e0e0e0;border-radius:4px;margin:4px 0;overflow:hidden}"
-".filter-bar-fill{height:100%;border-radius:4px;transition:width .3s}"
-".filter-bar-fill.good{background:linear-gradient(90deg,#28a745,#20c997)}"
-".filter-bar-fill.warn{background:linear-gradient(90deg,#ffc107,#fd7e14)}"
-".filter-bar-fill.error{background:linear-gradient(90deg,#dc3545,#c82333)}"
-".dim-label{font-size:10px;color:#999}"
-"</style></head><body>"
+"<style>" SHARED_CSS "</style></head><body>"
 "<div class='container'>"
 "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>"
-"<button class='back-btn' onclick=\"location.href='/'\" style='margin:0'>← 返回首页</button>"
-"<button class='back-btn' onclick=\"location.href='/logs'\" style='margin:0'>日志 →</button>"
-"<button class='back-btn' onclick=\"location.href='/ota'\" style='margin:0'>固件升级 →</button>"
+"<button class='back-btn m0' onclick=\"location.href='/'\">← 返回首页</button>"
+"<button class='back-btn m0' onclick=\"location.href='/logs'\">日志 →</button>"
+"<button class='back-btn m0' onclick=\"location.href='/ota'\">固件升级 →</button>"
 "</div>"
-"<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>管理页面</h1>"
+"<h1>管理页面</h1>"
 
 "<div class='card'><h3>控制面板</h3>"
 "<div class='btn-group'>"
@@ -474,46 +473,19 @@ static const char html_ota_page[] =
 "<!DOCTYPE html><html><head>"
 "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
 "<title>固件升级</title>"
-"<style>"
-"*{box-sizing:border-box}"
-"body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh}"
-".container{max-width:600px;margin:0 auto}"
-".card{background:rgba(255,255,255,0.95);padding:20px;margin:15px 0;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.1)}"
-"h1{color:#fff;text-align:center;margin-bottom:20px;text-shadow:0 2px 4px rgba(0,0,0,0.2)}"
-"h3{color:#333;margin:0 0 15px 0;padding-bottom:10px;border-bottom:2px solid #eee}"
-".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}"
-".stat{background:#f8f9fa;padding:15px;border-radius:12px;text-align:center}"
-".stat-label{color:#666;font-size:12px;margin-bottom:5px}"
-".stat-value{color:#333;font-size:20px;font-weight:600}"
-".stat-value.good{color:#28a745}"
-".stat-value.warn{color:#ffc107}"
-".stat-value.error{color:#dc3545}"
-".btn{padding:12px 20px;margin:5px;border:none;border-radius:10px;cursor:pointer;color:#fff;font-size:14px;font-weight:500;transition:all .2s}"
-".btn:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.2)}"
-".btn-success{background:linear-gradient(135deg,#28a745,#20c997)}"
-".btn-primary{background:linear-gradient(135deg,#667eea,#764ba2)}"
-".btn-danger{background:linear-gradient(135deg,#dc3545,#c82333)}"
-".btn-group{display:flex;flex-wrap:wrap;gap:8px}"
-"input,select{padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:14px;transition:border-color .2s;width:100%}"
-"input:focus,select:focus{outline:none;border-color:#667eea}"
-".form-row{margin:10px 0}"
-".form-row label{display:block;color:#555;margin-bottom:5px;font-size:13px}"
-".form-row small{color:#999;font-size:11px}"
-".back-btn{background:rgba(255,255,255,0.2);color:#fff;padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:10px}"
-".back-btn:hover{background:rgba(255,255,255,0.3)}"
-"</style></head><body>"
+"<style>" SHARED_CSS "</style></head><body>"
 "<div class='container'>"
 "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>"
-"<button class='back-btn' onclick=\"location.href='/admin'\" style='margin:0'>← 返回管理</button>"
-"<button class='back-btn' onclick=\"location.href='/'\" style='margin:0'>首页 →</button>"
+"<button class='back-btn m0' onclick=\"location.href='/admin'\">← 返回管理</button>"
+"<button class='back-btn m0' onclick=\"location.href='/'\">首页 →</button>"
 "</div>"
-"<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>固件升级 (OTA)</h1>"
+"<h1>固件升级 (OTA)</h1>"
 
 "<div class='card'><h3>版本信息</h3>"
 "<div class='grid'>"
 "<div class='stat'><div class='stat-label'>当前版本</div><div id='fwVer' class='stat-value'>-</div></div>"
-"<div class='stat'><div class='stat-label'>编译时间</div><div id='compileTime' class='stat-value' style='font-size:14px'>-</div></div>"
-"<div class='stat'><div class='stat-label'>运行分区</div><div id='partition' class='stat-value' style='font-size:14px'>-</div></div>"
+"<div class='stat'><div class='stat-label'>编译时间</div><div id='compileTime' class='stat-value fs14'>-</div></div>"
+"<div class='stat'><div class='stat-label'>运行分区</div><div id='partition' class='stat-value fs14'>-</div></div>"
 "</div>"
 "</div>"
 
@@ -528,7 +500,15 @@ static const char html_ota_page[] =
 "<div class='card'><h3>上传固件</h3>"
 "<div class='form-row'>"
 "<label>选择固件文件 (.bin)</label>"
-"<input type='file' id='fwFile' accept='.bin' style='padding:8px'>"
+"<input type='file' id='fwFile' accept='.bin' style='padding:8px' onchange='previewFirmware()'>"
+"</div>"
+"<div id='fwPreview' style='display:none;margin:10px 0;padding:10px;background:#f0f7ff;border-radius:8px;border:1px solid #667eea'>"
+"<div style='font-size:13px;color:#555;margin-bottom:5px'>固件信息:</div>"
+"<div class='grid' style='grid-template-columns:repeat(3,1fr)'>"
+"<div><span style='color:#888'>版本:</span> <strong id='fwPreviewVer' style='color:#333'>-</strong></div>"
+"<div><span style='color:#888'>日期:</span> <strong id='fwPreviewDate' style='color:#333'>-</strong></div>"
+"<div><span style='color:#888'>时间:</span> <strong id='fwPreviewTime' style='color:#333'>-</strong></div>"
+"</div>"
 "</div>"
 "<div id='otaProgress' style='display:none;margin:10px 0'>"
 "<div style='display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px'>"
@@ -557,6 +537,7 @@ static const char html_ota_page[] =
 "<script>"
 "function $(id){return document.getElementById(id)}"
 "function formatSize(b){if(!b||b<=0)return'-';return b<1024?b+'B':b<1048576?(b/1024).toFixed(1)+'KB':(b/1048576).toFixed(2)+'MB';}"
+"function previewFirmware(){var f=$('fwFile').files[0];if(!f||!f.name.endsWith('.bin')){$('fwPreview').style.display='none';return}var r=new FileReader();r.onload=function(e){var d=new Uint8Array(e.target.result);fetch('/api/ota/preview',{method:'POST',body:d}).then(r=>r.json()).then(j=>{if(j.version){$('fwPreview').style.display='block';$('fwPreviewVer').textContent=j.version;$('fwPreviewDate').textContent=j.date;$('fwPreviewTime').textContent=j.time}else{$('fwPreview').style.display='none';alert(j.message||'固件解析失败')}}).catch(e=>{ $('fwPreview').style.display='none';alert('预览失败')})};r.readAsArrayBuffer(f.slice(0,512))}"
 "function loadOTA(){fetch('/api/ota/status').then(r=>r.json()).then(d=>{$('fwVer').textContent=d.running_version||'-';$('compileTime').textContent=(d.compile_time||'')+' '+d.compile_date||'-';$('partition').textContent=d.partition||'-';$('rollbackStatus').textContent=d.rollback_status||'-';$('rollbackStatus').className=d.rollback_status=='出厂固件'||d.rollback_status=='有效'?'stat-value good':'stat-value';$('otaState').textContent=d.state==='idle'?'就绪':d.state;$('otaState').className=d.state==='idle'?'stat-value good':'stat-value';$('canOta').textContent=d.can_ota?'是':'否';$('canOta').className=d.can_ota?'stat-value good':'stat-value error'})}"
 "function uploadFirmware(){var f=$('fwFile').files[0];if(!f)return alert('请选择固件文件');if(!f.name.endsWith('.bin'))return alert('只支持 .bin 文件');if(!confirm('确认升级固件？设备将自动重启。'))return;var fd=new FormData();fd.append('firmware',f);$('otaProgress').style.display='block';$('otaState').textContent='上传中...';$('otaState').className='stat-value warn';var xhr=new XMLHttpRequest();xhr.open('POST','/api/ota/update');xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('otaProgressText').textContent='上传中 '+formatSize(e.loaded)+'/'+formatSize(e.total);$('otaProgressPct').textContent=p+'%';$('otaProgressBar').style.width=p+'%';}};xhr.onload=function(){if(xhr.status===200){$('otaState').textContent='升级成功，重启中...';$('otaState').className='stat-value good';$('otaProgressText').textContent='升级完成，设备正在重启';$('otaProgressBar').style.width='100%';}else{try{var e=JSON.parse(xhr.responseText);alert(e.message||'升级失败');}catch(e){alert('升级失败: '+xhr.responseText);}$('otaState').textContent='升级失败';$('otaState').className='stat-value error';}};xhr.onerror=function(){$('otaState').textContent='网络错误';$('otaState').className='stat-value error';};xhr.send(fd);}"
 "function revertFactory(){if(!confirm('确认恢复出厂固件？设备将自动重启。'))return;fetch('/api/ota/factory',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.status==='success'){alert('恢复成功，设备将重启');}else{alert(d.message||'恢复失败')}}).catch(e=>alert('请求失败'))}"
@@ -571,33 +552,18 @@ static const char html_log_page[] =
 "<!DOCTYPE html><html><head>"
 "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
 "<title>系统日志</title>"
-"<style>"
-"*{box-sizing:border-box}"
-"body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh}"
-".container{max-width:900px;margin:0 auto}"
-"h1{color:#fff;text-align:center;margin-bottom:20px;text-shadow:0 2px 4px rgba(0,0,0,0.2)}"
-".back-btn{background:rgba(255,255,255,0.2);color:#fff;padding:10px 20px;border:none;border-radius:10px;cursor:pointer;font-size:14px;margin-bottom:10px}"
-".back-btn:hover{background:rgba(255,255,255,0.3)}"
-".card{background:rgba(255,255,255,0.95);padding:15px;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.1);margin-bottom:15px}"
-".control-panel{display:flex;flex-wrap:wrap;gap:15px;align-items:center;padding:10px;background:#f8f9fa;border-radius:12px;margin-bottom:10px}"
-"select{padding:8px 12px;border:2px solid #e0e0e0;border-radius:8px;font-size:14px;background:#fff;min-width:120px}"
-"select:focus{outline:none;border-color:#667eea}"
-".toggle-label{display:flex;align-items:center;gap:8px;font-size:14px;color:#333;cursor:pointer}"
-".toggle-label input[type='checkbox']{width:18px;height:18px;cursor:pointer}"
-"#logContent{background:#f8f9fa;color:#333;font-family:'Cascadia Code','Fira Code',monospace;font-size:12px;padding:12px;border-radius:8px;white-space:pre-wrap;word-break:break-all;line-height:1.6;overflow-y:auto;max-height:65vh;border:1px solid #e0e0e0}"
-".E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}"
-"</style></head><body>"
-"<div class='container'>"
+"<style>" SHARED_CSS LOG_CSS "</style></head><body>"
+"<div class='container' style='max-width:900px'>"
 "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:15px'>"
-"<button class='back-btn' onclick=\"location.href='/admin'\" style='margin:0'>← 返回管理</button>"
-"<button class='back-btn' onclick=\"location.href='/'\" style='margin:0'>首页 →</button>"
+"<button class='back-btn m0' onclick=\"location.href='/admin'\">← 返回管理</button>"
+"<button class='back-btn m0' onclick=\"location.href='/'\">首页 →</button>"
 "</div>"
-"<h1 style='color:#fff;margin:0 0 15px 0;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.2)'>系统日志</h1>"
+"<h1>系统日志</h1>"
 
-"<div class='card'>"
+"<div class='card' style='padding:15px;margin-bottom:15px'>"
 "<div class='control-panel'>"
 "<label style='font-size:14px;color:#333'>日志级别:</label>"
-"<select id='levelFilter'>"
+"<select id='levelFilter' class='sel-auto' style='min-width:80px'>"
 "<option value='all'>全部</option>"
 "<option value='E'>仅错误 (E)</option>"
 "<option value='W'>仅警告 (W)</option>"
@@ -608,7 +574,7 @@ static const char html_log_page[] =
 "</select>"
 "<label class='toggle-label'><input type='checkbox' id='autoRefresh' checked> 自动刷新</label>"
 "<label style='font-size:14px;color:#333'>间隔:</label>"
-"<select id='refreshInterval'>"
+"<select id='refreshInterval' class='sel-auto' style='min-width:60px'>"
 "<option value='3'>3秒</option>"
 "<option value='5'>5秒</option>"
 "<option value='10' selected>10秒</option>"
@@ -715,11 +681,17 @@ static bool check_auth(httpd_req_t *req)
     if (httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) != ESP_OK) return false;
     if (strncmp(auth, "Basic ", 6) != 0) return false;
 
-    // Base64解码
-    unsigned char decoded[64] = {0};
+    // Base64解码（增加缓冲区大小，防止溢出）
+    // auth最大128字节，去掉"Basic "后最多122字节base64
+    // Base64解码输出 = 输入 * 3/4，最多92字节
+    unsigned char decoded[96] = {0};  // 增大到96字节（原64字节可能不足）
     size_t dec_len = 0;
-    mbedtls_base64_decode(decoded, sizeof(decoded), &dec_len,
+    int ret = mbedtls_base64_decode(decoded, sizeof(decoded), &dec_len,
                           (unsigned char*)(auth + 6), strlen(auth + 6));
+    if (ret != 0 || dec_len == 0) {
+        ESP_LOGD(TAG, "Base64解码失败");
+        return false;
+    }
 
     // 格式: username:password
     char *colon = strchr((char*)decoded, ':');
@@ -854,6 +826,7 @@ static esp_err_t handle_log_api(httpd_req_t *req)
  * @brief 日志端点：以HTML形式返回日志缓冲区内容（支持时间戳转换和级别过滤）
  * @note 查询参数: level=E/W/I/D/EW/EWI 过滤日志级别
  *       两阶段扫描：先逆向计算能显示的行数，再正向输出（确保新日志完整）
+ *       内存使用：~18KB输出缓冲区 + ~800字节行位置数组，最多显示200行
  */
 static esp_err_t handle_log_debug(httpd_req_t *req)
 {
@@ -863,15 +836,31 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     }
     set_session_cookie(req);
 
+    // 计算所需缓冲区大小
+    size_t buf_size = LOG_BUF_SIZE * 2 + 2048;  // ~18KB
+    size_t line_starts_size = 200 * sizeof(uint32_t);  // ~800字节（200行）
+    size_t total_required = buf_size + line_starts_size + 1024;  // 加1KB余量
+
     // 检查可用内存
     size_t free_heap = esp_get_free_heap_size();
-    if (free_heap < 20000) {
-        ESP_LOGW(TAG, "内存不足(%lu字节)，跳过日志详细处理", (unsigned long)free_heap);
+    if (free_heap < total_required) {
+        ESP_LOGW(TAG, "内存不足(%lu字节，需%lu字节)，跳过日志详细处理",
+                 (unsigned long)free_heap, (unsigned long)total_required);
         httpd_resp_set_type(req, "text/html");
         return httpd_resp_send(req, "<span style='color:#f57c00'>内存不足，无法显示详细日志</span>", HTTPD_RESP_USE_STRLEN);
     }
 
-    static char buf[LOG_BUF_SIZE * 2 + 2048];  // 18432字节，约2.2x膨胀(分析值14582)
+    // 动态分配缓冲区（避免栈溢出）
+    char *buf = malloc(buf_size);
+    uint32_t *line_starts = malloc(line_starts_size);
+    if (!buf || !line_starts) {
+        ESP_LOGE(TAG, "日志缓冲区分配失败");
+        if (buf) free(buf);
+        if (line_starts) free(line_starts);
+        httpd_resp_set_type(req, "text/html");
+        return httpd_resp_send(req, "<span style='color:#d32f2f'>内存分配失败</span>", HTTPD_RESP_USE_STRLEN);
+    }
+
     int pos = 0;
 
     // 解析查询参数中的日志级别过滤
@@ -888,14 +877,13 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     time_t boot_wall = wifi_manager_get_boot_wall_clock_time();
     bool has_wall_time = (boot_wall > 0);
 
-    #define MAX_LOG_LINES 300  // 最多记录300行位置
-    static uint32_t line_starts[MAX_LOG_LINES];  // 每行的起始位置
+    #define MAX_LOG_LINES 200  // 最多记录200行位置
     char line_buf[300];
 
     // 重试循环：防止缓冲区覆盖导致读取不一致
     int retry_count = 0;
     bool scan_success = false;
-    int limit = (int)sizeof(buf) - 100;
+    int limit = (int)buf_size - 100;
 
     do {
         // 快照当前缓冲区状态（包括生成计数器）
@@ -928,7 +916,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     // ==================== 第二阶段：正向输出（从最旧到最新）====================
     // 最旧日志在最上方，最新日志在最下方
 
-    pos = snprintf(buf, sizeof(buf),
+    pos = snprintf(buf, buf_size,
         "<style>.E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}</style>"
         "<div style='padding:4px 8px;border-bottom:1px solid #e0e0e0;font-size:10px;color:#888;background:#f0f0f0'>缓冲区 %lu/%lu 字节 | %s | 过滤: %s</div>",
         (unsigned long)(head >= tail ? head - tail : LOG_BUF_SIZE - tail + head),
@@ -1006,7 +994,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
                 time_t log_time = boot_wall + (boot_ms / 1000);
                 struct tm tm_log;
                 localtime_r(&log_time, &tm_log);
-                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                pos += snprintf(buf + pos, buf_size - pos,
                     "[%02d-%02d %02d:%02d:%02d] ",
                     tm_log.tm_mon + 1, tm_log.tm_mday,
                     tm_log.tm_hour, tm_log.tm_min, tm_log.tm_sec);
@@ -1026,7 +1014,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
             }
 
             // HTML转义
-            for (int k = content_start; k < line_len && pos < (int)sizeof(buf) - 10; k++) {
+            for (int k = content_start; k < line_len && pos < (int)buf_size - 10; k++) {
                 char ch = line_buf[k];
                 if (ch == '<') { buf[pos++] = '&'; buf[pos++] = 'l'; buf[pos++] = 't'; }
                 else if (ch == '>') { buf[pos++] = '&'; buf[pos++] = 'g'; buf[pos++] = 't'; }
@@ -1034,7 +1022,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
                 else buf[pos++] = ch;
             }
 
-            if (cls && pos + 8 < (int)sizeof(buf)) {
+            if (cls && pos + 8 < (int)buf_size) {
                 memcpy(buf + pos, "</span>", 7);
                 pos += 7;
             }
@@ -1063,13 +1051,19 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     // 滚动到底部（显示最新日志）
     const char *scroll_js = "<script>(function(){var el=document.getElementById('logContent');if(el)el.scrollTop=el.scrollHeight})()</script>";
     int slen = strlen(scroll_js);
-    if (pos + slen < (int)sizeof(buf)) {
+    if (pos + slen < (int)buf_size) {
         memcpy(buf + pos, scroll_js, slen);
         pos += slen;
     }
 
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, buf, pos);
+    esp_err_t ret = httpd_resp_send(req, buf, pos);
+
+    // 释放动态分配的缓冲区
+    free(buf);
+    free(line_starts);
+
+    return ret;
 }
 
 // ==================== 辅助函数 ====================
@@ -1160,6 +1154,9 @@ static esp_err_t handle_status(httpd_req_t *req)
     char ip[16] = "";
     wifi_manager_get_ip(ip, sizeof(ip));
 
+    char ssid_buf[33] = "";
+    wifi_manager_get_ssid(ssid_buf, sizeof(ssid_buf));
+
     // 今日统计
     uint32_t today_prod_min = 0;
     daily_stats_t today;
@@ -1247,13 +1244,13 @@ static esp_err_t handle_status(httpd_req_t *req)
     }
 
     // 最终字段写入前检查
-    if (pos >= sizeof(buf) - 150) {
+    if (pos >= sizeof(buf) - 200) {
         ESP_LOGW(TAG, "JSON最终数据溢出");
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
         return ESP_FAIL;
     }
 
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
+    int final_written = snprintf(buf + pos, sizeof(buf) - pos,
         "],"
         "\"totalWater\":%lu,"
         "\"wifiState\":\"%s\","
@@ -1269,7 +1266,7 @@ static esp_err_t handle_status(httpd_req_t *req)
         "\"stackWiFi\":%u}",
         (unsigned long)filters_status.total_water_used,
         wifi_manager_get_state_name(wifi_manager_get_state()),
-        wifi_manager_get_ssid(),
+        ssid_buf,
         ip,
         wifi_manager_get_rssi(),
         pm_manager_get_wifi_tx_power() / 4,  // 转换为dBm
@@ -1279,6 +1276,14 @@ static esp_err_t handle_status(httpd_req_t *req)
         (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("monitor")),
         (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("httpd")),
         (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("wifi")));
+
+    // 检查最终写入是否截断
+    if (final_written < 0 || final_written >= sizeof(buf) - pos) {
+        ESP_LOGW(TAG, "JSON最终数据写入失败/截断");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
+        return ESP_FAIL;
+    }
+    pos += final_written;
 
     httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -2329,12 +2334,12 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     const esp_app_desc_t *app_desc = esp_app_get_description();
     if (app_desc) {
         cJSON_AddStringToObject(root, "running_version", app_desc->version);
-        cJSON_AddStringToObject(root, "compile_time", app_desc->date);
-        cJSON_AddStringToObject(root, "compile_date", app_desc->time);
+        cJSON_AddStringToObject(root, "compile_date", app_desc->date);    // 编译日期
+        cJSON_AddStringToObject(root, "compile_time", app_desc->time);    // 编译时间
     } else {
         cJSON_AddStringToObject(root, "running_version", "unknown");
-        cJSON_AddStringToObject(root, "compile_time", "");
         cJSON_AddStringToObject(root, "compile_date", "");
+        cJSON_AddStringToObject(root, "compile_time", "");
     }
 
     const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
@@ -2352,6 +2357,51 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     httpd_resp_sendstr(req, resp);
     free(resp);
     cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/**
+ * @brief 固件预览API处理器（解析上传固件的版本信息）
+ * @note 接收固件头部数据（至少256字节），返回版本、日期、时间
+ */
+static esp_err_t ota_preview_handler(httpd_req_t *req)
+{
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+    set_session_cookie(req);
+
+    // 接收固件头部数据（至少256字节）
+    char buf[512];  // 缓冲区足够解析app_desc
+    int total_len = httpd_req_recv(req, buf, sizeof(buf));
+    if (total_len <= 0) {
+        ESP_LOGE(TAG, "接收固件数据失败");
+        return send_json_error(req, 400, "接收数据失败");
+    }
+
+    // 解析固件信息
+    char version[32] = {0};
+    char date[16] = {0};
+    char time[16] = {0};
+
+    esp_err_t ret = ota_update_preview((uint8_t*)buf, total_len, version, date, time);
+    if (ret != ESP_OK) {
+        return send_json_error(req, 400, "无效的固件文件");
+    }
+
+    // 返回固件信息
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "version", version);
+    cJSON_AddStringToObject(root, "date", date);
+    cJSON_AddStringToObject(root, "time", time);
+
+    char *resp = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    free(resp);
+    cJSON_Delete(root);
+
     return ESP_OK;
 }
 
@@ -2518,6 +2568,9 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(ctx.server, &uri);
 
     uri.uri = "/api/ota/status", uri.method = HTTP_GET, uri.handler = ota_status_handler;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/ota/preview", uri.method = HTTP_POST, uri.handler = ota_preview_handler;
     httpd_register_uri_handler(ctx.server, &uri);
 
     uri.uri = "/api/ota/factory", uri.method = HTTP_POST, uri.handler = ota_factory_handler;

@@ -34,8 +34,6 @@
 
 #define MQTT_MAX_TOPIC_LEN  128
 #define MQTT_MAX_DATA_LEN   1024
-#include "tds_sensor.h"
-#include "wifi_manager.h"
 
 static const char *TAG = "APP_MQTT";
 
@@ -151,7 +149,15 @@ esp_err_t mqtt_client_deinit(void)
     if (!mqtt_ctx.initialized) {
         return ESP_OK;
     }
+
+    // 先停止客户端（清理所有运行中的资源）
+    mqtt_client_stop();
+
+    // 清理配置
+    memset(&mqtt_ctx.config, 0, sizeof(mqtt_ctx.config));
+
     mqtt_ctx.initialized = false;
+    ESP_LOGI(TAG, "MQTT客户端已完全清理");
     return ESP_OK;
 }
 
@@ -206,12 +212,14 @@ esp_err_t mqtt_client_stop(void)
         taskENTER_CRITICAL(&mqtt_spinlock);
         vTaskDelete(mqtt_ctx.reconnect_task);
         mqtt_ctx.reconnect_task = NULL;
+        mqtt_ctx.reconnect_active = false;  // 清除活跃标志
         taskEXIT_CRITICAL(&mqtt_spinlock);
     }
 
-    // 清除停止标志
+    // 清除停止标志和活跃标志（确保完全清理）
     taskENTER_CRITICAL(&mqtt_spinlock);
     mqtt_ctx.stop_requested = false;
+    mqtt_ctx.reconnect_active = false;  // 确保清除（防止残留）
     taskEXIT_CRITICAL(&mqtt_spinlock);
 
     if (mqtt_ctx.mqtt_client != NULL) {
@@ -424,8 +432,8 @@ esp_err_t mqtt_publish_purifier_status(void)
     tds_dual_measurement_t dual_tds;
     bool has_tds = (tds_sensor_get_latest_dual(&dual_tds) == ESP_OK && dual_tds.both_valid);
 
-    // 使用静态缓冲区避免 cJSON_PrintUnformatted 的堆分配
-    static char json_buf[256];
+    // 使用局部缓冲区（栈分配）避免静态变量的多线程竞争风险
+    char json_buf[256];
     snprintf(json_buf, sizeof(json_buf),
              "{\"state\":\"%s\",\"tds_in\":%.1f,\"tds_out\":%.1f,\"tds_reduction_rate\":%.1f}",
              state_name,
@@ -446,7 +454,8 @@ esp_err_t mqtt_publish_tds_value(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    static char json_buf[128];
+    // 使用局部缓冲区（栈分配）避免静态变量的多线程竞争风险
+    char json_buf[128];
     snprintf(json_buf, sizeof(json_buf),
              "{\"tds_in\":%.1f,\"tds_out\":%.1f,\"tds_reduction_rate\":%.1f}",
              dual_tds.inlet.tds_value, dual_tds.outlet.tds_value, dual_tds.reduction_rate);
@@ -461,7 +470,8 @@ esp_err_t mqtt_publish_system_status(void)
     uint32_t free_heap = esp_get_free_heap_size();
     uint32_t uptime = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
 
-    static char json_buf[128];
+    // 使用局部缓冲区（栈分配）避免静态变量的多线程竞争风险
+    char json_buf[128];
     snprintf(json_buf, sizeof(json_buf),
              "{\"free_heap\":%lu,\"uptime\":%lu,\"wifi_connected\":%s}",
              (unsigned long)free_heap, (unsigned long)uptime,
@@ -771,7 +781,7 @@ esp_err_t mqtt_send_ha_discovery(void)
 
 esp_err_t mqtt_send_ha_sensor_config(const char *sensor_name, const char *sensor_type, const char *unit)
 {
-    char topic[128], discovery_msg[512], state_topic[128];
+    char topic[128], discovery_msg[768], state_topic[128];  // 增大到768字节
     char value_template[64];
 
     snprintf(topic, sizeof(topic), "homeassistant/sensor/water_purifier/%s/config", sensor_name);
@@ -792,6 +802,13 @@ esp_err_t mqtt_send_ha_sensor_config(const char *sensor_name, const char *sensor
 
     char *json_str = cJSON_PrintUnformatted(root);
     if (json_str) {
+        size_t json_len = strlen(json_str);
+        if (json_len >= sizeof(discovery_msg)) {
+            ESP_LOGE(TAG, "HA discovery消息过长(%zu字节)，超过缓冲区，跳过发送", json_len);
+            cJSON_Delete(root);
+            free(json_str);
+            return ESP_ERR_NO_MEM;  // 返回错误而不是截断发送
+        }
         snprintf(discovery_msg, sizeof(discovery_msg), "%s", json_str);
         cJSON_Delete(root);  // 先删除cJSON对象
         free(json_str);      // 再释放Print分配的内存
@@ -805,7 +822,7 @@ esp_err_t mqtt_send_ha_sensor_config(const char *sensor_name, const char *sensor
 
 esp_err_t mqtt_send_ha_switch_config(const char *switch_name)
 {
-    char topic[128], discovery_msg[512], state_topic[128], command_topic[128];
+    char topic[128], discovery_msg[768], state_topic[128], command_topic[128];  // 增大到768字节
 
     snprintf(topic, sizeof(topic), "homeassistant/switch/water_purifier/%s/config", switch_name);
 
@@ -823,6 +840,13 @@ esp_err_t mqtt_send_ha_switch_config(const char *switch_name)
 
     char *json_str = cJSON_PrintUnformatted(root);
     if (json_str) {
+        size_t json_len = strlen(json_str);
+        if (json_len >= sizeof(discovery_msg)) {
+            ESP_LOGE(TAG, "HA switch discovery消息过长(%zu字节)，超过缓冲区，跳过发送", json_len);
+            cJSON_Delete(root);
+            free(json_str);
+            return ESP_ERR_NO_MEM;  // 返回错误而不是截断发送
+        }
         snprintf(discovery_msg, sizeof(discovery_msg), "%s", json_str);
         cJSON_Delete(root);  // 先删除cJSON对象
         free(json_str);      // 再释放Print分配的内存

@@ -112,9 +112,11 @@ esp_err_t ota_update_init(void)
     const esp_app_desc_t *app_desc = esp_app_get_description();
     if (app_desc) {
         strncpy(s_ctx.running_version, app_desc->version, sizeof(s_ctx.running_version) - 1);
+        s_ctx.running_version[sizeof(s_ctx.running_version) - 1] = '\0';  // 确保null终止
         ESP_LOGI(TAG, "当前固件版本: %s", s_ctx.running_version);
     } else {
         strncpy(s_ctx.running_version, "unknown", sizeof(s_ctx.running_version) - 1);
+        s_ctx.running_version[sizeof(s_ctx.running_version) - 1] = '\0';
     }
 
     s_ctx.state = OTA_STATE_IDLE;
@@ -250,11 +252,34 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
         ESP_LOGI(TAG, "新固件: 版本=%s, 编译=%s %s",
                  app_desc->version, app_desc->date, app_desc->time);
 
-        // 同版本检测（使用strcmp比较完整版本字符串，避免strncmp截断误判）
-        if (strcmp(app_desc->version, s_ctx.running_version) == 0) {
-            ESP_LOGW(TAG, "上传的固件版本与当前运行版本相同，拒绝升级");
-            s_ctx.state = OTA_STATE_FAILED;
-            return ESP_ERR_INVALID_ARG;
+        // 版本比较：只比较主版本号部分（截取前N个字符，忽略构建时间后缀）
+        // 格式通常为 "1.0.0" 或 "1.0.0-20250101"，只比较前面的数字部分
+        char new_ver_main[16] = {0};
+        char run_ver_main[16] = {0};
+        // 截取版本号的主部分（查找第一个非数字/非点/非连字符的位置）
+        for (int i = 0; i < sizeof(new_ver_main) - 1 && app_desc->version[i]; i++) {
+            char c = app_desc->version[i];
+            if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == 'v') {
+                new_ver_main[i] = c;
+            } else {
+                break;  // 遇到其他字符停止（如空格或构建日期）
+            }
+        }
+        for (int i = 0; i < sizeof(run_ver_main) - 1 && s_ctx.running_version[i]; i++) {
+            char c = s_ctx.running_version[i];
+            if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == 'v') {
+                run_ver_main[i] = c;
+            } else {
+                break;
+            }
+        }
+
+        // 同主版本号检测（允许同主版本号升级，用于修复bug或更新构建日期）
+        if (strcmp(new_ver_main, run_ver_main) == 0) {
+            ESP_LOGW(TAG, "固件主版本号相同 (%s)，允许升级（可能包含bug修复）", new_ver_main);
+            // 不阻止升级，只是输出警告
+        } else {
+            ESP_LOGI(TAG, "版本变更: %s -> %s", run_ver_main, new_ver_main);
         }
 
         // 启动 OTA 写入
@@ -458,11 +483,13 @@ esp_err_t ota_update_revert_to_factory(void)
     }
 
     ESP_LOGI(TAG, "已设置启动分区为factory，即将重启...");
-    // 延迟重启，让HTTP响应先发送
-    vTaskDelay(pdMS_TO_TICKS(500));
+    // 延迟重启，确保HTTP响应和日志完全发送（Web服务器响应可能需要缓冲）
+    // 增加到1500ms以适应网络延迟和缓冲刷新
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    ESP_LOGI(TAG, "执行重启...");
     esp_restart();
 
-    return ESP_OK;
+    return ESP_OK;  // 不可达，但保持函数完整性
 }
 
 /**
@@ -515,6 +542,48 @@ esp_err_t ota_update_rollback(void)
     ESP_LOGI(TAG, "已设置启动分区为 %s，即将重启...", target->label);
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
+
+    return ESP_OK;
+}
+
+esp_err_t ota_update_preview(const uint8_t *data, size_t len,
+                             char *version, char *date, char *time)
+{
+    // 计算解析app_desc所需的最小数据量
+    size_t need = sizeof(esp_image_header_t) +
+                  sizeof(esp_image_segment_header_t) +
+                  sizeof(esp_app_desc_t);
+
+    if (len < need) {
+        ESP_LOGE(TAG, "数据不足: len=%zu < need=%zu", len, need);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 检查ESP镜像头magic
+    esp_image_header_t *header = (esp_image_header_t *)data;
+    if (header->magic != ESP_IMAGE_HEADER_MAGIC) {
+        ESP_LOGE(TAG, "无效的固件magic: 0x%02x", header->magic);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 解析app_desc结构
+    const esp_app_desc_t *app_desc =
+        (const esp_app_desc_t *)(data + sizeof(esp_image_header_t) +
+                                 sizeof(esp_image_segment_header_t));
+
+    // 复制版本信息到输出缓冲区
+    if (version) {
+        strncpy(version, app_desc->version, 32);
+        version[31] = '\0';
+    }
+    if (date) {
+        strncpy(date, app_desc->date, 16);
+        date[15] = '\0';
+    }
+    if (time) {
+        strncpy(time, app_desc->time, 16);
+        time[15] = '\0';
+    }
 
     return ESP_OK;
 }

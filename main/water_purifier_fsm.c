@@ -256,7 +256,9 @@ static void stop_all_outputs(void)
     gpio_driver_set_waste_valve(false);
     gpio_driver_set_return_valve(false);
     gpio_driver_set_boost_pump(false);
-    ESP_LOGD(TAG, "所有输出已关闭");
+    // 重置相位标志，防止紧急情况恢复后状态机异常执行
+    fsm_ctx.current_phase = FLUSH_PHASE_NONE;
+    ESP_LOGD(TAG, "所有输出已关闭，相位已重置");
 }
 
 /**
@@ -344,19 +346,38 @@ static const char* const event_names[] = {
 
 static void record_stop(stop_type_t type, const char *description)
 {
-    fsm_ctx.runtime_data.last_stop_type = type;
-    fsm_ctx.runtime_data.last_stop_time = esp_timer_get_time();
+    /* 使用mutex保护stop_history数组的访问（与fsm_get_stop_history共享） */
+    if (fsm_ctx.runtime_data_mutex && xSemaphoreTake(fsm_ctx.runtime_data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        fsm_ctx.runtime_data.last_stop_type = type;
+        fsm_ctx.runtime_data.last_stop_time = esp_timer_get_time();
 
-    /* 循环缓冲区存储：索引持续递增，存储位置用modulo计算 */
-    uint32_t idx = fsm_ctx.stop_history_index % 16;
-    fsm_ctx.stop_history[idx].type = type;
-    fsm_ctx.stop_history[idx].timestamp = esp_timer_get_time();
-    /* 安全拷贝：强制null终止，防止strncpy不终止 */
-    size_t desc_len = strlen(description);
-    size_t copy_len = (desc_len < 63) ? desc_len : 63;
-    memcpy(fsm_ctx.stop_history[idx].description, description, copy_len);
-    fsm_ctx.stop_history[idx].description[copy_len] = '\0';
-    fsm_ctx.stop_history_index++;
+        /* 循环缓冲区存储：索引持续递增，存储位置用modulo计算 */
+        uint32_t idx = fsm_ctx.stop_history_index % 16;
+        fsm_ctx.stop_history[idx].type = type;
+        fsm_ctx.stop_history[idx].timestamp = esp_timer_get_time();
+        /* 安全拷贝：强制null终止，防止strncpy不终止 */
+        size_t desc_len = strlen(description);
+        size_t copy_len = (desc_len < 63) ? desc_len : 63;
+        memcpy(fsm_ctx.stop_history[idx].description, description, copy_len);
+        fsm_ctx.stop_history[idx].description[copy_len] = '\0';
+        fsm_ctx.stop_history_index++;
+
+        xSemaphoreGive(fsm_ctx.runtime_data_mutex);
+    } else {
+        /* mutex获取失败，仍需记录（降级处理） */
+        ESP_LOGW(TAG, "record_stop: mutex获取失败，无锁记录");
+        fsm_ctx.runtime_data.last_stop_type = type;
+        fsm_ctx.runtime_data.last_stop_time = esp_timer_get_time();
+
+        uint32_t idx = fsm_ctx.stop_history_index % 16;
+        fsm_ctx.stop_history[idx].type = type;
+        fsm_ctx.stop_history[idx].timestamp = esp_timer_get_time();
+        size_t desc_len = strlen(description);
+        size_t copy_len = (desc_len < 63) ? desc_len : 63;
+        memcpy(fsm_ctx.stop_history[idx].description, description, copy_len);
+        fsm_ctx.stop_history[idx].description[copy_len] = '\0';
+        fsm_ctx.stop_history_index++;
+    }
 
     ESP_LOGE(TAG, "停止记录: %s", description);
 
@@ -1493,6 +1514,16 @@ uint32_t fsm_get_stop_history(stop_record_t *records, uint32_t max_count)
         return 0;
     }
 
+    if (!fsm_ctx.runtime_data_mutex) {
+        ESP_LOGE(TAG, "运行数据mutex未初始化");
+        return 0;
+    }
+
+    if (xSemaphoreTake(fsm_ctx.runtime_data_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "获取mutex超时，返回0条记录");
+        return 0;
+    }
+
     uint32_t total_written = fsm_ctx.stop_history_index;
     /* 已写入的总记录数决定了有多少有效记录 */
     uint32_t valid_count = (total_written < 16) ? total_written : 16;
@@ -1508,6 +1539,7 @@ uint32_t fsm_get_stop_history(stop_record_t *records, uint32_t max_count)
         memcpy(&records[i], &fsm_ctx.stop_history[idx], sizeof(stop_record_t));
     }
 
+    xSemaphoreGive(fsm_ctx.runtime_data_mutex);
     return count;
 }
 
