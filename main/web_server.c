@@ -1262,9 +1262,7 @@ static esp_err_t handle_status(httpd_req_t *req)
         "\"freeHeap\":%u,"
         "\"minHeap\":%u,"
         "\"stackFSM\":%u,"
-        "\"stackMon\":%u,"
-        "\"stackHTTP\":%u,"
-        "\"stackWiFi\":%u}",
+        "\"stackHTTP\":%u}",
         (unsigned long)filters_status.total_water_used,
         wifi_manager_get_state_name(wifi_manager_get_state()),
         ssid_buf,
@@ -1273,10 +1271,8 @@ static esp_err_t handle_status(httpd_req_t *req)
         pm_manager_get_wifi_tx_power() / 4,  // 转换为dBm
         (unsigned)esp_get_free_heap_size(),
         (unsigned)esp_get_minimum_free_heap_size(),
-        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("fsm")),
-        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("monitor")),
-        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("httpd")),
-        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("wifi")));
+        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("fsm_task")),
+        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("httpd")));
 
     // 检查最终写入是否截断
     if (final_written < 0 || final_written >= sizeof(buf) - pos) {

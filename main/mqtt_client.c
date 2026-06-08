@@ -898,6 +898,7 @@ static void mqtt_reconnect_task(void *pvParameters)
         pdMS_TO_TICKS(8000),
         pdMS_TO_TICKS(16000),
         pdMS_TO_TICKS(30000),
+        pdMS_TO_TICKS(60000),  // 上限60秒
     };
     const int delay_count = sizeof(delays) / sizeof(delays[0]);
 
@@ -984,7 +985,8 @@ static void mqtt_reconnect_task(void *pvParameters)
             }
         } else {
             ESP_LOGD(TAG, "尝试MQTT重连 %d/%d", retry + 1, max_retries);
-            esp_err_t ret = esp_mqtt_client_start(mqtt_ctx.mqtt_client);
+            // 已启动的客户端使用reconnect，未启动的客户端使用start
+            esp_err_t ret = esp_mqtt_client_reconnect(mqtt_ctx.mqtt_client);
             if (ret == ESP_OK) {
                 /* 等待连接成功或超时，最多等待5秒 */
                 for (int wait = 0; wait < 50; wait++) {
