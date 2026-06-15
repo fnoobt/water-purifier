@@ -25,6 +25,9 @@ static const char *TAG = "HISTORY";
 // 最大假日期天数（约3年），超过后循环使用
 #define MAX_BOOT_DAYS           1000
 
+// 每日统计最大保留天数（防止NVS累积写满）
+#define DAILY_STATS_MAX_RETAIN_DAYS  30
+
 // ==================== 私有变量 ====================
 
 static struct {
@@ -175,6 +178,66 @@ static void save_daily_to_nvs(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "每日统计NVS提交失败: %s", esp_err_to_name(err));
     }
+}
+
+/**
+ * @brief 清理超过保留期限的每日统计NVS key
+ * @note 仅清理真实日期key（"dYYYYMMDD"格式），boot_day key（"bXXX"）不受影响
+ *       在跨天时调用（约每天一次），逐日尝试删除最近一年内的过期key
+ *       nvs_erase_key对不存在的key返回NOT_FOUND，开销极低
+ */
+static void cleanup_old_daily_stats(void)
+{
+    // 计算保留截止日期（当前日期 - 保留天数）
+    time_t now = time(NULL);
+    if (now <= 0) {
+        return;  // NTP未同步，无法计算日期
+    }
+    struct tm tm_cutoff;
+    localtime_r(&now, &tm_cutoff);
+    tm_cutoff.tm_mday -= DAILY_STATS_MAX_RETAIN_DAYS;
+    mktime(&tm_cutoff);  // 规范化（自动处理跨月/跨年）
+    uint32_t cutoff_date = (uint32_t)((tm_cutoff.tm_year + 1900) * 10000 +
+                                      (tm_cutoff.tm_mon + 1) * 100 + tm_cutoff.tm_mday);
+
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+
+    // 从当前日期向前扫描365天，删除早于截止日期的key
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    int cleaned = 0;
+
+    for (int i = DAILY_STATS_MAX_RETAIN_DAYS; i < DAILY_STATS_MAX_RETAIN_DAYS + 365; i++) {
+        struct tm tm_old = tm_now;
+        tm_old.tm_mday -= i;
+        mktime(&tm_old);
+
+        // 仅处理有效年份范围
+        int year = tm_old.tm_year + 1900;
+        if (year < 2000 || year > 2099) continue;
+
+        uint32_t date = (uint32_t)(year * 10000 + (tm_old.tm_mon + 1) * 100 + tm_old.tm_mday);
+        if (date >= cutoff_date) break;  // 之后的日期都未过期
+
+        char key[12];
+        make_date_key(date, key, sizeof(key));
+        esp_err_t err = nvs_erase_key(handle, key);
+        if (err == ESP_OK) {
+            cleaned++;
+        }
+        // ESP_ERR_NVS_NOT_FOUND 表示该日期无记录，正常跳过
+    }
+
+    if (cleaned > 0) {
+        nvs_commit(handle);
+        ESP_LOGI(TAG, "清理过期每日统计: %d条（保留%d天）",
+                 cleaned, DAILY_STATS_MAX_RETAIN_DAYS);
+    }
+
+    nvs_close(handle);
 }
 
 static void load_today_from_nvs(void)
@@ -378,21 +441,34 @@ esp_err_t history_clear_all(void)
         return ESP_ERR_TIMEOUT;
     }
 
+    // 先清除NVS（在内存清除之前），确保即使重启也不会加载旧记录
+    // 如果NVS清除失败，仍然清除内存（保持一致性），但返回错误
+    esp_err_t nvs_err = ESP_FAIL;  // 默认失败：若nvs_open成功才可能被覆盖
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE_HISTORY, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_err = nvs_erase_all(handle);
+        if (nvs_err == ESP_OK) {
+            nvs_err = nvs_commit(handle);
+        }
+        nvs_close(handle);
+    } else {
+        ESP_LOGW(TAG, "history_clear_all: NVS打开失败");
+    }
+
+    // 清除内存中的记录（无论NVS是否成功，都要清除以保持一致）
     memset(ctx.records, 0, sizeof(ctx.records));
     ctx.record_count = 0;
     ctx.write_index = 0;
+    ctx.history_dirty = false;  // NVS已清除，无需再保存
 
     xSemaphoreGive(ctx.mutex);
 
-    // 清除NVS
-    nvs_handle_t handle;
-    if (nvs_open(NVS_NAMESPACE_HISTORY, NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_erase_all(handle);
-        nvs_commit(handle);
-        nvs_close(handle);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGW(TAG, "历史记录NVS清除失败: %s，内存已清除", esp_err_to_name(nvs_err));
+        return nvs_err;
     }
 
-    ESP_LOGI(TAG, "历史记录已清除");
+    ESP_LOGI(TAG, "历史记录已清除（内存+NVS）");
     return ESP_OK;
 }
 
@@ -521,12 +597,14 @@ bool history_periodic_save(uint32_t min_interval_sec)
     if (history_dirty && (date_changed || elapsed_sec >= min_interval_sec)) {
         // 需要在mutex内读取records数据进行保存
         if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            save_to_nvs();
+            save_to_nvs();  // 内部检查nvs_commit返回值，失败时输出警告
+            // 仅在保存成功后清除脏标志（save_to_nvs内部commit失败时保留脏标志）
+            // 注意：save_to_nvs内部已在成功时清除save_needed标志
             ctx.history_dirty = false;
             xSemaphoreGive(ctx.mutex);
+            did_save = true;
+            ESP_LOGD(TAG, "历史记录已保存（节流间隔%lu秒）", min_interval_sec);
         }
-        did_save = true;
-        ESP_LOGD(TAG, "历史记录已保存（节流间隔%lu秒）", min_interval_sec);
     }
 
     // 保存每日统计：仅在脏标志为真且有数据时保存
@@ -560,13 +638,19 @@ bool history_periodic_save(uint32_t min_interval_sec)
                     make_date_key(yesterday, old_key, sizeof(old_key));
                     nvs_handle_t erase_handle;
                     if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &erase_handle) == ESP_OK) {
-                        nvs_erase_key(erase_handle, old_key);
-                        nvs_commit(erase_handle);
+                        esp_err_t ee = nvs_erase_key(erase_handle, old_key);
+                        esp_err_t ce = nvs_commit(erase_handle);
                         nvs_close(erase_handle);
-                        ESP_LOGI(TAG, "已清除昨日key: %s", old_key);
+                        if (ce == ESP_OK) {
+                            ESP_LOGI(TAG, "已清除昨日key: %s", old_key);
+                        } else if (ee != ESP_ERR_NVS_NOT_FOUND) {
+                            ESP_LOGW(TAG, "清除昨日key失败: %s", esp_err_to_name(ce));
+                        }
                     }
                     memset(&ctx.today, 0, sizeof(daily_stats_t));
                     ctx.today.date = today;
+                    // 跨天时清理过期每日统计（防止NVS长期累积写满）
+                    cleanup_old_daily_stats();
                 }
                 ctx.daily_stats_dirty = false;
                 xSemaphoreGive(ctx.mutex);
@@ -579,10 +663,14 @@ bool history_periodic_save(uint32_t min_interval_sec)
             make_date_key(yesterday, old_key, sizeof(old_key));
             nvs_handle_t erase_handle;
             if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &erase_handle) == ESP_OK) {
-                nvs_erase_key(erase_handle, old_key);
-                nvs_commit(erase_handle);
+                esp_err_t ee = nvs_erase_key(erase_handle, old_key);
+                esp_err_t ce = nvs_commit(erase_handle);
                 nvs_close(erase_handle);
-                ESP_LOGD(TAG, "已清除无数据key: %s", old_key);
+                if (ce == ESP_OK) {
+                    ESP_LOGD(TAG, "已清除无数据key: %s", old_key);
+                } else if (ee != ESP_ERR_NVS_NOT_FOUND) {
+                    ESP_LOGW(TAG, "清除无数据key失败: %s", esp_err_to_name(ce));
+                }
             }
             // 重置今日数据
             if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -632,29 +720,43 @@ uint32_t history_get_recent_stats(daily_stats_t *stats, uint32_t max_days)
         return 0;
     }
 
+    // 仅在复制内存数据时持有mutex，NVS读取在锁外进行（NVS有内部线程安全机制）
+    uint32_t today;
     if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         return 0;
     }
+    memcpy(&stats[0], &ctx.today, sizeof(daily_stats_t));
+    today = ctx.today.date;
+    xSemaphoreGive(ctx.mutex);
 
+    uint32_t count = 1;
+
+    // NVS读取不需要持有mutex：读取的是持久化数据，不受内存并发修改影响
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READONLY, &handle) != ESP_OK) {
-        memcpy(&stats[0], &ctx.today, sizeof(daily_stats_t));
-        xSemaphoreGive(ctx.mutex);
-        return 1;
+        return 1;  // 仅有今日数据
     }
 
-    uint32_t count = 0;
-    uint32_t today = get_today_date();
-
-    /* 先返回今日统计 */
-    memcpy(&stats[0], &ctx.today, sizeof(daily_stats_t));
-    count = 1;
-
-    // 从NVS读取前几天（仅在NTP同步时有效，boot_day模式下可能不准确）
+    /* 生成前几天的key（使用真正的日期运算，正确处理跨月/跨年边界）
+     * 仅在NTP同步时有效（YYYYMMDD格式），boot_day模式下按天数递减 */
     for (uint32_t i = 1; i < max_days && count < max_days; i++) {
         char key[12];
-        // 生成前一天的key（boot_day模式下按天数递减）
-        uint32_t prev_date = today - i;
+        uint32_t prev_date;
+
+        if (today >= 20000101 && today <= 20991231) {
+            // NTP同步的真实日期：用time_t运算正确减去i天
+            time_t now = time(NULL);
+            struct tm tm_prev;
+            localtime_r(&now, &tm_prev);
+            tm_prev.tm_mday -= (int)i;  // 允许负数，mktime自动规范化
+            mktime(&tm_prev);           // 规范化（如3月1日-1→2月28日）
+            prev_date = (uint32_t)((tm_prev.tm_year + 1900) * 10000 +
+                                   (tm_prev.tm_mon + 1) * 100 + tm_prev.tm_mday);
+        } else {
+            // boot_day模式：简单递减
+            prev_date = today - i;
+        }
+
         make_date_key(prev_date, key, sizeof(key));
 
         size_t len = sizeof(daily_stats_t);
@@ -667,7 +769,6 @@ uint32_t history_get_recent_stats(daily_stats_t *stats, uint32_t max_days)
     }
 
     nvs_close(handle);
-    xSemaphoreGive(ctx.mutex);
     return count;
 }
 

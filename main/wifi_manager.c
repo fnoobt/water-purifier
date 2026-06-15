@@ -111,6 +111,7 @@ static void init_mdns(void)
         ESP_LOGW(TAG, "mDNS初始化失败: %s", esp_err_to_name(ret));
         return;
     }
+    // 先设置标志再配置服务，防止其他任务重复调用init_mdns
     s_mdns_initialized = true;
 
     // 设置主机名
@@ -309,26 +310,38 @@ esp_err_t wifi_manager_stop(void)
     if (!ctx.started) return ESP_OK;
 
     // 取消重连任务（使用mutex保护，避免竞态条件）
-    if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (ctx.reconnect_task_handle) {
+    // 重试3次获取mutex，每次等待100ms（总计最多300ms）
+    bool task_cleaned = false;
+    for (int attempt = 0; attempt < 3 && !task_cleaned; attempt++) {
+        if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             ctx.reconnect_active = false;
             ctx.active_reconnect_seq = 0;
-            TaskHandle_t task = ctx.reconnect_task_handle;
-            ctx.reconnect_task_handle = NULL;
-            xSemaphoreGive(ctx.state_mutex);
-            vTaskDelete(task);
-        } else {
-            xSemaphoreGive(ctx.state_mutex);
+            if (ctx.reconnect_task_handle) {
+                TaskHandle_t task = ctx.reconnect_task_handle;
+                ctx.reconnect_task_handle = NULL;
+                xSemaphoreGive(ctx.state_mutex);
+                // 先注销看门狗（任务可能已注册），防止资源泄漏
+                esp_err_t wdt_ret = esp_task_wdt_delete(task);
+                if (wdt_ret != ESP_OK && wdt_ret != ESP_ERR_NOT_FOUND) {
+                    ESP_LOGW(TAG, "注销重连任务看门狗异常: %s", esp_err_to_name(wdt_ret));
+                }
+                vTaskDelete(task);
+            } else {
+                xSemaphoreGive(ctx.state_mutex);
+            }
+            task_cleaned = true;
         }
-    } else {
-        // mutex获取失败：先设置标志通知任务退出，等待一小段时间
+    }
+
+    if (!task_cleaned) {
+        // 最后手段：强制清除标志并删除任务
+        // 注：vTaskDelete 对正在 vTaskDelay 中的任务是安全的（任务未持锁）
+        ESP_LOGW(TAG, "获取mutex失败，强制清除重连任务");
         ctx.reconnect_active = false;
-        if (ctx.reconnect_task_handle) {
-            ESP_LOGW(TAG, "获取mutex失败，等待任务退出");
-            vTaskDelay(pdMS_TO_TICKS(100));  // 给任务100ms退出时间
-            // 如果任务仍未退出，强制删除（最后手段）
-            TaskHandle_t task = ctx.reconnect_task_handle;
-            ctx.reconnect_task_handle = NULL;
+        TaskHandle_t task = ctx.reconnect_task_handle;
+        ctx.reconnect_task_handle = NULL;
+        if (task) {
+            esp_task_wdt_delete(task);  // 先注销看门狗
             vTaskDelete(task);
         }
     }
@@ -840,22 +853,20 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
                     // 如果没有活跃的重连任务，创建新任务
                     if (!ctx.reconnect_active) {
                         ctx.reconnect_sequence++;
-                        ctx.reconnect_active = true;
                         ctx.active_reconnect_seq = ctx.reconnect_sequence;
-                        xSemaphoreGive(ctx.state_mutex);
 
                         set_state(WIFI_STATE_RECONNECTING);
                         // 将序列号作为任务参数传递
+                        // 在mutex内创建任务，确保reconnect_active与任务创建原子性
                         BaseType_t ret = xTaskCreate(wifi_reconnect_task, "wifi_reconnect",
                                                      4096, (void*)ctx.active_reconnect_seq, 5,
                                                      &ctx.reconnect_task_handle);
-                        if (ret != pdPASS) {
+                        if (ret == pdPASS) {
+                            ctx.reconnect_active = true;  // 任务创建成功后才设置标志
+                            xSemaphoreGive(ctx.state_mutex);
+                        } else {
+                            xSemaphoreGive(ctx.state_mutex);
                             ESP_LOGE(TAG, "创建重连任务失败，进入AP模式");
-                            // 创建失败时重置标志
-                            if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                                ctx.reconnect_active = false;
-                                xSemaphoreGive(ctx.state_mutex);
-                            }
                             // 进入AP模式作为降级处理
                             set_state(WIFI_STATE_DISCONNECTED);
                             wifi_manager_start_ap_mode();

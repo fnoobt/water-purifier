@@ -11,8 +11,6 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "water_purifier_fsm.h"  // FSM模块
-#include "wifi_manager.h"        // WiFi模块
 
 static const char *TAG = "PM";
 
@@ -131,9 +129,10 @@ esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
     }
 
     if (current_idx < 0) {
-        // 当前功率不在表中，默认使用最大功率档
-        current_idx = PWR_TABLE_SIZE - 1;
-        ESP_LOGD(TAG, "当前功率%d(%.2fdBm)不在表中，默认最大档",
+        // 当前功率不在表中（可能被外部修改），默认使用中间档位(15dBm=60)
+        // 选择中间档位而非最大功率，避免功耗过高；后续滞回算法会自动调整到合适档位
+        current_idx = 2;  // 15dBm档
+        ESP_LOGD(TAG, "当前功率%d(%.2fdBm)不在表中，默认中间档位15dBm",
                  actual_power, actual_power / 4.0f);
     }
 
@@ -188,16 +187,18 @@ esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
         return ret;
     }
 
-    // 更新状态并重置计数器
+    // 更新状态并重置计数器（在spinlock内重新验证当前功率，防止并发修改）
     taskENTER_CRITICAL(&pm_spinlock);
     s_ctx.current_wifi_tx_power = new_power;
     s_ctx.wifi_tx_adjusted = true;
     s_ctx.pending_direction = 0;
     s_ctx.pending_count = 0;
+    // 更新日志所需的功率值（使用spinlock内的实际值，而非函数开头读取的值）
+    uint8_t old_power_log = s_pwr_table[current_idx].tx_qdbm;
     taskEXIT_CRITICAL(&pm_spinlock);
 
     ESP_LOGI(TAG, "WiFi TX功率调整: RSSI=%ddBm, %ddBm→%ddBm (连续3次确认)",
-             rssi, s_pwr_table[current_idx].tx_dbm, s_pwr_table[new_idx].tx_dbm);
+             rssi, old_power_log / 4, s_pwr_table[new_idx].tx_dbm);
     return ESP_OK;
 }
 
@@ -208,23 +209,15 @@ esp_err_t pm_manager_check_heap(void)
     size_t free_heap = esp_get_free_heap_size();
     size_t min_ever_heap = esp_get_minimum_free_heap_size();
 
-    // 低于15KB立即重启（先清理关键资源，避免重启过程中访问已释放资源）
+    // 低于15KB立即重启（直接重启，不尝试清理资源）
+    // 原因：内存严重不足时 fsm_send_event/wifi_manager_stop 等函数自身需要分配内存，
+    // 极可能失败；且100ms延时不足以让复杂任务退出，反而增加卡死风险。
+    // esp_restart() 由 ROM bootloader 执行，不依赖堆内存，是最可靠的重启方式。
     if (free_heap < 15360) {
-        ESP_LOGE(TAG, "堆内存严重不足! 可用=%u bytes, 历史最低=%u bytes, 先停止关键任务再重启",
+        ESP_LOGE(TAG, "堆内存严重不足! 可用=%u bytes, 历史最低=%u bytes, 立即重启",
                  (unsigned)free_heap, (unsigned)min_ever_heap);
-
-        // 停止FSM任务（避免重启过程中FSM继续操作硬件）
-        fsm_send_event(FSM_EVENT_SHUTDOWN);
-
-        // 停止WiFi（避免重启过程中网络操作）
-        wifi_manager_stop();
-
-        // 短暂延时让任务退出
-        vTaskDelay(pdMS_TO_TICKS(100));
-
-        ESP_LOGE(TAG, "资源清理完成，执行重启");
         esp_restart();
-        return ESP_ERR_NO_MEM;
+        return ESP_ERR_NO_MEM;  // 不可达，保持函数完整性
     }
 
     // 低于30KB告警

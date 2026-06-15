@@ -1,21 +1,23 @@
 /**
  * @file app_mqtt.h
- * @brief 本地MQTT客户端模块接口（重命名版本，避免与ESP-IDF头文件冲突）
- * @note 这是本地mqtt_client.h的别名，用于避免与ESP-IDF的mqtt_client.h冲突
+ * @brief MQTT客户端模块公共类型定义
+ * @note 使用app_前缀避免与ESP-IDF系统mqtt_client.h类型冲突
+ *       实现函数使用mqtt_client_*命名（见app_mqtt_public.h / mqtt_client.c）
  */
 
 #ifndef APP_MQTT_H
 #define APP_MQTT_H
 
-// 直接包含本地mqtt_client.h的内容，但使用不同的include guard
-#define MQTT_CLIENT_H_SKIP_INCLUDE 1
+#include <stdint.h>
+#include <stdbool.h>
+#include "esp_err.h"
 
-// 包含ESP-IDF的MQTT客户端头文件
-#include "mqtt_client.h"  // 系统ESP-IDF MQTT客户端
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-#undef MQTT_CLIENT_H_SKIP_INCLUDE
+// ==================== 公共类型定义 ====================
 
-// 重新定义本地类型，使用app_前缀避免冲突
 typedef struct {
     char broker_uri[128];        // Broker URI (mqtt://host:port)
     char client_id[64];          // 客户端ID
@@ -46,34 +48,8 @@ typedef struct {
 typedef void (*app_mqtt_message_callback_t)(const char *topic, const char *data, uint32_t data_len);
 typedef void (*app_mqtt_connection_callback_t)(bool connected);
 
-// 函数声明 - 使用app_前缀
-esp_err_t app_mqtt_client_init(void);
-esp_err_t app_mqtt_client_deinit(void);
-esp_err_t app_mqtt_client_start(void);
-esp_err_t app_mqtt_client_stop(void);
-esp_err_t app_mqtt_client_set_config(const app_mqtt_config_t *config);
-esp_err_t app_mqtt_client_get_config(app_mqtt_config_t *config);
-esp_err_t app_mqtt_client_connect(void);
-esp_err_t app_mqtt_client_disconnect(void);
-esp_err_t app_mqtt_client_publish(const char *topic, const char *data, uint32_t len, uint8_t qos, bool retain);
-esp_err_t app_mqtt_publish_purifier_status(void);
-esp_err_t app_mqtt_publish_tds_value(void);
-esp_err_t app_mqtt_publish_system_status(void);
-esp_err_t app_mqtt_client_subscribe(const char *topic, uint8_t qos);
-esp_err_t app_mqtt_client_unsubscribe(const char *topic);
-esp_err_t app_mqtt_subscribe_control_topics(void);
-app_mqtt_state_t app_mqtt_client_get_state(void);
-bool app_mqtt_client_is_connected(void);
-esp_err_t app_mqtt_client_register_message_callback(app_mqtt_message_callback_t callback);
-esp_err_t app_mqtt_client_register_connection_callback(app_mqtt_connection_callback_t callback);
-esp_err_t app_mqtt_client_save_config(void);
-esp_err_t app_mqtt_client_load_config(void);
-esp_err_t app_mqtt_client_clear_config(void);
-bool app_mqtt_client_has_saved_config(void);
-esp_err_t app_mqtt_send_ha_discovery(void);
-esp_err_t app_mqtt_send_ha_sensor_config(const char *sensor_name, const char *sensor_type, const char *unit);
-esp_err_t app_mqtt_send_ha_switch_config(const char *switch_name);
-esp_err_t app_mqtt_client_get_status(char *buffer, size_t buffer_size);
-void app_mqtt_client_print_info(void);
+#ifdef __cplusplus
+}
+#endif
 
 #endif // APP_MQTT_H

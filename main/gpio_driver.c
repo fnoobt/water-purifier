@@ -15,7 +15,7 @@
 static const char *TAG = "GPIO_DRIVER";
 
 // ==================== 防抖配置 ====================
-#define DEBOUNCE_MS 50  // 防抖稳定时间(毫秒)
+// 使用 gpio_config.h 中的 GPIO_DEBOUNCE_TIME_MS (50ms)
 
 // ==================== 内部状态 ====================
 
@@ -281,8 +281,8 @@ static bool debounced_read(gpio_num_t pin, int idx)
         debounce_ctx.last_raw_state[idx] = raw;
         debounce_ctx.last_change_time[idx] = now;
     }
-    // 状态稳定超过DEBOUNCE_MS：更新防抖状态
-    else if (now - debounce_ctx.last_change_time[idx] >= DEBOUNCE_MS) {
+    // 状态稳定超过GPIO_DEBOUNCE_TIME_MS：更新防抖状态
+    else if (now - debounce_ctx.last_change_time[idx] >= GPIO_DEBOUNCE_TIME_MS) {
         debounce_ctx.debounced_state[idx] = (raw == 0);
     }
 
@@ -351,6 +351,22 @@ static inline uint8_t safe_get_trigger_level(void)
     return level;
 }
 
+/**
+ * @brief 带重试的mutex获取（确保硬件状态与软件状态一致）
+ * @return true 获取成功
+ */
+static inline bool output_mutex_take_with_retry(void)
+{
+    if (!output_mutex) return false;
+    // 重试3次，每次50ms，总计最多150ms
+    for (int i = 0; i < 3; i++) {
+        if (xSemaphoreTake(output_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            return true;
+        }
+    }
+    return false;
+}
+
 esp_err_t gpio_driver_set_inlet_valve(bool state)
 {
     uint8_t trigger = safe_get_trigger_level();
@@ -359,14 +375,12 @@ esp_err_t gpio_driver_set_inlet_valve(bool state)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "进水阀GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
-        // GPIO设置成功后必须更新状态（保持硬件与内存一致）
-        if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        // GPIO设置成功后必须更新状态（保持硬件与内存一致），重试确保成功
+        if (output_mutex_take_with_retry()) {
             output_state.inlet_valve = state;
             xSemaphoreGive(output_mutex);
         } else {
-            // mutex获取失败时仍需更新状态（非关键数据，降级处理）
-            output_state.inlet_valve = state;
-            ESP_LOGD(TAG, "进水阀状态更新无锁");
+            ESP_LOGE(TAG, "进水阀mutex获取失败(重试3次)，硬件与软件状态可能不一致");
         }
         ESP_LOGD(TAG, "进水阀: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
@@ -381,13 +395,11 @@ esp_err_t gpio_driver_set_waste_valve(bool state)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "废水阀GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
-        // GPIO设置成功后必须更新状态（保持硬件与内存一致）
-        if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (output_mutex_take_with_retry()) {
             output_state.waste_valve = state;
             xSemaphoreGive(output_mutex);
         } else {
-            output_state.waste_valve = state;
-            ESP_LOGD(TAG, "废水阀状态更新无锁");
+            ESP_LOGE(TAG, "废水阀mutex获取失败(重试3次)，硬件与软件状态可能不一致");
         }
         ESP_LOGD(TAG, "废水阀: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
@@ -402,13 +414,11 @@ esp_err_t gpio_driver_set_return_valve(bool state)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "回水阀GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
-        // GPIO设置成功后必须更新状态（保持硬件与内存一致）
-        if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (output_mutex_take_with_retry()) {
             output_state.return_valve = state;
             xSemaphoreGive(output_mutex);
         } else {
-            output_state.return_valve = state;
-            ESP_LOGD(TAG, "回水阀状态更新无锁");
+            ESP_LOGE(TAG, "回水阀mutex获取失败(重试3次)，硬件与软件状态可能不一致");
         }
         ESP_LOGD(TAG, "回水阀: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
@@ -423,13 +433,11 @@ esp_err_t gpio_driver_set_boost_pump(bool state)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "增压泵GPIO写入失败: %s (期望=%d)", esp_err_to_name(ret), level);
     } else {
-        // GPIO设置成功后必须更新状态（保持硬件与内存一致）
-        if (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (output_mutex_take_with_retry()) {
             output_state.boost_pump = state;
             xSemaphoreGive(output_mutex);
         } else {
-            output_state.boost_pump = state;
-            ESP_LOGD(TAG, "增压泵状态更新无锁");
+            ESP_LOGE(TAG, "增压泵mutex获取失败(重试3次)，硬件与软件状态可能不一致");
         }
         ESP_LOGD(TAG, "增压泵: %s (GPIO=%d)", state ? "开启" : "关闭", level);
     }
@@ -440,27 +448,30 @@ esp_err_t gpio_driver_emergency_stop(void)
 {
     ESP_LOGW(TAG, "紧急停止！关闭所有输出设备");
 
-    /* 紧急停止必须快速可靠执行：
-     * 尝试获取mutex，如果失败仍继续执行（紧急操作优先保证响应速度）
-     * 无论mutex是否获取成功，GPIO输出立即关闭 */
-    bool mutex_acquired = (output_mutex && xSemaphoreTake(output_mutex, pdMS_TO_TICKS(5)) == pdTRUE);
-
     uint8_t trigger = safe_get_trigger_level();
     int inactive_level = calc_output_level_with_trigger(false, trigger);
 
-    /* 先设置GPIO（硬件优先），再更新内部状态 */
+    /* 先设置GPIO（硬件优先），确保紧急响应速度 */
     gpio_set_level(GPIO_INLET_VALVE, inactive_level);
     gpio_set_level(GPIO_WASTE_VALVE, inactive_level);
     gpio_set_level(GPIO_RETURN_VALVE, inactive_level);
     gpio_set_level(GPIO_BOOST_PUMP, inactive_level);
 
-    output_state.inlet_valve = false;
-    output_state.waste_valve = false;
-    output_state.return_valve = false;
-    output_state.boost_pump = false;
-
-    if (mutex_acquired) {
+    /* 使用重试机制更新软件状态，确保与硬件一致 */
+    if (output_mutex && output_mutex_take_with_retry()) {
+        output_state.inlet_valve = false;
+        output_state.waste_valve = false;
+        output_state.return_valve = false;
+        output_state.boost_pump = false;
         xSemaphoreGive(output_mutex);
+    } else {
+        /* 最终降级：直接写（硬件已关闭，软件状态短暂不一致）
+         * 软件状态将在下次gpio_driver_set_*调用时通过mutex恢复一致 */
+        output_state.inlet_valve = false;
+        output_state.waste_valve = false;
+        output_state.return_valve = false;
+        output_state.boost_pump = false;
+        ESP_LOGE(TAG, "emergency_stop: mutex重试失败，软件状态已直接更新（下次操作时恢复一致）");
     }
 
     return ESP_OK;
@@ -478,6 +489,7 @@ esp_err_t gpio_driver_set_led1(bool state)
             xSemaphoreGive(output_mutex);
         } else {
             // 降级处理：LED状态非关键，直接更新
+            // ESP32-C3单核：bool赋值无并发写入风险，降级安全
             output_state.led1 = state;
         }
     }
@@ -494,19 +506,11 @@ esp_err_t gpio_driver_set_led2(bool state)
             xSemaphoreGive(output_mutex);
         } else {
             // 降级处理：LED状态非关键，直接更新
+            // ESP32-C3单核：bool赋值无并发写入风险，降级安全
             output_state.led2 = state;
         }
     }
     return ret;
-}
-
-esp_err_t gpio_driver_set_led_mode(uint8_t led_num, led_mode_t mode)
-{
-    // LED模式由LED控制任务处理，这里仅设置基本状态
-    // 实际闪烁逻辑在water_purifier_fsm.c中实现
-    (void)led_num;
-    (void)mode;
-    return ESP_OK;
 }
 
 // ==================== 状态查询函数 ====================

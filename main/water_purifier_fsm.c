@@ -39,23 +39,25 @@ static const char *TAG = "FSM";
 static portMUX_TYPE fsm_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 // ==================== 配置参数 ====================
+// 注：以下默认值与 config_manager.c 的 default_config 保持一致，
+// 启动时由 fsm_set_*() 用 config 值覆盖，此处仅作为 fallback。
 
-#define PRODUCTION_TIMEOUT_DEFAULT_SEC   (3 * 3600)  // 3小时
-#define NORMAL_FLUSH_DURATION_DEFAULT_SEC 20         // 常规冲洗20秒
-#define PURE_FLUSH_DURATION_DEFAULT_SEC   15         // 纯水洗膜15秒
-#define FILTER_FLUSH_DURATION_DEFAULT_SEC 1200       // 换芯冲洗1200秒（20分钟）
-#define LEAK_CONFIRM_TIME_DEFAULT_SEC     5          // 漏水确认5秒
-#define CHECK_INTERVAL_MS                 100        // 状态检查间隔
-#define LED_BLINK_SLOW_MS                 1000       // 慢闪周期
-#define LED_BLINK_FAST_MS                 200        // 快闪周期
+#define PRODUCTION_TIMEOUT_DEFAULT_SEC   (3 * 3600)
+#define NORMAL_FLUSH_DURATION_DEFAULT_SEC 20
+#define PURE_FLUSH_DURATION_DEFAULT_SEC   15
+#define FILTER_FLUSH_DURATION_DEFAULT_SEC 1200
+#define LEAK_CONFIRM_TIME_DEFAULT_SEC     5
+#define CHECK_INTERVAL_MS                 100
+#define LED_BLINK_SLOW_MS                 1000
+#define LED_BLINK_FAST_MS                 200
 
 // 水锤默认延时
-#define WATER_HAMMER_VALVE_OPEN_DELAY_MS  1000       // 开阀延时1秒
-#define WATER_HAMMER_PUMP_STOP_DELAY_MS   1000       // 停泵延时1秒
-#define WATER_HAMMER_VALVE_CLOSE_DELAY_MS 500        // 关阀延时0.5秒
+#define WATER_HAMMER_VALVE_OPEN_DELAY_MS  1000
+#define WATER_HAMMER_PUMP_STOP_DELAY_MS   1000
+#define WATER_HAMMER_VALVE_CLOSE_DELAY_MS 500
 
 // 短制水判断阈值
-#define SHORT_PRODUCTION_THRESHOLD_SEC    180        // 3分钟
+#define SHORT_PRODUCTION_THRESHOLD_SEC    180
 
 // 冲洗阶段（用于水锤延时控制）
 typedef enum {
@@ -135,6 +137,8 @@ static struct {
 static void transition_to(fsm_state_t new_state);
 static uint64_t get_elapsed_sec(uint64_t start_time);
 static uint64_t get_elapsed_ms(uint64_t start_time);
+static uint64_t accumulate_production_water(bool clear_timer, bool update_daily, uint64_t *out_duration_sec);
+static uint64_t accumulate_flush_water(bool clear_timer, bool update_daily);
 
 // ==================== LED控制 ====================
 
@@ -178,7 +182,7 @@ static void led_set_mode(led_blink_mode_t mode)
         return;
     }
 
-    // 闪烁模式：检查是否需要切换（spinlock保护）
+    // 闪烁模式：检查是否需要切换（spinlock保护状态和GPIO写入的一致性）
     taskENTER_CRITICAL(&fsm_spinlock);
     if (led_blink_ctx.current_mode != mode) {
         // 模式切换，重置状态
@@ -195,12 +199,11 @@ static void led_set_mode(led_blink_mode_t mode)
         led_blink_ctx.last_toggle_ms = now_ms;
     }
 
-    bool led1 = led_blink_ctx.led1_state;
-    bool led2 = led_blink_ctx.led2_state;
+    // GPIO写入在spinlock内完成，确保硬件输出与软件状态严格一致
+    // ESP32-C3单核：gpio_set_level执行极快（直接寄存器写入），不会显著增加临界区时间
+    gpio_driver_set_led1(led_blink_ctx.led1_state);
+    gpio_driver_set_led2(led_blink_ctx.led2_state);
     taskEXIT_CRITICAL(&fsm_spinlock);
-
-    gpio_driver_set_led1(led1);
-    gpio_driver_set_led2(led2);
 }
 
 // 保持原有接口兼容性（调用通用函数）
@@ -364,19 +367,9 @@ static void record_stop(stop_type_t type, const char *description)
 
         xSemaphoreGive(fsm_ctx.runtime_data_mutex);
     } else {
-        /* mutex获取失败，仍需记录（降级处理） */
-        ESP_LOGW(TAG, "record_stop: mutex获取失败，无锁记录");
-        fsm_ctx.runtime_data.last_stop_type = type;
-        fsm_ctx.runtime_data.last_stop_time = esp_timer_get_time();
-
-        uint32_t idx = fsm_ctx.stop_history_index % 16;
-        fsm_ctx.stop_history[idx].type = type;
-        fsm_ctx.stop_history[idx].timestamp = esp_timer_get_time();
-        size_t desc_len = strlen(description);
-        size_t copy_len = (desc_len < 63) ? desc_len : 63;
-        memcpy(fsm_ctx.stop_history[idx].description, description, copy_len);
-        fsm_ctx.stop_history[idx].description[copy_len] = '\0';
-        fsm_ctx.stop_history_index++;
+        /* mutex获取失败，丢弃本次记录以保证数据一致性
+         * 在单核ESP32-C3上mutex失败概率极低，偶尔丢失一条停止记录可接受 */
+        ESP_LOGW(TAG, "record_stop: mutex获取失败，丢弃记录: %s", description);
     }
 
     ESP_LOGE(TAG, "停止记录: %s", description);
@@ -417,41 +410,8 @@ static void transition_to(fsm_state_t new_state)
     /* 进入报警/停止/缺水状态时，先累计未统计的水量再清除计时器 */
     if (new_state == FSM_STATE_LEAK_ALARM || new_state == FSM_STATE_STOP ||
         new_state == FSM_STATE_WATER_SHORTAGE) {
-        float ro_rate = fsm_get_production_rate_lph();
-        float waste_rate = filter_mgr_get_waste_flow_lph();
-        float pre_rate = ro_rate + waste_rate;
-        if (fsm_ctx.production_start_time > 0) {
-            uint64_t duration = get_elapsed_sec(fsm_ctx.production_start_time);
-            float pre_liters = (float)duration * pre_rate / 3600.0f;
-            float post_liters = (float)duration * ro_rate / 3600.0f;
-            if (pre_liters > 0.1f || post_liters > 0.1f) {
-                filter_mgr_update_water_usage_dual(pre_liters, post_liters);
-            }
-            fsm_ctx.production_start_time = 0;
-            fsm_ctx.runtime_dirty = true;
-        }
-        // 冲洗水量（换芯冲洗和普通冲洗互斥）
-        if (fsm_ctx.filter_flush_start > 0 && fsm_ctx.filter_flush_mode) {
-            uint64_t total_elapsed = get_elapsed_sec(fsm_ctx.filter_flush_start);
-            float pump_rate = filter_mgr_get_pump_flow_lph();
-            float pre_liters = (float)total_elapsed * pump_rate / 3600.0f;
-            if (pre_liters > 0.1f) {
-                filter_mgr_update_water_usage_dual(pre_liters, 0.0f);
-            }
-            fsm_ctx.runtime_data.total_flush_time_sec += total_elapsed;
-            fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
-            fsm_ctx.filter_flush_start = 0;
-        } else if (fsm_ctx.flush_start_time > 0) {
-            uint64_t flush_sec = get_elapsed_sec(fsm_ctx.flush_start_time);
-            float pump_rate = filter_mgr_get_pump_flow_lph();
-            float pre_liters = (float)flush_sec * pump_rate / 3600.0f;
-            if (pre_liters > 0.1f) {
-                filter_mgr_update_water_usage_dual(pre_liters, 0.0f);
-            }
-            fsm_ctx.runtime_data.total_flush_time_sec += flush_sec;
-            fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
-            fsm_ctx.flush_start_time = 0;
-        }
+        accumulate_production_water(true, false, NULL);
+        accumulate_flush_water(true, false);
     }
 
     /* 常规冲洗 -> 纯水洗膜：包含冲洗时长 */
@@ -524,6 +484,93 @@ static uint64_t get_elapsed_ms(uint64_t start_time)
     return (esp_timer_get_time() - start_time) / 1000;
 }
 
+// ==================== 水量统计公共函数 ====================
+
+/**
+ * @brief 统计当前制水周期的水量并累加到滤芯寿命
+ * @param clear_timer true=清除计时器和dirty标志, false=仅统计不清除
+ * @param update_daily true=同时更新每日制水统计
+ * @param out_duration_sec 输出制水时长（秒），可为NULL
+ * @return 制水时长（秒），0表示未在计时
+ */
+static uint64_t accumulate_production_water(bool clear_timer, bool update_daily, uint64_t *out_duration_sec)
+{
+    if (fsm_ctx.production_start_time == 0) {
+        if (out_duration_sec) *out_duration_sec = 0;
+        return 0;
+    }
+
+    uint64_t duration = get_elapsed_sec(fsm_ctx.production_start_time);
+    float ro_rate = fsm_get_production_rate_lph();
+    float waste_rate = filter_mgr_get_waste_flow_lph();
+    float pre_rate = ro_rate + waste_rate;
+    float pre_liters = (float)duration * pre_rate / 3600.0f;
+    float post_liters = (float)duration * ro_rate / 3600.0f;
+
+    if (pre_liters > 0.1f || post_liters > 0.1f) {
+        filter_mgr_update_water_usage_dual(pre_liters, post_liters);
+        if (update_daily) {
+            history_update_daily_production((uint32_t)duration);
+        }
+    }
+
+    if (clear_timer) {
+        fsm_ctx.production_start_time = 0;
+        fsm_ctx.runtime_dirty = true;
+    }
+
+    if (out_duration_sec) *out_duration_sec = duration;
+    return duration;
+}
+
+/**
+ * @brief 统计当前冲洗周期的水量并累加到滤芯寿命
+ * @param clear_timer true=清除计时器并更新冲洗时间统计
+ * @param update_daily true=同时递增每日冲洗计数
+ * @return 冲洗时长（秒），0表示未在计时
+ */
+static uint64_t accumulate_flush_water(bool clear_timer, bool update_daily)
+{
+    uint64_t flush_sec = 0;
+
+    // 换芯冲洗和普通冲洗互斥
+    if (fsm_ctx.filter_flush_start > 0 && fsm_ctx.filter_flush_mode) {
+        flush_sec = get_elapsed_sec(fsm_ctx.filter_flush_start);
+        float pump_rate = filter_mgr_get_pump_flow_lph();
+        float pre_liters = (float)flush_sec * pump_rate / 3600.0f;
+        if (pre_liters > 0.1f) {
+            filter_mgr_update_water_usage_dual(pre_liters, 0.0f);
+        }
+        if (clear_timer) {
+            fsm_ctx.runtime_data.total_flush_time_sec += flush_sec;
+            fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
+            fsm_ctx.filter_flush_start = 0;
+        }
+    } else if (fsm_ctx.flush_start_time > 0) {
+        flush_sec = get_elapsed_sec(fsm_ctx.flush_start_time);
+        float pump_rate = filter_mgr_get_pump_flow_lph();
+        float pre_liters = (float)flush_sec * pump_rate / 3600.0f;
+        if (pre_liters > 0.1f) {
+            filter_mgr_update_water_usage_dual(pre_liters, 0.0f);
+        }
+        if (clear_timer) {
+            fsm_ctx.runtime_data.total_flush_time_sec += flush_sec;
+            fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
+            fsm_ctx.flush_start_time = 0;
+        }
+    } else {
+        return 0;
+    }
+
+    if (clear_timer) {
+        if (update_daily) {
+            history_increment_daily_flush();
+        }
+    }
+
+    return flush_sec;
+}
+
 // ==================== 状态执行函数 ====================
 
 static void execute_standby(void)
@@ -533,26 +580,14 @@ static void execute_standby(void)
         fsm_ctx.state_init_done = true;
     }
 
-    // 更新制水时间统计
-    if (fsm_ctx.production_start_time > 0) {
-        uint64_t duration = get_elapsed_sec(fsm_ctx.production_start_time);
-        fsm_ctx.runtime_data.total_production_time_sec += duration;
-        fsm_ctx.production_start_time = 0;
-
-        // 计算用水量（区分泵前后滤芯）
-        float ro_rate = fsm_get_production_rate_lph();
-        float waste_rate = filter_mgr_get_waste_flow_lph();
-        float pre_rate = ro_rate + waste_rate;
-        float pre_liters = (float)duration * pre_rate / 3600.0f;
-        float post_liters = (float)duration * ro_rate / 3600.0f;
-
-        if (pre_liters > 0.1f || post_liters > 0.1f) {
-            filter_mgr_update_water_usage_dual(pre_liters, post_liters);
-            history_update_daily_production((uint32_t)duration);
-            ESP_LOGD(TAG, "水量更新: %.1f 升(RO), 前三级 %.1f 升", post_liters, pre_liters);
+    // 更新制水时间统计（异常恢复场景：production_start_time未清零就进入待机）
+    {
+        uint64_t prod_dur = 0;
+        accumulate_production_water(true, true, &prod_dur);
+        if (prod_dur > 0) {
+            fsm_ctx.runtime_data.total_production_time_sec += prod_dur;
+            ESP_LOGD(TAG, "待机时补充统计制水: %llu秒", prod_dur);
         }
-
-        fsm_ctx.runtime_dirty = true;
     }
 }
 
@@ -594,23 +629,11 @@ static void execute_tank_full(void)
         // 注意：transition_to已处理PRODUCTION→TANK_FULL的水量统计，
         // 这里检查production_start_time是否已清零，避免重复统计
         if (fsm_ctx.production_start_time > 0) {
-            uint64_t prod_sec = get_elapsed_sec(fsm_ctx.production_start_time);
-            fsm_ctx.runtime_data.total_production_time_sec += prod_sec;
-
-            // 计算用水量（区分泵前后滤芯）
-            float ro_rate = fsm_get_production_rate_lph();
-            float waste_rate = filter_mgr_get_waste_flow_lph();
-            float pre_rate = ro_rate + waste_rate;
-            float pre_liters = (float)prod_sec * pre_rate / 3600.0f;
-            float post_liters = (float)prod_sec * ro_rate / 3600.0f;
-
-            if (pre_liters > 0.1f || post_liters > 0.1f) {
-                filter_mgr_update_water_usage_dual(pre_liters, post_liters);
-                history_update_daily_production((uint32_t)prod_sec);
-                // transition_to已打印水满统计，此处不重复
+            uint64_t prod_dur = 0;
+            accumulate_production_water(true, false, &prod_dur);
+            if (prod_dur > 0) {
+                fsm_ctx.runtime_data.total_production_time_sec += prod_dur;
             }
-
-            fsm_ctx.runtime_dirty = true;
         }
 
         // 短制水判断（transition_to已设置，这里补充prod_sec=0的情况）
@@ -669,20 +692,14 @@ static void execute_normal_flush(void)
                 if (total_elapsed >= fsm_ctx.filter_flush_duration_sec) {
                     ESP_LOGI(TAG, "换芯冲洗完成，总时长: %lu秒", (uint32_t)total_elapsed);
 
-                    // 换芯冲洗水量计入前三级滤芯（使用总时长而非单轮时长）
-                    if (fsm_ctx.filter_flush_start > 0) {
+                    // 换芯冲洗水量统计
+                    uint64_t flush_dur_sec = accumulate_flush_water(true, true);
+                    if (flush_dur_sec > 0) {
                         float pump_rate = filter_mgr_get_pump_flow_lph();
-                        float pre_liters = (float)total_elapsed * pump_rate / 3600.0f;
-                        if (pre_liters > 0.1f) {
-                            filter_mgr_update_water_usage_dual(pre_liters, 0.0f);
-                            ESP_LOGI(TAG, "换芯冲洗总过水: %.1f 升（前三级）", pre_liters);
-                        }
-                        // 同步冲洗时间统计
-                        fsm_ctx.runtime_data.total_flush_time_sec += total_elapsed;
-                        fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
-                        fsm_ctx.runtime_dirty = true;
+                        float pre_liters = (float)flush_dur_sec * pump_rate / 3600.0f;
+                        ESP_LOGI(TAG, "换芯冲洗总过水: %.1f 升（前三级）", pre_liters);
                     }
-                    history_increment_daily_flush();
+                    fsm_ctx.runtime_dirty = true;
 
                     fsm_ctx.filter_flush_mode = false;
                     stop_all_outputs();
@@ -698,21 +715,17 @@ static void execute_normal_flush(void)
 
             ESP_LOGD(TAG, "常规冲洗完成，进入纯水洗膜过渡");
 
-            // 常规冲洗水量计入前三级滤芯（后两级不经过）
-            if (fsm_ctx.flush_start_time > 0) {
-                uint64_t flush_sec = get_elapsed_sec(fsm_ctx.flush_start_time);
+            // 常规冲洗水量统计
+            uint64_t flush_dur_sec = accumulate_flush_water(true, false);
+            if (flush_dur_sec > 0) {
                 float pump_rate = filter_mgr_get_pump_flow_lph();
-                float pre_liters = (float)flush_sec * pump_rate / 3600.0f;
-                if (pre_liters > 0.1f) {
-                    filter_mgr_update_water_usage_dual(pre_liters, 0.0f);
-                    ESP_LOGD(TAG, "本次冲洗: 前三级过水 %.1f 升", pre_liters);
-                }
-                // 同步冲洗时间统计
-                fsm_ctx.runtime_data.total_flush_time_sec += flush_sec;
-                fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
-                fsm_ctx.runtime_dirty = true;
+                float pre_liters = (float)flush_dur_sec * pump_rate / 3600.0f;
+                ESP_LOGD(TAG, "本次冲洗: 前三级过水 %.1f 升", pre_liters);
             }
-            history_increment_daily_flush();
+            fsm_ctx.runtime_dirty = true;
+            // 注意：此处不调用 history_increment_daily_flush()
+            // 完整冲洗周期（常规+纯水）的每日计数由 execute_pure_flush 完成时统一递增，
+            // 避免一次完整冲洗被计为两次
 
             transition_to_pure_flush();
         }
@@ -1048,48 +1061,18 @@ static void fsm_task(void *arg)
                 // 网页面板：切换到待机（任意状态可切入）
                 ESP_LOGI(TAG, "网页控制：切换到待机");
                 // 清理未统计的制水/冲洗时间
-                if (fsm_ctx.production_start_time > 0) {
-                    uint64_t duration = get_elapsed_sec(fsm_ctx.production_start_time);
-                    fsm_ctx.runtime_data.total_production_time_sec += duration;
-
-                    float ro_rate = fsm_get_production_rate_lph();
-                    float waste_rate = filter_mgr_get_waste_flow_lph();
-                    float pre_rate = ro_rate + waste_rate;
-                    float pre_liters = (float)duration * pre_rate / 3600.0f;
-                    float post_liters = (float)duration * ro_rate / 3600.0f;
-
-                    if (pre_liters > 0.1f || post_liters > 0.1f) {
-                        filter_mgr_update_water_usage_dual(pre_liters, post_liters);
-                        history_update_daily_production((uint32_t)duration);
+                {
+                    uint64_t prod_dur = 0;
+                    accumulate_production_water(true, true, &prod_dur);
+                    if (prod_dur > 0) {
+                        fsm_ctx.runtime_data.total_production_time_sec += prod_dur;
                     }
-                    fsm_ctx.production_start_time = 0;
-                    fsm_ctx.runtime_dirty = true;
                 }
-                // 冲洗时间统计（换芯冲洗和普通冲洗互斥，避免重复计数）
-                if (fsm_ctx.filter_flush_start > 0 && fsm_ctx.filter_flush_mode) {
-                    // 换芯冲洗中断：使用总时长（已包含当前轮次）
-                    uint64_t total_elapsed = get_elapsed_sec(fsm_ctx.filter_flush_start);
-                    float pump_rate = filter_mgr_get_pump_flow_lph();
-                    float pre_liters = (float)total_elapsed * pump_rate / 3600.0f;
-                    if (pre_liters > 0.1f) {
-                        filter_mgr_update_water_usage_dual(pre_liters, 0.0f);
+                {
+                    uint64_t flush_dur = accumulate_flush_water(true, true);
+                    if (flush_dur > 0) {
+                        // flush time already accumulated inside helper
                     }
-                    fsm_ctx.runtime_data.total_flush_time_sec += total_elapsed;
-                    fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
-                    history_increment_daily_flush();
-                    fsm_ctx.filter_flush_start = 0;
-                } else if (fsm_ctx.flush_start_time > 0) {
-                    // 普通冲洗中断：仅记录当前轮次
-                    uint64_t flush_sec = get_elapsed_sec(fsm_ctx.flush_start_time);
-                    float pump_rate = filter_mgr_get_pump_flow_lph();
-                    float pre_liters = (float)flush_sec * pump_rate / 3600.0f;
-                    if (pre_liters > 0.1f) {
-                        filter_mgr_update_water_usage_dual(pre_liters, 0.0f);
-                    }
-                    fsm_ctx.runtime_data.total_flush_time_sec += flush_sec;
-                    fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
-                    history_increment_daily_flush();
-                    fsm_ctx.flush_start_time = 0;
                 }
                 stop_all_outputs();
                 fsm_ctx.leak_detected = false;
@@ -1100,46 +1083,14 @@ static void fsm_task(void *arg)
             } else if (event == FSM_EVENT_SHUTDOWN) {
                 // 网页面板：停机（进入停止前先累计未统计的水量）
                 ESP_LOGI(TAG, "网页控制：停机");
-                if (fsm_ctx.production_start_time > 0) {
-                    uint64_t duration = get_elapsed_sec(fsm_ctx.production_start_time);
-                    fsm_ctx.runtime_data.total_production_time_sec += duration;  // 累计制水时间
-
-                    float ro_rate = fsm_get_production_rate_lph();
-                    float waste_rate = filter_mgr_get_waste_flow_lph();
-                    float pre_rate = ro_rate + waste_rate;
-                    float pre_liters = (float)duration * pre_rate / 3600.0f;
-                    float post_liters = (float)duration * ro_rate / 3600.0f;
-                    if (pre_liters > 0.1f || post_liters > 0.1f) {
-                        filter_mgr_update_water_usage_dual(pre_liters, post_liters);
-                        history_update_daily_production((uint32_t)duration);  // 添加日志统计
+                {
+                    uint64_t prod_dur = 0;
+                    accumulate_production_water(true, true, &prod_dur);
+                    if (prod_dur > 0) {
+                        fsm_ctx.runtime_data.total_production_time_sec += prod_dur;
                     }
-                    fsm_ctx.production_start_time = 0;
-                    fsm_ctx.runtime_dirty = true;
                 }
-                // 冲洗水量统计（换芯冲洗和普通冲洗互斥）
-                if (fsm_ctx.filter_flush_start > 0 && fsm_ctx.filter_flush_mode) {
-                    uint64_t total_elapsed = get_elapsed_sec(fsm_ctx.filter_flush_start);
-                    float pump_rate = filter_mgr_get_pump_flow_lph();
-                    float pre_liters = (float)total_elapsed * pump_rate / 3600.0f;
-                    if (pre_liters > 0.1f) {
-                        filter_mgr_update_water_usage_dual(pre_liters, 0.0f);
-                    }
-                    fsm_ctx.runtime_data.total_flush_time_sec += total_elapsed;
-                    fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
-                    history_increment_daily_flush();  // 添加日志统计
-                    fsm_ctx.filter_flush_start = 0;
-                } else if (fsm_ctx.flush_start_time > 0) {
-                    uint64_t flush_sec = get_elapsed_sec(fsm_ctx.flush_start_time);
-                    float pump_rate = filter_mgr_get_pump_flow_lph();
-                    float pre_liters = (float)flush_sec * pump_rate / 3600.0f;
-                    if (pre_liters > 0.1f) {
-                        filter_mgr_update_water_usage_dual(pre_liters, 0.0f);
-                    }
-                    fsm_ctx.runtime_data.total_flush_time_sec += flush_sec;
-                    fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
-                    history_increment_daily_flush();  // 添加日志统计
-                    fsm_ctx.flush_start_time = 0;
-                }
+                accumulate_flush_water(true, true);
                 stop_all_outputs();
                 transition_to(FSM_STATE_STOP);
             } else if (event == FSM_EVENT_FILTER_FLUSH) {
@@ -1160,6 +1111,9 @@ static void fsm_task(void *arg)
         check_inputs();
 
         // 周期性统一保存（运行数据、滤芯、历史记录）
+        // 注意：NVS写入可能阻塞50-200ms，期间状态检查暂停。
+        // 这在保存间隔（默认120分钟）下是可接受的——状态事件在队列中排队，
+        // 保存完成后立即处理。看门狗在循环开始/结束均重置，不会因NVS阻塞超时。
         periodic_save_counter++;
         uint32_t save_interval_sec = fsm_ctx.runtime_save_interval_min * 60;
         uint32_t save_ticks = save_interval_sec * 1000 / CHECK_INTERVAL_MS;
@@ -1487,15 +1441,29 @@ esp_err_t fsm_get_runtime_data(fsm_runtime_data_t *data)
         xSemaphoreGive(fsm_ctx.runtime_data_mutex);
         return ESP_OK;
     }
+    // mutex超时：清零输出，防止调用方使用栈上的垃圾数据
+    memset(data, 0, sizeof(fsm_runtime_data_t));
+    ESP_LOGW(TAG, "fsm_get_runtime_data: mutex获取超时，返回零值");
     return ESP_ERR_TIMEOUT;
 }
 
 esp_err_t fsm_reset_runtime_data(void)
 {
-    memset(&fsm_ctx.runtime_data, 0, sizeof(fsm_runtime_data_t));
-    fsm_ctx.stop_history_index = 0;
-    ESP_LOGI(TAG, "运行数据已重置");
-    return ESP_OK;
+    /* 使用mutex保护，防止与fsm_get_runtime_data/fsm_get_stop_history并发访问竞态 */
+    if (!fsm_ctx.runtime_data_mutex) {
+        ESP_LOGE(TAG, "运行数据mutex未初始化");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(fsm_ctx.runtime_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memset(&fsm_ctx.runtime_data, 0, sizeof(fsm_runtime_data_t));
+        fsm_ctx.stop_history_index = 0;
+        xSemaphoreGive(fsm_ctx.runtime_data_mutex);
+        ESP_LOGI(TAG, "运行数据已重置");
+        return ESP_OK;
+    }
+    ESP_LOGW(TAG, "fsm_reset_runtime_data: mutex获取超时");
+    return ESP_ERR_TIMEOUT;
 }
 
 esp_err_t fsm_clear_stop(void)

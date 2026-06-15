@@ -147,7 +147,7 @@ WaterPurifier/
 
 **输入防抖**: 50ms去抖时间，首次读取立即返回初始稳定值。
 
-**输出互斥锁**: `output_state` 结构体受 `output_mutex` 保护，防止跨任务访问竞态。
+**输出互斥锁**: `output_state` 结构体受 `output_mutex` 保护，防止跨任务访问竞态。`gpio_driver_set_*` 函数在 GPIO 设置成功后获取 mutex 更新软件状态，若 mutex 获取失败会重试 3 次（每次 50ms，总计最多 150ms），确保硬件状态与软件状态一致。紧急停止函数使用更短超时以优先保证响应速度。
 
 **主要函数**:
 ```c
@@ -268,6 +268,8 @@ typedef struct {
 |--------|------|---------|---------|
 | 前三级（泵前） | PP棉、颗粒碳、压缩碳 | 系统总进水量 | 制水=RO通量+废水流量，冲洗=泵流量 |
 | 后两级（泵后） | RO膜、后置炭 | 纯水产量 | 仅制水=RO通量，冲洗/纯水=0 |
+
+**输入验证**: `filter_mgr_update_water_usage_dual()` 使用 `isfinite()` 排除 NaN/无穷大，并额外检查负数（`< 0.0f`），防止负值转换为 `uint32_t` 时导致整数下溢（如 -0.1 转为 4294967295 mL）。
 
 **首页显示**：
 - **总用水量**：前三级过水量（含制水+冲洗，系统从水源抽取的总量）
@@ -450,6 +452,8 @@ typedef struct {
 
 **周期保存**: FSM任务循环中按配置的保存间隔（默认120分钟，可选10/60/120/240/360/720/1440分钟）统一调用 `config_manager_periodic_save_all()`，协调所有模块脏数据保存。
 
+**水量统计公共函数**: `accumulate_production_water()` 和 `accumulate_flush_water()` 提取了制水/冲洗水量的计算逻辑（流量计算、滤芯累加、计时器清除），消除了 `transition_to`、`execute_standby`、`execute_tank_full`、`execute_normal_flush` 和事件处理器中的 6+ 处重复代码。
+
 **主要函数**:
 ```c
 esp_err_t fsm_init(void);
@@ -495,6 +499,7 @@ esp_err_t fsm_get_status_string(char *buf, size_t buf_size);
 - 路由器恢复后下次WiFi断开时自动重建重连任务，避免无限循环导致设备不稳定
 - 重连任务不阻塞事件处理系统，重连成功后自动停止AP模式
 - AP模式使用APSTA混合模式，允许后台重连等待路由器恢复
+- `wifi_manager_stop()` 使用 3 次重试获取 mutex（每次 100ms，共 300ms）确保重连任务在 mutex 保护下正确清理，仅最终失败时强制删除任务（vTaskDelete 对正在 vTaskDelay 的任务是安全的）
 
 **主要函数**:
 ```c
@@ -746,9 +751,13 @@ typedef struct {
 
 **验证机制**: `config_manager_validate()` 检查所有配置参数的有效范围，`config_manager_set_config()` 先验证后更新。
 
+**原子写入保证**: `config_manager_set_string()`/`set_int()`/`set_bool()` 采用"先写 NVS、后更新内存"策略。NVS 写入成功后才修改内存配置，且将 `config_dirty` 设为 false（因为 NVS 已是最新）。NVS 写入失败时内存保持不变，返回错误给调用者。这确保了内存与 NVS 的一致性，防止 NVS 故障时内存已修改但持久化丢失。
+
+**NVS迁移错误处理**: 首次启动时的 NVS 迁移（从旧命名空间合并到 water_purifier）对所有 `nvs_set_*`/`nvs_commit` 操作均检查返回值，失败时输出警告日志，避免数据迁移静默丢失。
+
 **NVS字符串终止保护**: `nvs_get_str()` 读取后强制添加 `\0` 终止符，防止NVS数据损坏导致缓冲区溢出。
 
-**统一周期保存**: `config_manager_periodic_save_all()` 协调系统配置、滤芯数据、历史记录三个模块的脏数据批量保存。
+**统一周期保存**: `config_manager_periodic_save_all()` 协调系统配置、滤芯数据、历史记录三个模块的脏数据批量保存。通过 `#include "filter_manager.h"` 和 `#include "history_logger.h"` 引入其他模块的保存函数声明（不使用 extern），确保模块化设计。
 
 **NVS命名空间**:
 
@@ -800,7 +809,7 @@ esp_err_t config_manager_get_fsm_stats(fsm_runtime_data_t *data);
 3. `ota_update_end()`: 验证镜像，设置启动分区，取消回滚倒计时
 4. Reboot: `esp_restart()` 重启进入新固件
 
-**版本检测**: 同版本固件拒绝升级，防止重复刷写。
+**版本检测**: 使用 `sscanf()` 解析 major.minor.patch 数值进行语义化版本比较（避免字符串字典序问题，如 "1.0.10" < "1.0.9"）。同版本固件允许升级（输出警告日志，用于修复bug或更新构建日期）。
 
 **边界保护**: `init_buf[512]` 积累固件头部数据，解析ESP镜像头前检查大小有效性，防止异常输入导致缓冲区溢出。
 
@@ -850,7 +859,9 @@ esp_err_t ota_update_rollback(void);
 
 **堆内存监控**:
 - 可用堆 < 30KB → 输出警告日志
-- 可用堆 < 15KB → 立即重启（跳过NVS保存，避免内存进一步消耗）
+- 可用堆 < 15KB → 立即重启（直接 esp_restart()，不尝试清理资源。原因：内存严重不足时 fsm_send_event/wifi_manager_stop 等函数自身需要分配内存，极可能失败；esp_restart() 由 ROM bootloader 执行，不依赖堆内存）
+
+**功率档位默认行为**: 当当前WiFi TX功率不在滞回表中（可能被外部修改）时，默认使用中间档位 15dBm（而非最大功率 20dBm），避免功耗过高。后续滞回算法会自动调整到合适的档位。
 
 **主要函数**:
 ```c
@@ -880,6 +891,8 @@ esp_err_t pm_manager_check_heap(void);
 4. 跨天处理：有数据才保存昨天的记录，无数据则清除旧key
 
 **NVS提交检查**: 每次 `nvs_commit()` 检查返回值，失败时输出警告日志。
+
+**history_clear_all 原子性**: 清除操作在 mutex 内先擦除 NVS 再清除内存，确保即使系统在清除过程中崩溃，重启后也不会从 NVS 加载旧的已删除记录。`history_dirty` 标志在清除后设为 false（因为 NVS 已是最新空状态）。
 
 **主要函数**:
 ```c
@@ -1162,6 +1175,7 @@ POST /api/ota/rollback
 | 2.3.1 | 2026-05-25 | **电源管理模块完善**：pm_manager WiFi TX功率滞回算法文档完善（5档功率表+滞回阈值说明）、初始化流程添加步骤6 pm_manager_init() |
 | 2.3.4 | 2026-05-26 | **日志显示修复**：简化读取逻辑（移除复杂两阶段扫描+重试），输出缓冲区扩大至16KB（容纳HTML格式化后的日志）。原generation计数器验证不完整（仅检测缓冲区溢出，不检测绕回写入导致的数据损坏） |
 | 2.3.5 | 2026-06-07 | **存储优化**：CSS样式合并优化（4个HTML页面统一使用SHARED_CSS/LOG_CSS宏，消除重复约5KB），历史记录数量优化（HISTORY_MAX_RECORDS从20改为15，节省约500字节RAM+NVS） |
+| 2.4.x | 2026-06-11~12 | **三轮代码审计+架构优化（36项）**：PM低内存直接esp_restart()；history_clear_all原子化；filter负数检查+累加器余数提交+旧格式迁移；wifi_manager_stop 3次重试+看门狗注销；OTA版本sscanf数值比较+esp_ota_abort移出临界区+预览NULL检查；config_manager先写NVS后更新内存+迁移返回值检查+TDS校准钳位+validate范围校验；Web strcpy→strlcpy+session spinlock+cJSON统一构建+WiFi认证防劫持；mqtt spinlock获取client句柄+重连看门狗注销+subscribe竞态修复；FSM水量公共函数+mutex保护+冲洗双计修复；GPIO mutex重试+安全退出；tds mutex保护+安全退出；history脏标志保护+跨天NVS返回值检查；config_manager extern→include解耦；monitor_task去冗余。2026-06-15 | **第五轮审计+固件瘦身（12项）**：① sdkconfig裁剪未用特性（WiFi Mesh/以太网/企业WiFi/SAE-PK/OWE/SoftAP-SAE/GDB stub/IP分片），预估节省200-300KB Flash；② uptime uint32→uint64修复49.7天回绕（web_server + mqtt_client）；③ MQTT类型定义去重（mqtt_client.c删除5个重复类型，统一由app_mqtt.h提供）；④ gpio_config.h清理死代码（4个未引用枚举+2个pin mask宏+gpio_driver_set_led_mode死函数）；⑤ tds_sensor.c删除死代码temperature_compensation；⑥ board_params.h/gpio_config.h清理16个旧架构残留宏；⑦ GPIO防抖宏名统一（DEBOUNCE_MS→GPIO_DEBOUNCE_TIME_MS）；⑧ daily_stats NVS累积清理（跨天自动删除30天前key）；⑨ filter累加器单次输入上限保护（防uint32溢出）；⑩ filter waste/pump_flow_lph误设save_needed修复；⑪ handle_log_debug流式输出改造（httpd_resp_send_chunk分块传输，堆占用18KB→1KB，httpd栈20KB→8KB，净省~27KB RAM）；⑫ TDS任务栈2KB→3KB+栈水位监控（handle_status新增stackTDS/stackMonitor字段） |
 
 ---
 

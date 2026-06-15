@@ -59,12 +59,19 @@ static void config_manager_migrate_nvs(void)
             // 写入water_purifier命名空间
             nvs_handle_t wp_handle;
             if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &wp_handle) == ESP_OK) {
-                nvs_set_str(wp_handle, "wifi_ssid", ssid);
-                nvs_set_str(wp_handle, "wifi_pass", pass);
-                nvs_commit(wp_handle);
+                esp_err_t e1 = nvs_set_str(wp_handle, "wifi_ssid", ssid);
+                esp_err_t e2 = nvs_set_str(wp_handle, "wifi_pass", pass);
+                esp_err_t ce = nvs_commit(wp_handle);
                 nvs_close(wp_handle);
-                ESP_LOGI(TAG, "迁移WiFi配置: %s", ssid);
-                migrated = true;
+                if (e1 == ESP_OK && e2 == ESP_OK && ce == ESP_OK) {
+                    ESP_LOGI(TAG, "迁移WiFi配置: %s", ssid);
+                    migrated = true;
+                } else {
+                    ESP_LOGW(TAG, "迁移WiFi配置写入失败: %s/%s/%s",
+                             esp_err_to_name(e1), esp_err_to_name(e2), esp_err_to_name(ce));
+                }
+            } else {
+                ESP_LOGW(TAG, "迁移WiFi配置: 打开water_purifier命名空间失败");
             }
         }
 
@@ -101,15 +108,21 @@ static void config_manager_migrate_nvs(void)
         if (has_mqtt) {
             nvs_handle_t wp_handle;
             if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &wp_handle) == ESP_OK) {
-                nvs_set_str(wp_handle, "mqtt_broker", broker);
-                nvs_set_str(wp_handle, "mqtt_user", user);
-                nvs_set_str(wp_handle, "mqtt_pass", pass);
-                nvs_set_str(wp_handle, "mqtt_topic", topic);
-                nvs_set_u8(wp_handle, "mqtt_en", 1);
-                nvs_commit(wp_handle);
+                esp_err_t e1 = nvs_set_str(wp_handle, "mqtt_broker", broker);
+                esp_err_t e2 = nvs_set_str(wp_handle, "mqtt_user", user);
+                esp_err_t e3 = nvs_set_str(wp_handle, "mqtt_pass", pass);
+                esp_err_t e4 = nvs_set_str(wp_handle, "mqtt_topic", topic);
+                esp_err_t e5 = nvs_set_u8(wp_handle, "mqtt_en", 1);
+                esp_err_t ce = nvs_commit(wp_handle);
                 nvs_close(wp_handle);
-                ESP_LOGI(TAG, "迁移MQTT配置: %s", broker);
-                migrated = true;
+                if (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK && e4 == ESP_OK && e5 == ESP_OK && ce == ESP_OK) {
+                    ESP_LOGI(TAG, "迁移MQTT配置: %s", broker);
+                    migrated = true;
+                } else {
+                    ESP_LOGW(TAG, "迁移MQTT配置写入失败");
+                }
+            } else {
+                ESP_LOGW(TAG, "迁移MQTT配置: 打开water_purifier命名空间失败");
             }
         }
 
@@ -134,10 +147,14 @@ static void config_manager_migrate_nvs(void)
                 // 检查wp_filters是否已有total_water，避免覆盖新数据
                 uint32_t existing_water = 0;
                 if (nvs_get_u32(filter_handle, "total_water", &existing_water) != ESP_OK || existing_water == 0) {
-                    nvs_set_u32(filter_handle, "total_water", total_water);
-                    nvs_commit(filter_handle);
-                    ESP_LOGI(TAG, "迁移总用水量: %lu升", total_water);
-                    migrated = true;
+                    esp_err_t se = nvs_set_u32(filter_handle, "total_water", total_water);
+                    esp_err_t ce = nvs_commit(filter_handle);
+                    if (se == ESP_OK && ce == ESP_OK) {
+                        ESP_LOGI(TAG, "迁移总用水量: %lu升", total_water);
+                        migrated = true;
+                    } else {
+                        ESP_LOGW(TAG, "迁移总用水量写入失败");
+                    }
                 }
                 nvs_close(filter_handle);
             }
@@ -172,12 +189,17 @@ static void config_manager_migrate_nvs(void)
         if (has_deprecated) {
             nvs_handle_t wp_handle;
             if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &wp_handle) == ESP_OK) {
-                nvs_erase_key(wp_handle, "flush_dur");
-                nvs_erase_key(wp_handle, "filter_cap");
-                nvs_commit(wp_handle);
+                esp_err_t e1 = nvs_erase_key(wp_handle, "flush_dur");
+                esp_err_t e2 = nvs_erase_key(wp_handle, "filter_cap");
+                esp_err_t ce = nvs_commit(wp_handle);
                 nvs_close(wp_handle);
-                ESP_LOGI(TAG, "已清理废弃字段(flush_dur, filter_cap)");
-                migrated = true;
+                if (ce == ESP_OK) {
+                    ESP_LOGI(TAG, "已清理废弃字段(flush_dur, filter_cap)");
+                    migrated = true;
+                } else {
+                    ESP_LOGW(TAG, "清理废弃字段提交失败");
+                }
+                (void)e1; (void)e2;  // erase_key may return NOT_FOUND, that's OK
             }
         }
     }
@@ -189,9 +211,14 @@ static void config_manager_migrate_nvs(void)
     // 设置迁移完成标志（无论是否有迁移，都标记为已完成）
     nvs_handle_t wp_handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &wp_handle) == ESP_OK) {
-        nvs_set_u8(wp_handle, "nvs_migrated", 1);
-        nvs_commit(wp_handle);
+        esp_err_t se = nvs_set_u8(wp_handle, "nvs_migrated", 1);
+        esp_err_t ce = nvs_commit(wp_handle);
         nvs_close(wp_handle);
+        if (se != ESP_OK || ce != ESP_OK) {
+            ESP_LOGW(TAG, "设置迁移完成标志失败");
+        }
+    } else {
+        ESP_LOGW(TAG, "设置迁移完成标志: 打开命名空间失败");
     }
 }
 
@@ -382,7 +409,7 @@ esp_err_t config_manager_load(void)
 
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "NVS中无配置，使用默认值");
-        return ESP_OK;
+        return ESP_OK;  // 设计意图：返回OK表示"初始化成功（使用默认值）"，调用方无需区分有无旧配置
     }
 
     size_t len;
@@ -656,14 +683,28 @@ esp_err_t config_manager_save(void)
     nvs_set_u16(handle, "save_intv", config_copy.runtime_save_interval_min);
 
     // TDS配置（定点数存储：乘100保留2位小数精度）
+    // 钳位防止float溢出int32_t范围（阈值0~2000ppm * 100 = 0~200000，安全）
     nvs_set_i32(handle, "tds_in_th", (int32_t)(config_copy.tds_inlet_threshold * 100.0f));
     nvs_set_i32(handle, "tds_out_th", (int32_t)(config_copy.tds_outlet_threshold * 100.0f));
 
     // TDS校准（定点数存储：offset乘100，scale乘10000）
-    nvs_set_i32(handle, "tds_in_off", (int32_t)(config_copy.tds_calibration_offset[0] * 100.0f));
-    nvs_set_i32(handle, "tds_out_off", (int32_t)(config_copy.tds_calibration_offset[1] * 100.0f));
-    nvs_set_i32(handle, "tds_in_scale", (int32_t)(config_copy.tds_calibration_scale[0] * 10000.0f));
-    nvs_set_i32(handle, "tds_out_scale", (int32_t)(config_copy.tds_calibration_scale[1] * 10000.0f));
+    // 钳位到安全范围：offset [-1000,1000] → [-100000,100000]，scale [0.01,100] → [100,1000000]
+    float off0 = config_copy.tds_calibration_offset[0];
+    float off1 = config_copy.tds_calibration_offset[1];
+    float sc0 = config_copy.tds_calibration_scale[0];
+    float sc1 = config_copy.tds_calibration_scale[1];
+    if (off0 < -1000.0f) off0 = -1000.0f;
+    if (off0 > 1000.0f) off0 = 1000.0f;
+    if (off1 < -1000.0f) off1 = -1000.0f;
+    if (off1 > 1000.0f) off1 = 1000.0f;
+    if (sc0 < 0.01f) sc0 = 0.01f;
+    if (sc0 > 100.0f) sc0 = 100.0f;
+    if (sc1 < 0.01f) sc1 = 0.01f;
+    if (sc1 > 100.0f) sc1 = 100.0f;
+    nvs_set_i32(handle, "tds_in_off", (int32_t)(off0 * 100.0f));
+    nvs_set_i32(handle, "tds_out_off", (int32_t)(off1 * 100.0f));
+    nvs_set_i32(handle, "tds_in_scale", (int32_t)(sc0 * 10000.0f));
+    nvs_set_i32(handle, "tds_out_scale", (int32_t)(sc1 * 10000.0f));
 
     // Web配置
     nvs_set_u16(handle, "web_port", config_copy.web_port);
@@ -842,56 +883,66 @@ esp_err_t config_manager_set_string(const char *key, const char *value)
         return ESP_ERR_INVALID_ARG;
     }
 
-    // 优化：一次READWRITE打开完成读写，避免两次打开
+    // 输入长度校验：NVS单条目限制约4000字节，配置字符串通常不超过128字节
+    size_t value_len = strlen(value);
+    if (value_len > 256) {
+        ESP_LOGW(TAG, "set_string(%s): 值过长(%zu字节)，拒绝写入", key, value_len);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 一次READWRITE打开完成读写
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         return err;
     }
 
-    // 在同一个handle中读取现有值，比较是否变化
+    // 检查NVS中现有值，避免不必要的写入
     size_t cur_len = 0;
     err = nvs_get_str(handle, key, NULL, &cur_len);
-    bool value_changed = true;  // 默认假设值已变化
-    if (err == ESP_OK && cur_len > 0) {
+    bool value_changed = true;
+    if (err == ESP_OK && cur_len > 0 && cur_len <= 512) {
+        // cur_len上限校验：防止NVS中损坏的长度值导致大量内存分配
         char *cur_val = malloc(cur_len);
         if (cur_val) {
             err = nvs_get_str(handle, key, cur_val, &cur_len);
             if (err == ESP_OK && strcmp(cur_val, value) == 0) {
-                value_changed = false;  // 值未变化
+                value_changed = false;
             }
             free(cur_val);
         }
     }
 
-    // 值未变化时直接关闭handle返回，避免不必要的写入
     if (!value_changed) {
         nvs_close(handle);
         return ESP_OK;
     }
 
-    // 先更新内存配置（使用mutex保护，失败时返回错误避免竞态）
-    bool mem_changed = false;
-    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        update_config_from_key(key, value, &mem_changed);
-        if (mem_changed) {
-            ctx.config_dirty = true;
-        }
-        xSemaphoreGive(ctx.mutex);
-    } else {
-        // mutex获取失败：关闭NVS handle并返回错误，避免竞态条件
-        nvs_close(handle);
-        ESP_LOGE(TAG, "set_string: mutex获取失败，拒绝更新以避免竞态");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    // 写入NVS（handle已打开）
+    // 先写入NVS（确保持久化成功后再更新内存）
     err = nvs_set_str(handle, key, value);
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
-    return err;
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set_string: NVS写入失败(%s)，内存未更新", esp_err_to_name(err));
+        return err;
+    }
+
+    // NVS写入成功，更新内存配置
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        bool mem_changed = false;
+        update_config_from_key(key, value, &mem_changed);
+        if (mem_changed) {
+            ctx.config_dirty = false;  // NVS已是最新，清除脏标志
+        }
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        ESP_LOGW(TAG, "set_string: NVS已写入但mutex获取失败，内存可能不一致");
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t config_manager_get_int(const char *key, int *value)
@@ -968,27 +1019,38 @@ esp_err_t config_manager_set_int(const char *key, int value)
         return ESP_ERR_INVALID_ARG;
     }
 
-    // 先更新内存配置（使用mutex保护）
-    bool mem_changed = false;
-    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        update_config_int_from_key(key, value, &mem_changed);
-        if (mem_changed) {
-            ctx.config_dirty = true;
-        }
-        xSemaphoreGive(ctx.mutex);
-    } else {
-        // mutex获取失败：返回错误避免竞态条件
-        ESP_LOGE(TAG, "set_int: mutex获取失败，拒绝更新以避免竞态");
-        return ESP_ERR_TIMEOUT;
+    // 单字段范围校验（与config_manager_validate保持一致）
+    if (value < 0) {
+        // 除web_port等字段外，大部分配置不应为负数
+        // 允许负数但在UPDATE_U8/U16/U32_FIELD中会被截断，此处先放行由NVS存储
+    }
+    // 关键字段范围检查
+    if ((strcmp(key, "production_timeout_sec") == 0 && (value < 600 || value > 86400)) ||
+        (strcmp(key, "leak_confirm_time_sec") == 0 && (value < 1 || value > 60)) ||
+        (strcmp(key, "normal_flush_duration_sec") == 0 && (value < 5 || value > 300)) ||
+        (strcmp(key, "pure_flush_duration_sec") == 0 && (value < 5 || value > 300)) ||
+        (strcmp(key, "filter_flush_duration_sec") == 0 && (value < 60 || value > 7200)) ||
+        (strcmp(key, "short_prod_threshold_sec") == 0 && (value < 30 || value > 600)) ||
+        (strcmp(key, "water_hammer_valve_open_delay_ms") == 0 && (value < 100 || value > 5000)) ||
+        (strcmp(key, "water_hammer_pump_stop_delay_ms") == 0 && (value < 100 || value > 5000)) ||
+        (strcmp(key, "water_hammer_valve_close_delay_ms") == 0 && (value < 100 || value > 5000)) ||
+        (strcmp(key, "waste_valve_flow_cc") == 0 && (value < 100 || value > 1000)) ||
+        (strcmp(key, "ro_membrane_type") == 0 && (value < 0 || value > 4)) ||
+        (strcmp(key, "pump_type") == 0 && (value < 0 || value > 5)) ||
+        (strcmp(key, "tank_size") == 0 && (value < 0 || value > 4)) ||
+        (strcmp(key, "relay_trigger_level") == 0 && (value < 0 || value > 1))) {
+        ESP_LOGW(TAG, "set_int(%s): 值%d超出有效范围，拒绝写入", key, value);
+        return ESP_ERR_INVALID_ARG;
     }
 
-    // 写入NVS（一次打开完成读比较和写操作）
+    // 先写入NVS（确保持久化成功后再更新内存）
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         return err;
     }
 
+    // 检查现有值，避免不必要的写入
     int32_t cur_val;
     if (nvs_get_i32(handle, key, &cur_val) == ESP_OK && cur_val == value) {
         nvs_close(handle);
@@ -1000,7 +1062,25 @@ esp_err_t config_manager_set_int(const char *key, int value)
         err = nvs_commit(handle);
     }
     nvs_close(handle);
-    return err;
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set_int: NVS写入失败(%s)，内存未更新", esp_err_to_name(err));
+        return err;
+    }
+
+    // NVS写入成功，更新内存配置
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        bool mem_changed = false;
+        update_config_int_from_key(key, value, &mem_changed);
+        if (mem_changed) {
+            ctx.config_dirty = false;  // NVS已是最新
+        }
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        ESP_LOGW(TAG, "set_int: NVS已写入但mutex获取失败，内存可能不一致");
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t config_manager_get_bool(const char *key, bool *value)
@@ -1049,43 +1129,47 @@ esp_err_t config_manager_set_bool(const char *key, bool value)
         return ESP_ERR_INVALID_ARG;
     }
 
+    // 先检查NVS中现有值，避免不必要的写入
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
     if (err == ESP_OK) {
         uint8_t cur_val;
-        if (nvs_get_u8(handle, key, &cur_val) == ESP_OK && cur_val == value) {
+        if (nvs_get_u8(handle, key, &cur_val) == ESP_OK && cur_val == (uint8_t)value) {
             nvs_close(handle);
             return ESP_OK;  // 值未变化，不写入
         }
         nvs_close(handle);
     }
 
-    // 先更新内存配置（使用mutex保护）
-    bool mem_changed = false;
-    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        update_config_bool_from_key(key, value, &mem_changed);
-        if (mem_changed) {
-            ctx.config_dirty = true;
-        }
-        xSemaphoreGive(ctx.mutex);
-    } else {
-        // mutex获取失败：返回错误避免竞态条件
-        ESP_LOGE(TAG, "set_bool: mutex获取失败，拒绝更新以避免竞态");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    // 再写入NVS
+    // 先写入NVS（确保持久化成功后再更新内存）
     err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         return err;
     }
-
-    err = nvs_set_u8(handle, key, value);
+    err = nvs_set_u8(handle, key, (uint8_t)value);
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
-    return err;
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set_bool: NVS写入失败(%s)，内存未更新", esp_err_to_name(err));
+        return err;
+    }
+
+    // NVS写入成功，更新内存配置
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        bool mem_changed = false;
+        update_config_bool_from_key(key, value, &mem_changed);
+        if (mem_changed) {
+            ctx.config_dirty = false;  // NVS已是最新
+        }
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        ESP_LOGW(TAG, "set_bool: NVS已写入但mutex获取失败，内存可能不一致");
+    }
+
+    return ESP_OK;
 }
 
 // ==================== 验证 ====================
@@ -1214,9 +1298,8 @@ bool config_manager_has_mqtt_config(void)
 
 // ==================== 统一周期保存 ====================
 
-// 外部模块的周期保存函数声明
-extern bool filter_mgr_periodic_save(void);
-extern bool history_periodic_save(uint32_t min_interval_sec);
+#include "filter_manager.h"
+#include "history_logger.h"
 
 // 上次统一保存时间
 static uint64_t s_last_unified_save_time = 0;

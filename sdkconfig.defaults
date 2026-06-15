@@ -1,8 +1,10 @@
 # Compiler optimization for size
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
-# Disable GDB stub (ESP-IDF 6.0 has compilation bug)
-CONFIG_ESP_GDBSTUB_ENABLED=n
+# Disable GDB stub runtime (hidden option ESP_GDBSTUB_ENABLED=y cannot be turned off,
+# but the actual GDB stub code is only linked if RUNTIME or PANIC_GDBSTUB is enabled)
+# CONFIG_ESP_SYSTEM_GDBSTUB_RUNTIME is already not set by default
+# CONFIG_ESP_SYSTEM_PANIC_GDBSTUB is already not set by default
 
 # Disable mbedTLS certificate bundle (saves ~50KB)
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
@@ -38,6 +40,17 @@ CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=3
 
+# === 裁剪未使用的WiFi特性 ===
+# 注：WiFi Mesh在ESP-IDF 6.0中内置于WiFi库，无法单独关闭
+# 项目不使用802.1X企业认证WiFi
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
+# AP使用WPA2-PSK，不需要WPA3-SAE for SoftAP
+CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT=n
+# 不使用SAE-PK（极少使用的WPA3扩展）
+CONFIG_ESP_WIFI_ENABLE_SAE_PK=n
+# 不使用OWE（开放网络加密，本项目AP有密码）
+CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA=n
+
 # Use custom partition table (factory + OTA)
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
@@ -50,3 +63,11 @@ CONFIG_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 
 # Enable OTA rollback support (auto-convert NEW to PENDING_VERIFY)
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# === 裁剪调试功能（节省~15KB Flash）===
+# 禁用断言（choice选项：选DISABLE替代默认的ENABLE）
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+
+# === LWIP进一步精简（节省~5KB Flash）===
+# 局域网环境不需要IP分片
+CONFIG_LWIP_IP4_FRAG=n

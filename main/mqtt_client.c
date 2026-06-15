@@ -27,6 +27,7 @@
 #include "cJSON.h"
 
 // 本地模块头文件
+#include "app_mqtt.h"
 #include "config_manager.h"
 #include "water_purifier_fsm.h"
 #include "tds_sensor.h"
@@ -36,38 +37,6 @@
 #define MQTT_MAX_DATA_LEN   1024
 
 static const char *TAG = "APP_MQTT";
-
-// ==================== 本地类型定义（使用app_前缀避免冲突）================
-
-typedef struct {
-    char broker_uri[128];        // Broker URI (mqtt://host:port)
-    char client_id[64];          // 客户端ID
-    char username[64];           // 用户名
-    char password[64];           // 密码
-    char topic_prefix[64];       // 主题前缀
-    uint16_t keepalive;          // 保活时间（秒）
-    bool retain;                 // 保留标志
-    uint8_t qos;                 // QoS等级
-} app_mqtt_config_t;
-
-typedef enum {
-    APP_MQTT_STATE_DISCONNECTED = 0,  // 未连接
-    APP_MQTT_STATE_CONNECTING,        // 连接中
-    APP_MQTT_STATE_CONNECTED,         // 已连接
-    APP_MQTT_STATE_ERROR,             // 错误
-} app_mqtt_state_t;
-
-typedef struct {
-    char topic[128];             // 主题
-    char data[512];              // 数据
-    uint32_t data_len;           // 数据长度
-    uint8_t qos;                 // QoS等级
-    bool retain;                 // 保留标志
-} app_mqtt_message_t;
-
-// 回调函数类型
-typedef void (*app_mqtt_message_callback_t)(const char *topic, const char *data, uint32_t data_len);
-typedef void (*app_mqtt_connection_callback_t)(bool connected);
 
 // ==================== 状态名称字符串 ====================
 
@@ -85,6 +54,7 @@ static struct {
     bool started;
     bool stop_requested;         // 停止请求标志（通知重连任务退出）
     bool reconnect_active;       // 重连任务活跃标志（防止重复创建）
+    bool publish_in_progress;    // publish进行中标志（防止stop期间销毁client导致UAF）
     app_mqtt_state_t state;
     app_mqtt_config_t config;
 
@@ -102,6 +72,7 @@ static struct {
     .started = false,
     .stop_requested = false,
     .reconnect_active = false,
+    .publish_in_progress = false,
     .state = APP_MQTT_STATE_DISCONNECTED,
     .mqtt_client = NULL,
     .message_callback = NULL,
@@ -210,6 +181,8 @@ esp_err_t mqtt_client_stop(void)
     if (mqtt_ctx.reconnect_task) {
         ESP_LOGW(TAG, "重连任务未响应停止请求，强制删除");
         taskENTER_CRITICAL(&mqtt_spinlock);
+        // 先注销看门狗，防止资源泄漏（与wifi_manager_stop一致）
+        esp_task_wdt_delete(mqtt_ctx.reconnect_task);  // 忽略返回值（可能未注册）
         vTaskDelete(mqtt_ctx.reconnect_task);
         mqtt_ctx.reconnect_task = NULL;
         mqtt_ctx.reconnect_active = false;  // 清除活跃标志
@@ -221,6 +194,20 @@ esp_err_t mqtt_client_stop(void)
     mqtt_ctx.stop_requested = false;
     mqtt_ctx.reconnect_active = false;  // 确保清除（防止残留）
     taskEXIT_CRITICAL(&mqtt_spinlock);
+
+    // 等待所有publish操作完成，防止销毁client导致use-after-free
+    int publish_wait = 0;
+    while (publish_wait < 20) {  // 最多等待1秒（20×50ms）
+        taskENTER_CRITICAL(&mqtt_spinlock);
+        bool in_progress = mqtt_ctx.publish_in_progress;
+        taskEXIT_CRITICAL(&mqtt_spinlock);
+        if (!in_progress) break;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        publish_wait++;
+    }
+    if (publish_wait > 0) {
+        ESP_LOGW(TAG, "等待publish完成: %d次轮询", publish_wait);
+    }
 
     if (mqtt_ctx.mqtt_client != NULL) {
         esp_mqtt_client_disconnect(mqtt_ctx.mqtt_client);
@@ -361,8 +348,15 @@ esp_err_t mqtt_client_connect(void)
     }
 
     // 注册事件处理程序
-    esp_mqtt_client_register_event(mqtt_ctx.mqtt_client, ESP_EVENT_ANY_ID,
+    esp_err_t reg_ret = esp_mqtt_client_register_event(mqtt_ctx.mqtt_client, ESP_EVENT_ANY_ID,
                                      mqtt_event_handler, NULL);
+    if (reg_ret != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT事件注册失败: %s", esp_err_to_name(reg_ret));
+        esp_mqtt_client_destroy(mqtt_ctx.mqtt_client);
+        mqtt_ctx.mqtt_client = NULL;
+        mqtt_ctx.state = APP_MQTT_STATE_ERROR;
+        return reg_ret;
+    }
 
     // 启动MQTT客户端
     esp_err_t ret = esp_mqtt_client_start(mqtt_ctx.mqtt_client);
@@ -408,12 +402,35 @@ esp_err_t mqtt_client_publish(const char *topic, const char *data, uint32_t len,
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (mqtt_ctx.mqtt_client == NULL || !mqtt_client_is_connected()) {
+    // 在spinlock内获取client句柄和连接状态，并标记publish_in_progress
+    // 防止并发mqtt_client_stop()在publish期间销毁client导致use-after-free
+    esp_mqtt_client_handle_t client;
+    bool connected;
+    taskENTER_CRITICAL(&mqtt_spinlock);
+    if (mqtt_ctx.publish_in_progress) {
+        // 已有publish在进行（理论上单核不会发生，但作为防御性检查）
+        taskEXIT_CRITICAL(&mqtt_spinlock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    client = mqtt_ctx.mqtt_client;
+    connected = (mqtt_ctx.state == APP_MQTT_STATE_CONNECTED);
+    if (client != NULL && connected) {
+        mqtt_ctx.publish_in_progress = true;
+    }
+    taskEXIT_CRITICAL(&mqtt_spinlock);
+
+    if (client == NULL || !connected) {
         ESP_LOGW(TAG, "MQTT未连接，无法发布消息");
         return ESP_ERR_INVALID_STATE;
     }
 
-    int msg_id = esp_mqtt_client_publish(mqtt_ctx.mqtt_client, topic, data, len, qos, retain);
+    int msg_id = esp_mqtt_client_publish(client, topic, data, len, qos, retain);
+
+    // 清除publish标志
+    taskENTER_CRITICAL(&mqtt_spinlock);
+    mqtt_ctx.publish_in_progress = false;
+    taskEXIT_CRITICAL(&mqtt_spinlock);
+
     if (msg_id < 0) {
         ESP_LOGE(TAG, "MQTT发布失败");
         return ESP_FAIL;
@@ -433,7 +450,8 @@ esp_err_t mqtt_publish_purifier_status(void)
     bool has_tds = (tds_sensor_get_latest_dual(&dual_tds) == ESP_OK && dual_tds.both_valid);
 
     // 使用局部缓冲区（栈分配）避免静态变量的多线程竞争风险
-    char json_buf[256];
+    // 384字节：当前约120字节，留足扩展余量（state_name变长或增加字段）
+    char json_buf[384];
     snprintf(json_buf, sizeof(json_buf),
              "{\"state\":\"%s\",\"tds_in\":%.1f,\"tds_out\":%.1f,\"tds_reduction_rate\":%.1f}",
              state_name,
@@ -468,13 +486,14 @@ esp_err_t mqtt_publish_tds_value(void)
 esp_err_t mqtt_publish_system_status(void)
 {
     uint32_t free_heap = esp_get_free_heap_size();
-    uint32_t uptime = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+    // uint64运算防止49.7天回绕（xTaskGetTickCount为uint32，乘portTICK_PERIOD_MS后可能溢出）
+    uint64_t uptime = (uint64_t)xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
 
     // 使用局部缓冲区（栈分配）避免静态变量的多线程竞争风险
     char json_buf[128];
     snprintf(json_buf, sizeof(json_buf),
-             "{\"free_heap\":%lu,\"uptime\":%lu,\"wifi_connected\":%s}",
-             (unsigned long)free_heap, (unsigned long)uptime,
+             "{\"free_heap\":%lu,\"uptime\":%llu,\"wifi_connected\":%s}",
+             (unsigned long)free_heap, (unsigned long long)uptime,
              wifi_manager_is_connected() ? "true" : "false");
 
     return mqtt_client_publish("system/status", json_buf, strlen(json_buf), 0, true);
@@ -484,11 +503,23 @@ esp_err_t mqtt_publish_system_status(void)
 
 esp_err_t mqtt_client_subscribe(const char *topic, uint8_t qos)
 {
-    if (mqtt_ctx.mqtt_client == NULL || !mqtt_client_is_connected()) {
+    if (topic == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 在spinlock内获取client句柄和连接状态，防止并发disconnect导致use-after-free
+    esp_mqtt_client_handle_t client;
+    bool connected;
+    taskENTER_CRITICAL(&mqtt_spinlock);
+    client = mqtt_ctx.mqtt_client;
+    connected = (mqtt_ctx.state == APP_MQTT_STATE_CONNECTED);
+    taskEXIT_CRITICAL(&mqtt_spinlock);
+
+    if (client == NULL || !connected) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    int msg_id = esp_mqtt_client_subscribe(mqtt_ctx.mqtt_client, topic, qos);
+    int msg_id = esp_mqtt_client_subscribe(client, topic, qos);
     if (msg_id < 0) {
         return ESP_FAIL;
     }
@@ -498,11 +529,23 @@ esp_err_t mqtt_client_subscribe(const char *topic, uint8_t qos)
 
 esp_err_t mqtt_client_unsubscribe(const char *topic)
 {
-    if (mqtt_ctx.mqtt_client == NULL || !mqtt_client_is_connected()) {
+    if (topic == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 在spinlock内获取client句柄和连接状态
+    esp_mqtt_client_handle_t client;
+    bool connected;
+    taskENTER_CRITICAL(&mqtt_spinlock);
+    client = mqtt_ctx.mqtt_client;
+    connected = (mqtt_ctx.state == APP_MQTT_STATE_CONNECTED);
+    taskEXIT_CRITICAL(&mqtt_spinlock);
+
+    if (client == NULL || !connected) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    int msg_id = esp_mqtt_client_unsubscribe(mqtt_ctx.mqtt_client, topic);
+    int msg_id = esp_mqtt_client_unsubscribe(client, topic);
     if (msg_id < 0) {
         return ESP_FAIL;
     }
@@ -1010,6 +1053,8 @@ static void mqtt_reconnect_task(void *pvParameters)
                 if (should_stop) break;
                 if (!mqtt_client_is_connected()) {
                     esp_mqtt_client_disconnect(mqtt_ctx.mqtt_client);
+                } else {
+                    break;  // 重连成功，退出while循环
                 }
             }
         }

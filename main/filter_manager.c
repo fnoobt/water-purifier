@@ -179,10 +179,22 @@ static void load_from_nvs(void)
             for (int i = 3; i <= 4; i++) {
                 fctx.filter_accumulator_ml[i] = old_post_acc;
             }
-            // 清除旧字段（延迟删除，等待save时提交）
-            nvs_erase_key(handle, "pre_acc");
-            nvs_erase_key(handle, "post_acc");
-            nvs_commit(handle);
+            // 清除旧字段：关闭只读handle，重新以读写模式打开
+            nvs_close(handle);
+            nvs_handle_t rw_handle;
+            if (nvs_open(NVS_FILTERS_NAMESPACE, NVS_READWRITE, &rw_handle) == ESP_OK) {
+                nvs_erase_key(rw_handle, "pre_acc");
+                nvs_erase_key(rw_handle, "post_acc");
+                esp_err_t ce = nvs_commit(rw_handle);
+                nvs_close(rw_handle);
+                if (ce == ESP_OK) {
+                    ESP_LOGD(TAG, "旧累加器key已清除");
+                }
+            }
+            // 重新以只读模式打开，继续加载剩余字段
+            if (nvs_open(NVS_FILTERS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+                return;  // 无法重新打开，退出
+            }
         }
     }
 
@@ -592,9 +604,9 @@ esp_err_t filter_mgr_update_water_usage(float liters)
 
 esp_err_t filter_mgr_update_water_usage_dual(float pre_liters, float post_liters)
 {
-    // 参数校验
-    if (!isfinite(pre_liters)) pre_liters = 0.0f;
-    if (!isfinite(post_liters)) post_liters = 0.0f;
+    // 参数校验（排除NaN、无穷大和负数，负数转换为uint32_t会导致整数下溢）
+    if (!isfinite(pre_liters) || pre_liters < 0.0f) pre_liters = 0.0f;
+    if (!isfinite(post_liters) || post_liters < 0.0f) post_liters = 0.0f;
     if (pre_liters <= 0.0f && post_liters <= 0.0f) {
         return ESP_OK;
     }
@@ -605,6 +617,11 @@ esp_err_t filter_mgr_update_water_usage_dual(float pre_liters, float post_liters
     fixup_filter_time_on_ntp_sync_locked();
 
     // 转换为毫升累加（整数累加避免浮点精度误差）
+    // 安全上限：100,000L=100,000,000mL，远超单次统计周期最大水量
+    // （最大流量~183L/h × 最长保存间隔24h = 4392L），防止浮点异常值导致uint32溢出
+    #define MAX_SINGLE_UPDATE_LITERS  100000.0f
+    if (pre_liters > MAX_SINGLE_UPDATE_LITERS) pre_liters = MAX_SINGLE_UPDATE_LITERS;
+    if (post_liters > MAX_SINGLE_UPDATE_LITERS) post_liters = MAX_SINGLE_UPDATE_LITERS;
     uint32_t pre_ml = (uint32_t)(pre_liters * 1000.0f);  // 升转毫升
     uint32_t post_ml = (uint32_t)(post_liters * 1000.0f);
 
@@ -651,7 +668,8 @@ esp_err_t filter_mgr_set_waste_flow_lph(float lph)
     }
     LOCK_GET(50);
     fctx.waste_flow_lph = lph;
-    fctx.save_needed = true;  // 标记需要保存，避免配置丢失
+    // 注意：waste_flow_lph不被持久化（由FSM从config_manager重新计算），
+    // 因此不设置save_needed，避免多余NVS写入
     LOCK_GIVE();
     return ESP_OK;
 }
@@ -672,7 +690,7 @@ esp_err_t filter_mgr_set_pump_flow_lph(float lph)
     }
     LOCK_GET(50);
     fctx.pump_flow_lph = lph;
-    fctx.save_needed = true;  // 标记需要保存，避免配置丢失
+    // 注意：pump_flow_lph不被持久化（由FSM从config_manager重新计算），不设置save_needed
     LOCK_GIVE();
     return ESP_OK;
 }
@@ -780,9 +798,10 @@ esp_err_t filter_mgr_reset_all_filters(void)
 {
     LOCK_GET(100);
 
-    // 清除所有独立累加器
+    // 先提交所有累加器余数（<1L部分向上舍入计入total_water_used/total_production_water）
+    // 确保重置时不丢失水量统计（与filter_mgr_reset_filter行为一致）
     for (int i = 0; i < FILTER_COUNT; i++) {
-        fctx.filter_accumulator_ml[i] = 0;
+        force_commit_accumulator_locked(i);
     }
 
     time_t now_sec = time(NULL);
@@ -796,8 +815,7 @@ esp_err_t filter_mgr_reset_all_filters(void)
         fctx.filters[i].last_reset_time = reset_time;  // 更新为本次重置时间
         fctx.filters[i].replacement_needed = false;
     }
-    fctx.total_water_used = 0;
-    fctx.total_production_water = 0;
+    // 保留历史总用水量和总制水量（已在force_commit中更新，跨滤芯重置累积，不因换芯清零）
 
     fctx.save_needed = true;
     esp_err_t ret = save_to_nvs_locked();
@@ -808,10 +826,8 @@ esp_err_t filter_mgr_reset_all_filters(void)
     return ret;
 }
 
-/**编译成功！烧录失败是因为COM3端口被占用。
-
-编译结果
- * @brief 批量设置所有滤芯容量（一次NVs写入）
+/**
+ * @brief 批量设置所有滤芯容量（一次NVS写入）
  * @param capacities 容量数组，长度必须为FILTER_COUNT
  * @return ESP_OK 成功
  */
@@ -880,7 +896,8 @@ const char* filter_mgr_get_filter_name(filter_type_t filter_type)
 
 bool filter_mgr_any_filter_needs_replacement(void)
 {
-    // 内部调用，假定已持有锁或快速检查
+    // 内部调用，调用方必须已持有LOCK_GET（如filter_mgr_get_filters_status L754）
+    // 不应从外部直接调用（无锁保护）
     for (int i = 0; i < FILTER_COUNT; i++) {
         if (fctx.filters[i].replacement_needed ||
             fctx.filters[i].percentage < 10) {

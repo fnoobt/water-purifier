@@ -119,11 +119,7 @@ static void monitor_task(void *arg)
 
         // 每30秒执行一次完整检查
         if (loop_count % 30 == 0) {
-            // 检查漏水
-            if (gpio_driver_read_water_leak() && !fsm_is_stop_state()) {
-                ESP_LOGE(TAG, "检测到漏水！");
-                fsm_send_event(FSM_EVENT_WATER_LEAK);
-            }
+            // 漏水检测由FSM内部check_inputs()每100ms完成（含5秒确认防误报），无需monitor重复检测
 
             // 状态日志改为DEBUG级别，减少刷屏
             fsm_state_t state = fsm_get_state();

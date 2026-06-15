@@ -82,16 +82,7 @@ extern "C" {
 // 汇通Vontron实际参数: 50G=7.8, 75G=12.0, 100G=15.6, 200G=31.2, 400G=62.4 L/h
 
 /* ==================== TDS传感器参数 ==================== */
-
-#define TDS_ALARM_THRESHOLD        100.0f    // TDS报警阈值 (ppm)
-#define TDS_SAMPLE_INTERVAL_MS      1000      // TDS采样间隔：1秒
-#define TDS_FILTER_ALPHA            0.1f      // 滤波系数 (0-1)
-
-/* ==================== 系统限制 ==================== */
-
-#define MAX_PRODUCTION_CYCLES       999       // 最大制水循环次数
-#define MAX_FLUSH_CYCLES_PER_DAY    12        // 每日最大冲洗次数
-#define MAX_ERROR_COUNT             5         // 最大错误计数
+// @note TDS报警阈值、采样间隔等已移至运行时配置（config_manager / tds_sensor.c内部）
 
 #ifdef __cplusplus
 }

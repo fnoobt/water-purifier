@@ -37,13 +37,13 @@ static const char *TAG = "WEB";
 // 系统启动时间（微秒），在编译时记录
 static uint64_t g_boot_time = 0;
 
-// 获取系统运行时间（秒）
-static uint32_t get_uptime_sec(void)
+// 获取系统运行时间（秒），使用uint64防止49.7天回绕
+static uint64_t get_uptime_sec(void)
 {
     if (g_boot_time == 0) {
         g_boot_time = esp_timer_get_time();
     }
-    return (uint32_t)((esp_timer_get_time() - g_boot_time) / 1000000);
+    return (uint64_t)((esp_timer_get_time() - g_boot_time) / 1000000);
 }
 
 // ==================== 私有变量 ====================
@@ -69,6 +69,8 @@ static uint64_t s_last_wifi_scan_time = 0;   // 上次WiFi扫描时间
 // ==================== Basic Auth + Session ====================
 
 #define SESSION_TIMEOUT_SEC 86400  // Session有效期24小时
+
+static portMUX_TYPE session_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 static struct {
     char token[33];           // hex session token (32 chars + null)
@@ -166,7 +168,6 @@ esp_err_t web_server_init_log_interceptor(void)
 ".filter-stat{text-align:center;padding:10px 5px}" \
 ".filter-name{font-size:12px;color:#666;margin-bottom:4px}" \
 ".filter-pct{font-size:18px;font-weight:600;margin-bottom:2px}" \
-".filter-sub{font-size:10px;color:#999}" \
 ".dim-label{font-size:10px;color:#999}" \
 ".wifi-item{background:#f0f0f0;padding:10px;margin:5px 0;border-radius:8px;cursor:pointer;transition:background .2s}" \
 ".wifi-item:hover{background:#e0e0e0}" \
@@ -246,6 +247,8 @@ static const char html_page[] =
 "<div class='stat'><div class='stat-label'>历史最低</div><div id='minHeap' class='stat-value'>-</div></div>"
 "<div class='stat'><div class='stat-label'>FSM栈</div><div id='stackFSM' class='stat-value'>-</div></div>"
 "<div class='stat'><div class='stat-label'>HTTP栈</div><div id='stackHTTP' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>TDS栈</div><div id='stackTDS' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>监控栈</div><div id='stackMonitor' class='stat-value'>-</div></div>"
 "</div></div>"
 
 "<button class='btn btn-primary btn-center' onclick=\"location.href='/admin'\">管理设置</button>"
@@ -286,6 +289,10 @@ static const char html_page[] =
 "$('stackFSM').className='stat-value '+((d.stackFSM&&d.stackFSM>512)?'good':(d.stackFSM&&d.stackFSM>256)?'warn':'error');"
 "$('stackHTTP').textContent=formatSize(d.stackHTTP);"
 "$('stackHTTP').className='stat-value '+((d.stackHTTP&&d.stackHTTP>2048)?'good':(d.stackHTTP&&d.stackHTTP>1024)?'warn':'error');"
+"$('stackTDS').textContent=formatSize(d.stackTDS);"
+"$('stackTDS').className='stat-value '+((d.stackTDS&&d.stackTDS>512)?'good':(d.stackTDS&&d.stackTDS>256)?'warn':'error');"
+"$('stackMonitor').textContent=formatSize(d.stackMonitor);"
+"$('stackMonitor').className='stat-value '+((d.stackMonitor&&d.stackMonitor>512)?'good':(d.stackMonitor&&d.stackMonitor>256)?'warn':'error');"
 "})}"
 "setInterval(update,3000);update();"
 "</script></body></html>";
@@ -635,26 +642,33 @@ static void generate_session(void)
 {
     uint8_t rand_bytes[16];
     esp_fill_random(rand_bytes, sizeof(rand_bytes));
+
+    taskENTER_CRITICAL(&session_spinlock);
     for (int i = 0; i < 16; i++) {
         sprintf(&session_ctx.token[i*2], "%02x", rand_bytes[i]);
     }
     session_ctx.token[32] = '\0';
     session_ctx.create_time_us = esp_timer_get_time();
     session_ctx.valid = true;
+    taskEXIT_CRITICAL(&session_spinlock);
 }
 
 static bool validate_session(const char *token)
 {
-    if (!session_ctx.valid) return false;
-    if (strcmp(token, session_ctx.token) != 0) return false;
-    uint64_t age = (esp_timer_get_time() - session_ctx.create_time_us) / 1000000;
-    if (age > SESSION_TIMEOUT_SEC) {
-        session_ctx.valid = false;
-        return false;
+    bool result = false;
+    taskENTER_CRITICAL(&session_spinlock);
+    if (session_ctx.valid && strcmp(token, session_ctx.token) == 0) {
+        uint64_t age = (esp_timer_get_time() - session_ctx.create_time_us) / 1000000;
+        if (age <= SESSION_TIMEOUT_SEC) {
+            // 刷新session时间（滑动过期），活跃用户不会过期
+            session_ctx.create_time_us = esp_timer_get_time();
+            result = true;
+        } else {
+            session_ctx.valid = false;
+        }
     }
-    // 刷新session时间（滑动过期），活跃用户不会过期
-    session_ctx.create_time_us = esp_timer_get_time();
-    return true;
+    taskEXIT_CRITICAL(&session_spinlock);
+    return result;
 }
 
 static bool check_auth(httpd_req_t *req)
@@ -702,7 +716,7 @@ static bool check_auth(httpd_req_t *req)
     char user[32] = {0}, pass[32] = {0};
     if (user_len > 0 && user_len < 32) {
         memcpy(user, decoded, user_len);
-        strcpy(pass, colon + 1);
+        strlcpy(pass, colon + 1, sizeof(pass));  // 安全拷贝，防止密码超长溢出
     }
 
     // 比较凭证
@@ -723,10 +737,20 @@ static void send_401(httpd_req_t *req)
 
 static void set_session_cookie(httpd_req_t *req)
 {
+    char token_copy[33];
+    bool valid = false;
+
+    taskENTER_CRITICAL(&session_spinlock);
     if (session_ctx.valid) {
+        memcpy(token_copy, session_ctx.token, sizeof(token_copy));
+        valid = true;
+    }
+    taskEXIT_CRITICAL(&session_spinlock);
+
+    if (valid) {
         char hdr[64];
         snprintf(hdr, sizeof(hdr), "session=%s; Path=/; Max-Age=%d",
-                 session_ctx.token, SESSION_TIMEOUT_SEC);
+                 token_copy, SESSION_TIMEOUT_SEC);
         httpd_resp_set_hdr(req, "Set-Cookie", hdr);
     }
 }
@@ -752,19 +776,19 @@ static esp_err_t handle_log_api(httpd_req_t *req)
         return ESP_OK;
     }
     set_session_cookie(req);
-    // 使用静态缓冲区避免HTTP服务器任务栈溢出(默认栈仅4KB)
-    static char buf[4096];
-    int pos = 0;
+
+    // 使用cJSON构建JSON数组
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON alloc failed");
+        return ESP_FAIL;
+    }
+
+    cJSON *lines_arr = cJSON_CreateArray();
     uint32_t read_pos = s_log_tail;
     uint32_t tail = s_log_head;
-    int first = 1;
-
-    pos = snprintf(buf, sizeof(buf), "{\"lines\":[");
 
     while (read_pos != tail) {
-        // 预留足够空间: 一行最多 ~300 字节(含转义+逗号+引号)
-        if (pos > (int)sizeof(buf) - 350) break;
-
         char line[300];
         int ln = 0;
         int slen = 0;
@@ -780,19 +804,7 @@ static esp_err_t handle_log_api(httpd_req_t *req)
             continue;
         }
         line[ln] = '\0';
-
-        if (!first) buf[pos++] = ',';
-        first = 0;
-
-        // JSON 字符串转义
-        buf[pos++] = '"';
-        for (int i = 0; i < ln && pos < (int)sizeof(buf) - 10; i++) {
-            char ch = line[i];
-            if (ch == '"') { buf[pos++] = '\\'; buf[pos++] = '"'; }
-            else if (ch == '\\') { buf[pos++] = '\\'; buf[pos++] = '\\'; }
-            else buf[pos++] = ch;
-        }
-        buf[pos++] = '"';
+        cJSON_AddItemToArray(lines_arr, cJSON_CreateString(line));
 
         // 跳过换行
         while (read_pos != tail && (s_log_buf[read_pos] == '\n' || s_log_buf[read_pos] == '\r')) {
@@ -800,23 +812,23 @@ static esp_err_t handle_log_api(httpd_req_t *req)
         }
     }
 
-    buf[pos++] = ']';
-    // 手动写 nextPos，避免 snprintf
-    const char *suffix = ",\"nextPos\":";
-    for (const char *p = suffix; *p; p++) buf[pos++] = *p;
-    // 写数字
-    uint32_t np = read_pos;
-    char numbuf[12];
-    int ni = 0;
-    do { numbuf[ni++] = '0' + (np % 10); np /= 10; } while (np > 0);
-    for (int i = ni - 1; i >= 0; i--) buf[pos++] = numbuf[i];
-    buf[pos++] = '}';
-    buf[pos] = '\0';
+    cJSON_AddItemToObject(root, "lines", lines_arr);
+    cJSON_AddNumberToObject(root, "nextPos", read_pos);
+
+    char *resp = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON print failed");
+        return ESP_FAIL;
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    esp_err_t ret = httpd_resp_send(req, buf, pos);
+    esp_err_t ret = httpd_resp_send(req, resp, strlen(resp));
+    free(resp);
+
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "日志API发送失败: %s", esp_err_to_name(ret));
     }
@@ -824,10 +836,10 @@ static esp_err_t handle_log_api(httpd_req_t *req)
 }
 
 /**
- * @brief 日志端点：以HTML形式返回日志缓冲区内容（支持时间戳转换和级别过滤）
- * @note 查询参数: level=E/W/I/D/EW/EWI 过滤日志级别
- *       两阶段扫描：先逆向计算能显示的行数，再正向输出（确保新日志完整）
- *       内存使用：~18KB输出缓冲区 + ~800字节行位置数组，最多显示200行
+ * @brief 日志端点：流式输出日志缓冲区内容（chunked transfer encoding）
+ * @note 使用 httpd_resp_send_chunk 分块发送，避免 18KB 大块内存分配
+ *       内存使用：~1KB chunk缓冲区 + ~800字节行位置数组（vs 旧方案 ~19KB）
+ *       最多显示 MAX_LOG_LINES 行，从最旧到最新输出
  */
 static esp_err_t handle_log_debug(httpd_req_t *req)
 {
@@ -836,33 +848,6 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
         return ESP_OK;
     }
     set_session_cookie(req);
-
-    // 计算所需缓冲区大小
-    size_t buf_size = LOG_BUF_SIZE * 2 + 2048;  // ~18KB
-    size_t line_starts_size = 200 * sizeof(uint32_t);  // ~800字节（200行）
-    size_t total_required = buf_size + line_starts_size + 1024;  // 加1KB余量
-
-    // 检查可用内存
-    size_t free_heap = esp_get_free_heap_size();
-    if (free_heap < total_required) {
-        ESP_LOGW(TAG, "内存不足(%lu字节，需%lu字节)，跳过日志详细处理",
-                 (unsigned long)free_heap, (unsigned long)total_required);
-        httpd_resp_set_type(req, "text/html");
-        return httpd_resp_send(req, "<span style='color:#f57c00'>内存不足，无法显示详细日志</span>", HTTPD_RESP_USE_STRLEN);
-    }
-
-    // 动态分配缓冲区（避免栈溢出）
-    char *buf = malloc(buf_size);
-    uint32_t *line_starts = malloc(line_starts_size);
-    if (!buf || !line_starts) {
-        ESP_LOGE(TAG, "日志缓冲区分配失败");
-        if (buf) free(buf);
-        if (line_starts) free(line_starts);
-        httpd_resp_set_type(req, "text/html");
-        return httpd_resp_send(req, "<span style='color:#d32f2f'>内存分配失败</span>", HTTPD_RESP_USE_STRLEN);
-    }
-
-    int pos = 0;
 
     // 解析查询参数中的日志级别过滤
     char query[64] = {0};
@@ -878,68 +863,67 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     time_t boot_wall = wifi_manager_get_boot_wall_clock_time();
     bool has_wall_time = (boot_wall > 0);
 
-    #define MAX_LOG_LINES 200  // 最多记录200行位置
-    char line_buf[300];
+    // 分配小块chunk缓冲区（仅1KB，vs 旧方案 18KB）
+    #define CHUNK_BUF_SIZE 1024
+    char *chunk = malloc(CHUNK_BUF_SIZE);
+    if (!chunk) {
+        httpd_resp_set_type(req, "text/html");
+        return httpd_resp_send(req, "<span style='color:#d32f2f'>内存分配失败</span>", HTTPD_RESP_USE_STRLEN);
+    }
+    int cpos = 0;
 
-    // 重试循环：防止缓冲区覆盖导致读取不一致
-    int retry_count = 0;
-    bool scan_success = false;
-    int limit = (int)buf_size - 100;
+    // ==================== 第一步：发送HTML头部（CSS + 信息栏）====================
+    uint32_t tail = s_log_tail;
+    uint32_t head = s_log_head;
+    unsigned long used_bytes = (head >= tail) ? (head - tail) : (LOG_BUF_SIZE - tail + head);
 
-    do {
-        // 快照当前缓冲区状态（包括生成计数器）
-        uint32_t gen_before = s_log_generation;
-        uint32_t tail = s_log_tail;
-        uint32_t head = s_log_head;
+    httpd_resp_set_type(req, "text/html");
+    char header[384];
+    int hlen = snprintf(header, sizeof(header),
+        "<style>.E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}</style>"
+        "<div style='padding:4px 8px;border-bottom:1px solid #e0e0e0;font-size:10px;color:#888;background:#f0f0f0'>"
+        "缓冲区 %lu/%lu 字节 | %s | 过滤: %s</div>",
+        used_bytes, (unsigned long)LOG_BUF_SIZE,
+        has_wall_time ? "时间戳已同步" : "时间戳未同步",
+        level_filter);
+    // snprintf截断安全：即使hlen >= sizeof(header)，snprintf已保证null终止
+    // 但使用返回值作为实际长度，避免发送被截断的不完整HTML
+    if (hlen >= (int)sizeof(header)) {
+        hlen = sizeof(header) - 1;
+    }
+    httpd_resp_send_chunk(req, header, hlen);
 
-        // ==================== 第一阶段：逆向扫描（记录每行位置）===================
-        int line_count = 0;
+    // ==================== 第二步：逆向扫描定位最近200行的起始位置 ====================
+    #define MAX_LOG_LINES 200
+    uint32_t line_starts[MAX_LOG_LINES];
+    int line_count = 0;
+    {
         uint32_t scan_pos = head;
         int scan_line_len = 0;
-
         while (scan_pos != tail && line_count < MAX_LOG_LINES) {
             scan_pos = (scan_pos == 0) ? (LOG_BUF_SIZE - 1) : (scan_pos - 1);
             char c = s_log_buf[scan_pos];
-
             if (c == '\n' || c == '\r') {
                 if (scan_line_len > 0) {
-                    uint32_t line_start = scan_pos + 1;
-                    if (line_start >= LOG_BUF_SIZE) line_start = 0;
-                    line_starts[line_count] = line_start;
-                    line_count++;
+                    uint32_t ls = scan_pos + 1;
+                    if (ls >= LOG_BUF_SIZE) ls = 0;
+                    line_starts[line_count++] = ls;
                     scan_line_len = 0;
                 }
             } else {
                 if (scan_line_len < 299) scan_line_len++;
             }
         }
+    }
 
-    // ==================== 第二阶段：正向输出（从最旧到最新）====================
-    // 最旧日志在最上方，最新日志在最下方
+    // ==================== 第三步：正向逐行输出，流式发送 ====================
+    char line_buf[300];
 
-    pos = snprintf(buf, buf_size,
-        "<style>.E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}</style>"
-        "<div style='padding:4px 8px;border-bottom:1px solid #e0e0e0;font-size:10px;color:#888;background:#f0f0f0'>缓冲区 %lu/%lu 字节 | %s | 过滤: %s</div>",
-        (unsigned long)(head >= tail ? head - tail : LOG_BUF_SIZE - tail + head),
-        (unsigned long)LOG_BUF_SIZE,
-        has_wall_time ? "时间戳已同步" : "时间戳未同步",
-        level_filter);
+    for (int i = line_count - 1; i >= 0; i--) {
+        uint32_t read_pos = line_starts[i];
+        int line_len = 0;
 
-    // ==================== 第二阶段：Chronological 输出（oldest → newest）====================
-    // 直接从 oldest 向 newest 输出，逐行写入检查
-    // 缓冲区满时自然停止
-
-    int output_lines = 0;
-    int skipped_by_filter = 0;
-    int line_len = 0;
-
-    // 从 oldest (line_count-1) 向 newest (0) 输出
-    for (int i = line_count - 1; i >= 0 && pos < limit; i--) {
-        uint32_t line_start = line_starts[i];
-        uint32_t read_pos = line_start;
-        line_len = 0;
-
-        // 读取这一行
+        // 读取一行原始内容
         while (read_pos != head && line_len < 299) {
             char c = s_log_buf[read_pos];
             if (c == '\n' || c == '\r') break;
@@ -948,7 +932,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
         }
         line_buf[line_len] = '\0';
 
-        // 解析日志级别
+        // 解析日志级别和启动时间戳
         char lvl = 0;
         uint32_t boot_ms = 0;
         if (line_len >= 5 &&
@@ -968,103 +952,102 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
             }
         }
 
-        // 检查日志级别过滤
+        // 级别过滤
         bool show_log = (strcmp(level_filter, "all") == 0);
         if (!show_log && lvl) {
             for (int j = 0; level_filter[j]; j++) {
                 if (level_filter[j] == lvl) { show_log = true; break; }
             }
         }
+        if (!show_log) continue;
 
-        if (!show_log) {
-            skipped_by_filter++;  // 因级别过滤跳过
+        // 格式化行HTML到临时缓冲区
+        char html[420];
+        int hpos = 0;
+
+        // <span class='X'>
+        if (lvl) {
+            html[hpos++] = '<'; html[hpos++] = 's'; html[hpos++] = 'p'; html[hpos++] = 'a';
+            html[hpos++] = 'n'; html[hpos++] = ' '; html[hpos++] = 'c'; html[hpos++] = 'l';
+            html[hpos++] = 'a'; html[hpos++] = 's'; html[hpos++] = 's'; html[hpos++] = '=';
+            html[hpos++] = '\''; html[hpos++] = lvl; html[hpos++] = '\''; html[hpos++] = '>';
+        }
+
+        // 时间戳 [MM-DD HH:MM:SS]
+        if (has_wall_time && boot_ms > 0 && lvl) {
+            time_t log_time = boot_wall + (boot_ms / 1000);
+            struct tm tm_log;
+            localtime_r(&log_time, &tm_log);
+            hpos += snprintf(html + hpos, sizeof(html) - hpos,
+                "[%02d-%02d %02d:%02d:%02d] ",
+                tm_log.tm_mon + 1, tm_log.tm_mday,
+                tm_log.tm_hour, tm_log.tm_min, tm_log.tm_sec);
+        }
+
+        // 日志级别前缀 + 内容起始位置
+        int content_start = 0;
+        if (lvl && line_len >= 5) {
+            int paren_end = 2;
+            while (paren_end < line_len && line_buf[paren_end] != ')') paren_end++;
+            if (paren_end < line_len && paren_end + 3 < line_len) {
+                html[hpos++] = lvl;
+                html[hpos++] = ' ';
+                content_start = paren_end + 1;
+                if (content_start < line_len && line_buf[content_start] == ' ') content_start++;
+            }
+        }
+
+        // HTML转义输出日志内容
+        for (int k = content_start; k < line_len && hpos < (int)sizeof(html) - 10; k++) {
+            char ch = line_buf[k];
+            if (ch == '<') { memcpy(html + hpos, "&lt;", 4); hpos += 4; }
+            else if (ch == '>') { memcpy(html + hpos, "&gt;", 4); hpos += 4; }
+            else if (ch == '&') { memcpy(html + hpos, "&amp;", 5); hpos += 5; }
+            else html[hpos++] = ch;
+        }
+
+        // </span>\n
+        if (lvl) {
+            memcpy(html + hpos, "</span>\n", 8);
+            hpos += 8;
         } else {
-            output_lines++;  // 计数输出的行数
-            int cls = 0;
-            if (lvl) {
-                memcpy(buf + pos, "<span class='", 13);
-                pos += 13;
-                buf[pos++] = lvl;
-                memcpy(buf + pos, "'>", 2);
-                pos += 2;
-                cls = 1;
-            }
-
-            // 时间戳（无span包装，节省空间）
-            if (has_wall_time && boot_ms > 0 && cls) {
-                time_t log_time = boot_wall + (boot_ms / 1000);
-                struct tm tm_log;
-                localtime_r(&log_time, &tm_log);
-                pos += snprintf(buf + pos, buf_size - pos,
-                    "[%02d-%02d %02d:%02d:%02d] ",
-                    tm_log.tm_mon + 1, tm_log.tm_mday,
-                    tm_log.tm_hour, tm_log.tm_min, tm_log.tm_sec);
-            }
-
-            // 输出日志内容
-            int content_start = 0;
-            if (lvl && line_len >= 5) {
-                int paren_end = 2;
-                while (paren_end < line_len && line_buf[paren_end] != ')') paren_end++;
-                if (paren_end < line_len && paren_end + 3 < line_len) {
-                    buf[pos++] = lvl;
-                    buf[pos++] = ' ';
-                    content_start = paren_end + 1;
-                    if (content_start < line_len && line_buf[content_start] == ' ') content_start++;
-                }
-            }
-
-            // HTML转义
-            for (int k = content_start; k < line_len && pos < (int)buf_size - 10; k++) {
-                char ch = line_buf[k];
-                if (ch == '<') { buf[pos++] = '&'; buf[pos++] = 'l'; buf[pos++] = 't'; }
-                else if (ch == '>') { buf[pos++] = '&'; buf[pos++] = 'g'; buf[pos++] = 't'; }
-                else if (ch == '&') { buf[pos++] = '&'; buf[pos++] = 'a'; buf[pos++] = 'm'; buf[pos++] = 'p'; buf[pos++] = ';'; }
-                else buf[pos++] = ch;
-            }
-
-            if (cls && pos + 8 < (int)buf_size) {
-                memcpy(buf + pos, "</span>", 7);
-                pos += 7;
-            }
-            buf[pos++] = '\n';
-        }
-    }
-
-        // 验证生成计数器是否一致
-        uint32_t gen_after = s_log_generation;
-        if (gen_before == gen_after) {
-            scan_success = true;
-            break;  // 成功，退出循环
+            html[hpos++] = '\n';
         }
 
-        retry_count++;
-        ESP_LOGD(TAG, "日志扫描冲突，重试 #%d", retry_count);
-
-    } while (retry_count < 3);  // 最多重试3次
-
-    if (!scan_success) {
-        ESP_LOGW(TAG, "日志扫描多次冲突，显示可能不完整");
+        // 流式发送逻辑：
+        // - 如果当前chunk装不下此行 → 先flush已有内容
+        // - 如果单行超过chunk容量 → 直接作为独立chunk发送
+        // - 否则 → 追加到chunk缓冲区
+        if (cpos + hpos > CHUNK_BUF_SIZE) {
+            if (cpos > 0) {
+                httpd_resp_send_chunk(req, chunk, cpos);
+                cpos = 0;
+            }
+            if (hpos > CHUNK_BUF_SIZE) {
+                // 单行超大，直接发送
+                httpd_resp_send_chunk(req, html, hpos);
+                continue;
+            }
+        }
+        memcpy(chunk + cpos, html, hpos);
+        cpos += hpos;
     }
 
-    buf[pos] = '\0';
+    // 发送剩余内容
+    if (cpos > 0) {
+        httpd_resp_send_chunk(req, chunk, cpos);
+    }
 
     // 滚动到底部（显示最新日志）
-    const char *scroll_js = "<script>(function(){var el=document.getElementById('logContent');if(el)el.scrollTop=el.scrollHeight})()</script>";
-    int slen = strlen(scroll_js);
-    if (pos + slen < (int)buf_size) {
-        memcpy(buf + pos, scroll_js, slen);
-        pos += slen;
-    }
+    httpd_resp_sendstr_chunk(req,
+        "<script>(function(){var el=document.getElementById('logContent');"
+        "if(el)el.scrollTop=el.scrollHeight})()</script>");
 
-    httpd_resp_set_type(req, "text/html");
-    esp_err_t ret = httpd_resp_send(req, buf, pos);
+    // 结束chunked响应
+    httpd_resp_send_chunk(req, NULL, 0);
 
-    // 释放动态分配的缓冲区
-    free(buf);
-    free(line_starts);
-
-    return ret;
+    free(chunk);
+    return ESP_OK;
 }
 
 // ==================== 辅助函数 ====================
@@ -1086,9 +1069,17 @@ static esp_err_t send_json_error(httpd_req_t *req, int status_code, const char *
     drain_http_body(req);
     httpd_resp_set_status(req, status_code == 500 ? "500 Internal Server Error" : "400 Bad Request");
     httpd_resp_set_type(req, "application/json");
-    char json_buf[256];
-    snprintf(json_buf, sizeof(json_buf), "{\"status\":\"error\",\"message\":\"%s\"}", msg);
-    httpd_resp_send(req, json_buf, HTTPD_RESP_USE_STRLEN);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "status", "error");
+    cJSON_AddStringToObject(root, "message", msg);
+    char *resp = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (resp) {
+        httpd_resp_send(req, resp, strlen(resp));
+        free(resp);
+    } else {
+        httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"internal error\"}", HTTPD_RESP_USE_STRLEN);
+    }
     return ESP_FAIL;
 }
 
@@ -1141,14 +1132,12 @@ static esp_err_t handle_status(httpd_req_t *req)
     fsm_state_t state = fsm_get_state();
     fsm_runtime_data_t data = {0};
     if (fsm_get_runtime_data(&data) != ESP_OK) {
-        // 超时使用零值，不影响响应
         ESP_LOGW(TAG, "获取运行数据超时，使用默认值");
     }
 
     tds_dual_measurement_t tds;
     tds_sensor_get_latest_dual(&tds);
 
-    // 获取五级滤芯状态
     filters_status_t filters_status;
     filter_mgr_get_filters_status(&filters_status);
 
@@ -1158,14 +1147,12 @@ static esp_err_t handle_status(httpd_req_t *req)
     char ssid_buf[33] = "";
     wifi_manager_get_ssid(ssid_buf, sizeof(ssid_buf));
 
-    // 今日统计
     uint32_t today_prod_min = 0;
     daily_stats_t today;
     if (history_get_today_stats(&today) == ESP_OK) {
         today_prod_min = today.production_sec / 60;
     }
 
-    // SNTP系统时间
     char sntp_time[64] = "未同步";
     time_t now = time(NULL);
     struct tm tm_now;
@@ -1176,113 +1163,81 @@ static esp_err_t handle_status(httpd_req_t *req)
                  tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
     }
 
-    // 制水量从filter_manager获取（仅PRODUCTION状态累计，不含冲洗）
     uint32_t prod_water_l = filter_mgr_get_total_production_water();
 
-    // 构建JSON响应（使用snprintf避免cJSON堆分配）
-    char buf[2048];
-    int pos = 0;
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
-        "{\"state\":\"%s\","
-        "\"cycles\":%lu,"
-        "\"flushes\":%lu,"
-        "\"prodTime\":%llu,"
-        "\"uptime\":%lu,"
-        "\"todayProd\":%lu,"
-        "\"prodWater\":%lu,"
-        "\"tds_in\":%.1f,"
-        "\"tds_out\":%.1f,"
-        "\"rate\":%.1f,"
-        "\"leak\":%s,"
-        "\"sntpTime\":\"%s\","
-        "\"filters\":[",
-        fsm_get_state_name(state),
-        (unsigned long)data.total_production_cycles,
-        (unsigned long)data.total_flush_cycles,
-        (unsigned long long)data.total_production_time_sec,
-        (unsigned long)get_uptime_sec(),
-        (unsigned long)today_prod_min,
-        (unsigned long)prod_water_l,
-        tds.inlet.valid ? tds.inlet.tds_value : 0.0,
-        tds.outlet.valid ? tds.outlet.tds_value : 0.0,
-        tds.both_valid ? tds.reduction_rate : 0.0,
-        gpio_driver_read_water_leak() ? "true" : "false",
-        sntp_time);
-
-    // 边界检查：确保有足够空间继续写入（每次snprintf前检查）
-    if (pos >= sizeof(buf) - 500) {
-        ESP_LOGW(TAG, "JSON响应接近溢出，中止写入");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
+    // 使用cJSON构建JSON响应
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON alloc failed");
         return ESP_FAIL;
     }
 
+    cJSON_AddStringToObject(root, "state", fsm_get_state_name(state));
+    cJSON_AddNumberToObject(root, "cycles", data.total_production_cycles);
+    cJSON_AddNumberToObject(root, "flushes", data.total_flush_cycles);
+    cJSON_AddNumberToObject(root, "prodTime", data.total_production_time_sec);
+    cJSON_AddNumberToObject(root, "uptime", get_uptime_sec());
+    cJSON_AddNumberToObject(root, "todayProd", today_prod_min);
+    cJSON_AddNumberToObject(root, "prodWater", prod_water_l);
+    cJSON_AddNumberToObject(root, "tds_in", tds.inlet.valid ? tds.inlet.tds_value : 0.0);
+    cJSON_AddNumberToObject(root, "tds_out", tds.outlet.valid ? tds.outlet.tds_value : 0.0);
+    cJSON_AddNumberToObject(root, "rate", tds.both_valid ? tds.reduction_rate : 0.0);
+    cJSON_AddBoolToObject(root, "leak", gpio_driver_read_water_leak());
+    cJSON_AddStringToObject(root, "sntpTime", sntp_time);
+
+    // 滤芯数组
+    cJSON *filters_arr = cJSON_CreateArray();
+    if (!filters_arr) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON alloc failed");
+        return ESP_FAIL;
+    }
     for (int i = 0; i < FILTER_COUNT; i++) {
-        // 每次写入前检查剩余空间（单个滤芯JSON约150字节）
-        if (pos >= sizeof(buf) - 200) {
-            ESP_LOGW(TAG, "JSON滤芯数据溢出，中止写入");
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
+        cJSON *f = cJSON_CreateObject();
+        if (!f) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON alloc failed");
             return ESP_FAIL;
         }
-
-        int written = snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"waterPct\":%u,\"timePct\":%u,\"effPct\":%u,\"used\":%lu,\"total\":%lu,\"timeLimit\":%lu,\"needReplace\":%s}",
-            i > 0 ? "," : "",
-            filters_status.filters[i].percentage,
-            filters_status.filters[i].time_percentage,
-            filters_status.filters[i].effective_percentage,
-            (unsigned long)filters_status.filters[i].used_liters,
-            (unsigned long)filters_status.filters[i].total_liters,
-            (unsigned long)filters_status.filters[i].time_limit_hours,
-            filters_status.filters[i].replacement_needed ? "true" : "false");
-
-        // 验证snprintf返回值：如果written >= 剩余空间，说明截断
-        if (written < 0 || written >= sizeof(buf) - pos) {
-            ESP_LOGW(TAG, "JSON滤芯数据写入失败/截断");
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
-            return ESP_FAIL;
-        }
-        pos += written;
+        cJSON_AddNumberToObject(f, "waterPct", filters_status.filters[i].percentage);
+        cJSON_AddNumberToObject(f, "timePct", filters_status.filters[i].time_percentage);
+        cJSON_AddNumberToObject(f, "effPct", filters_status.filters[i].effective_percentage);
+        cJSON_AddNumberToObject(f, "used", filters_status.filters[i].used_liters);
+        cJSON_AddNumberToObject(f, "total", filters_status.filters[i].total_liters);
+        cJSON_AddNumberToObject(f, "timeLimit", filters_status.filters[i].time_limit_hours);
+        cJSON_AddBoolToObject(f, "needReplace", filters_status.filters[i].replacement_needed);
+        cJSON_AddItemToArray(filters_arr, f);
     }
+    cJSON_AddItemToObject(root, "filters", filters_arr);
 
-    // 最终字段写入前检查
-    if (pos >= sizeof(buf) - 200) {
-        ESP_LOGW(TAG, "JSON最终数据溢出");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
+    cJSON_AddNumberToObject(root, "totalWater", filters_status.total_water_used);
+    cJSON_AddStringToObject(root, "wifiState", wifi_manager_get_state_name(wifi_manager_get_state()));
+    cJSON_AddStringToObject(root, "ssid", ssid_buf);
+    cJSON_AddStringToObject(root, "ip", ip);
+    cJSON_AddNumberToObject(root, "rssi", wifi_manager_get_rssi());
+    cJSON_AddNumberToObject(root, "txPower", pm_manager_get_wifi_tx_power() / 4);
+    cJSON_AddNumberToObject(root, "freeHeap", esp_get_free_heap_size());
+    cJSON_AddNumberToObject(root, "minHeap", esp_get_minimum_free_heap_size());
+
+    TaskHandle_t fsm_task = xTaskGetHandle("fsm_task");
+    TaskHandle_t httpd_task = xTaskGetHandle("httpd");
+    TaskHandle_t tds_task = xTaskGetHandle("tds_task");
+    TaskHandle_t monitor_task = xTaskGetHandle("monitor");
+    cJSON_AddNumberToObject(root, "stackFSM", fsm_task ? uxTaskGetStackHighWaterMark2(fsm_task) : 0);
+    cJSON_AddNumberToObject(root, "stackHTTP", httpd_task ? uxTaskGetStackHighWaterMark2(httpd_task) : 0);
+    cJSON_AddNumberToObject(root, "stackTDS", tds_task ? uxTaskGetStackHighWaterMark2(tds_task) : 0);
+    cJSON_AddNumberToObject(root, "stackMonitor", monitor_task ? uxTaskGetStackHighWaterMark2(monitor_task) : 0);
+
+    char *resp = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON print failed");
         return ESP_FAIL;
     }
 
-    int final_written = snprintf(buf + pos, sizeof(buf) - pos,
-        "],"
-        "\"totalWater\":%lu,"
-        "\"wifiState\":\"%s\","
-        "\"ssid\":\"%s\","
-        "\"ip\":\"%s\","
-        "\"rssi\":%d,"
-        "\"txPower\":%d,"
-        "\"freeHeap\":%u,"
-        "\"minHeap\":%u,"
-        "\"stackFSM\":%u,"
-        "\"stackHTTP\":%u}",
-        (unsigned long)filters_status.total_water_used,
-        wifi_manager_get_state_name(wifi_manager_get_state()),
-        ssid_buf,
-        ip,
-        wifi_manager_get_rssi(),
-        pm_manager_get_wifi_tx_power() / 4,  // 转换为dBm
-        (unsigned)esp_get_free_heap_size(),
-        (unsigned)esp_get_minimum_free_heap_size(),
-        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("fsm_task")),
-        (unsigned)uxTaskGetStackHighWaterMark2(xTaskGetHandle("httpd")));
-
-    // 检查最终写入是否截断
-    if (final_written < 0 || final_written >= sizeof(buf) - pos) {
-        ESP_LOGW(TAG, "JSON最终数据写入失败/截断");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON overflow");
-        return ESP_FAIL;
-    }
-    pos += final_written;
-
-    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, resp, strlen(resp));
+    free(resp);
     return ESP_OK;
 }
 
@@ -1455,6 +1410,14 @@ static esp_err_t handle_config_set(httpd_req_t *req)
         cfg.web_password[sizeof(cfg.web_password) - 1] = '\0';
     }
 
+    // 验证配置值范围（防止恶意/错误请求设置非法值如 prodTimeout=0）
+    if (!config_manager_validate(&cfg)) {
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"配置值超出有效范围\"}");
+        return ESP_OK;
+    }
+
     config_manager_set_config(&cfg);
 
     // 先应用配置到各模块，成功后再保存NVS（确保一致性）
@@ -1621,6 +1584,16 @@ static esp_err_t handle_wifi_scan(httpd_req_t *req)
 
 static esp_err_t handle_wifi_config(httpd_req_t *req)
 {
+    // WiFi配置安全策略：已连接WiFi时要求认证（防止局域网内设备劫持）
+    // AP配网模式下免认证（初始配置场景）
+    if (wifi_manager_is_connected()) {
+        if (!check_auth(req)) {
+            send_401(req);
+            return ESP_OK;
+        }
+        set_session_cookie(req);
+    }
+
     /* 检查请求体长度 */
     int content_len = req->content_len;
     if (content_len > 127) {
@@ -2197,9 +2170,9 @@ static esp_err_t ota_update_handler(httpd_req_t *req)
                 ESP_LOGD(TAG, "OTA 已接收 %lu 字节", (unsigned long)total_written);
             }
         } else {
-            // 数据太少，全部保留到尾缓冲
-            memmove(buf, buf, total);
+            // 数据太少（total <= cb_len），全部保留到尾缓冲等待下一轮
             tail_len = total;
+            // 数据已在buf原位，无需搬移
         }
     }
 
@@ -2394,10 +2367,14 @@ static esp_err_t ota_preview_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "time", time);
 
     char *resp = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!resp) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, resp);
     free(resp);
-    cJSON_Delete(root);
 
     return ESP_OK;
 }
@@ -2502,7 +2479,7 @@ esp_err_t web_server_start(void)
     cfg.server_port = ctx.config.port;
     cfg.lru_purge_enable = true;
     cfg.max_uri_handlers = 26;
-    cfg.stack_size = 20480;  // 增加到20KB，handle_log_debug需要约17KB缓冲区
+    cfg.stack_size = 8192;   // 流式输出后降至8KB（原20KB），峰值使用~5KB
     cfg.max_open_sockets = 3;  // ESP-IDF v6.0限制：LWIP_MAX_SOCKETS=6，httpd内部占用3
     cfg.recv_wait_timeout = 10;    // 接收超时10秒（默认5秒）
     cfg.send_wait_timeout = 10;    // 发送超时10秒（默认5秒）

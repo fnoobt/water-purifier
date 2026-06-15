@@ -138,14 +138,6 @@ esp_err_t gpio_driver_set_led1(bool state);
  */
 esp_err_t gpio_driver_set_led2(bool state);
 
-/**
- * @brief 设置LED模式（需要配合LED控制任务）
- * @param led_num LED编号（1或2）
- * @param mode LED模式
- * @return ESP_OK 成功
- */
-esp_err_t gpio_driver_set_led_mode(uint8_t led_num, led_mode_t mode);
-
 // ==================== 状态查询接口 ====================
 
 /**

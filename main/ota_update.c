@@ -135,12 +135,15 @@ esp_err_t ota_update_begin(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    // 清理旧状态，允许从失败中重试
-    if (s_ctx.ota_handle != 0) {
-        esp_ota_abort(s_ctx.ota_handle);
-        s_ctx.ota_handle = 0;
-    }
+    // 提取旧的ota_handle，在临界区外调用abort（esp_ota_abort内部可能阻塞）
+    esp_ota_handle_t old_handle = s_ctx.ota_handle;
+    s_ctx.ota_handle = 0;
     taskEXIT_CRITICAL(&ota_spinlock);
+
+    // 清理旧状态，允许从失败中重试（临界区外执行，避免死锁风险）
+    if (old_handle != 0) {
+        esp_ota_abort(old_handle);
+    }
 
     // 注意：不在 begin 时调用 esp_ota_mark_app_valid_cancel_rollback
     // 如果当前固件正在 rollback 倒计时中，提前取消会导致 OTA 失败后失去回滚保护
@@ -252,34 +255,18 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
         ESP_LOGI(TAG, "新固件: 版本=%s, 编译=%s %s",
                  app_desc->version, app_desc->date, app_desc->time);
 
-        // 版本比较：只比较主版本号部分（截取前N个字符，忽略构建时间后缀）
-        // 格式通常为 "1.0.0" 或 "1.0.0-20250101"，只比较前面的数字部分
-        char new_ver_main[16] = {0};
-        char run_ver_main[16] = {0};
-        // 截取版本号的主部分（查找第一个非数字/非点/非连字符的位置）
-        for (int i = 0; i < sizeof(new_ver_main) - 1 && app_desc->version[i]; i++) {
-            char c = app_desc->version[i];
-            if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == 'v') {
-                new_ver_main[i] = c;
-            } else {
-                break;  // 遇到其他字符停止（如空格或构建日期）
-            }
-        }
-        for (int i = 0; i < sizeof(run_ver_main) - 1 && s_ctx.running_version[i]; i++) {
-            char c = s_ctx.running_version[i];
-            if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == 'v') {
-                run_ver_main[i] = c;
-            } else {
-                break;
-            }
-        }
+        // 版本比较：解析为数值进行语义化版本比较（避免字符串字典序问题 "1.0.10" < "1.0.9"）
+        int new_major = 0, new_minor = 0, new_patch = 0;
+        int run_major = 0, run_minor = 0, run_patch = 0;
+        sscanf(app_desc->version, "%d.%d.%d", &new_major, &new_minor, &new_patch);
+        sscanf(s_ctx.running_version, "%d.%d.%d", &run_major, &run_minor, &run_patch);
 
-        // 同主版本号检测（允许同主版本号升级，用于修复bug或更新构建日期）
-        if (strcmp(new_ver_main, run_ver_main) == 0) {
-            ESP_LOGW(TAG, "固件主版本号相同 (%s)，允许升级（可能包含bug修复）", new_ver_main);
+        bool same_version = (new_major == run_major && new_minor == run_minor && new_patch == run_patch);
+        if (same_version) {
+            ESP_LOGW(TAG, "固件版本号相同 (%s)，允许升级（可能包含bug修复）", app_desc->version);
             // 不阻止升级，只是输出警告
         } else {
-            ESP_LOGI(TAG, "版本变更: %s -> %s", run_ver_main, new_ver_main);
+            ESP_LOGI(TAG, "版本变更: %s -> %s", s_ctx.running_version, app_desc->version);
         }
 
         // 启动 OTA 写入
@@ -324,8 +311,9 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
 
     // 后续调用：直接写入
     // 安全检查：确保写入总量不超过分区容量
+    // 使用减法比较避免 total_written + len 的潜在整数溢出
     if (s_ctx.update_partition != NULL &&
-        s_ctx.total_written + len > s_ctx.update_partition->size) {
+        s_ctx.update_partition->size - s_ctx.total_written < len) {
         ESP_LOGE(TAG, "固件超出分区容量: 已写入%lu + 新数据%zu > 分区%lu",
                  s_ctx.total_written, len, s_ctx.update_partition->size);
         esp_ota_abort(s_ctx.ota_handle);
@@ -374,9 +362,14 @@ esp_err_t ota_update_end(void)
     esp_err_t err = esp_ota_end(s_ctx.ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end 验证失败: %s", esp_err_to_name(err));
+        // 验证失败时必须中止OTA会话，释放esp_ota内部资源
+        // 在临界区外调用abort（esp_ota_abort内部可能阻塞）
+        esp_ota_handle_t handle_to_abort = s_ctx.ota_handle;
         taskENTER_CRITICAL(&ota_spinlock);
+        s_ctx.ota_handle = 0;
         s_ctx.state = OTA_STATE_FAILED;
         taskEXIT_CRITICAL(&ota_spinlock);
+        esp_ota_abort(handle_to_abort);
         return err;
     }
 
@@ -414,10 +407,8 @@ esp_err_t ota_update_end(void)
 void ota_update_abort(void)
 {
     taskENTER_CRITICAL(&ota_spinlock);
-    if (s_ctx.ota_handle != 0) {
-        esp_ota_abort(s_ctx.ota_handle);
-        s_ctx.ota_handle = 0;
-    }
+    esp_ota_handle_t handle_to_abort = s_ctx.ota_handle;
+    s_ctx.ota_handle = 0;
     // 清除init_buf残留数据（安全整洁）
     memset(s_ctx.init_buf, 0, sizeof(s_ctx.init_buf));
     s_ctx.state = OTA_STATE_FAILED;
@@ -426,6 +417,11 @@ void ota_update_abort(void)
     s_ctx.image_header_checked = false;
     s_ctx.update_partition = NULL;  // 清空分区指针，防止下次begin使用旧分区
     taskEXIT_CRITICAL(&ota_spinlock);
+
+    // 在临界区外调用abort（避免esp_ota_abort内部阻塞导致死锁风险）
+    if (handle_to_abort != 0) {
+        esp_ota_abort(handle_to_abort);
+    }
     ESP_LOGW(TAG, "OTA 会话已中止");
 }
 

@@ -82,19 +82,6 @@ extern "C" {
 #define GPIO_LED_STATUS_1            GPIO_NUM_12     // LED D4 - 主状态指示
 #define GPIO_LED_STATUS_2            GPIO_NUM_13     // LED D5 - 次状态指示
 
-// ==================== 引脚模式宏定义 ====================
-
-#define GPIO_INPUT_PIN_MASK  ((1ULL << GPIO_LOW_PRESSURE_SWITCH) | \
-                              (1ULL << GPIO_TANK_PRESSURE_SWITCH) | \
-                              (1ULL << GPIO_WATER_LEAK_SENSOR))
-
-#define GPIO_OUTPUT_PIN_MASK ((1ULL << GPIO_INLET_VALVE) | \
-                              (1ULL << GPIO_WASTE_VALVE) | \
-                              (1ULL << GPIO_RETURN_VALVE) | \
-                              (1ULL << GPIO_BOOST_PUMP) | \
-                              (1ULL << GPIO_LED_STATUS_1) | \
-                              (1ULL << GPIO_LED_STATUS_2))
-
 // ==================== 电气参数配置 ====================
 
 /**
@@ -113,69 +100,12 @@ extern "C" {
  */
 #define LEAK_ALARM_MIN_DURATION_MS   1000            // 最小报警持续时间，防止误报
 
-// ==================== 设备状态枚举 ====================
-
-/**
- * @brief 开关状态枚举
- */
-typedef enum {
-    SWITCH_STATE_OPEN = 0,         // 断开状态
-    SWITCH_STATE_CLOSED = 1,       // 闭合状态
-    SWITCH_STATE_UNKNOWN = 0xFF    // 未知状态
-} switch_state_t;
-
-/**
- * @brief 电磁阀状态枚举
- */
-typedef enum {
-    VALVE_STATE_CLOSED = 0,        // 关闭状态
-    VALVE_STATE_OPEN = 1,          // 开启状态
-    VALVE_STATE_UNKNOWN = 0xFF     // 未知状态
-} valve_state_t;
-
-/**
- * @brief 增压泵状态枚举
- */
-typedef enum {
-    PUMP_STATE_OFF = 0,            // 关闭状态
-    PUMP_STATE_ON = 1,             // 开启状态
-    PUMP_STATE_UNKNOWN = 0xFF      // 未知状态
-} pump_state_t;
-
-/**
- * @brief LED指示模式枚举
- */
-typedef enum {
-    LED_MODE_OFF = 0,              // 常灭
-    LED_MODE_ON = 1,               // 常亮
-    LED_MODE_BLINK_SLOW = 2,       // 慢闪（1Hz）
-    LED_MODE_BLINK_FAST = 3,       // 快闪（5Hz）
-    LED_MODE_BLINK_DOUBLE = 4      // 双闪（闪两次停顿）
-} led_mode_t;
-
 // ==================== 系统参数配置 ====================
-
-/**
- * @brief 制水系统时间参数（单位：毫秒）
- */
-#define SYSTEM_STARTUP_DELAY_MS        3000          // 系统启动延时
-#define PUMP_STARTUP_DELAY_MS          2000          // 增压泵启动延时
-#define PRE_FILL_TIME_MS               5000          // 预充水时间（制水前）
-#define FLUSH_DURATION_DEFAULT_MS      30000         // RO膜冲洗时间默认值（30秒）
-#define MAX_PRODUCTION_TIME_MS         (3 * 3600000) // 单次制水最大时间（3小时）
-#define COOLDOWN_TIME_MS               30000         // 冷却时间（30秒）
-
-/**
- * @brief TDS检测参数
- */
-#define TDS_SAMPLING_INTERVAL_MS       1000          // TDS采样间隔（1秒）
-#define TDS_SAMPLE_COUNT               10            // TDS采样次数（取平均值）
-#define TDS_ALARM_THRESHOLD_DEFAULT    100.0f        // TDS报警阈值默认值（ppm）
-
-/**
- * @brief 系统维护参数
- */
-#define FORCE_FLUSH_INTERVAL_MS        3600000       // 强制冲洗间隔（1小时）
+// @note 以下参数已移至运行时配置（config_manager / water_purifier_fsm.c 内部）：
+// - 制水系统时间参数：水锤延时、冲洗时间等由 FSM 内部管理
+// - TDS检测参数：采样数/间隔由 tds_sensor.c 内部管理
+// - 报警阈值：由 config_manager 的 tds_inlet/outlet_threshold 配置
+// - 系统维护参数：已由 FSM 状态机逻辑替代
 
 #ifdef __cplusplus
 }
