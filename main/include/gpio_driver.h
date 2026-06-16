@@ -118,9 +118,17 @@ esp_err_t gpio_driver_set_boost_pump(bool state);
 
 /**
  * @brief 关闭所有输出（紧急停止）
+ * @note 触发后所有set_*函数将拒绝开启输出，直到调用clear_emergency()
  * @return ESP_OK 成功
  */
 esp_err_t gpio_driver_emergency_stop(void);
+
+/**
+ * @brief 清除紧急停止状态，允许正常操作
+ * @note 仅在确认安全后由FSM或用户手动调用
+ * @return ESP_OK 成功
+ */
+esp_err_t gpio_driver_clear_emergency(void);
 
 // ==================== LED控制接口 ====================
 

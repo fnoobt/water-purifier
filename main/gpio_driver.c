@@ -35,6 +35,7 @@ static struct {
     bool led1;              // LED D4
     bool led2;              // LED D5
     uint8_t relay_trigger_level;  // 继电器触发电平 (0=低电平, 1=高电平)
+    volatile bool emergency_active;  // 紧急停止锁定标志（set_*拒绝开启输出）
 } output_state = {
     .inlet_valve = false,
     .waste_valve = false,
@@ -42,7 +43,8 @@ static struct {
     .boost_pump = false,
     .led1 = false,
     .led2 = false,
-    .relay_trigger_level = RELAY_TRIGGER_LEVEL_DEFAULT
+    .relay_trigger_level = RELAY_TRIGGER_LEVEL_DEFAULT,
+    .emergency_active = false
 };
 
 // 保护 output_state 的互斥锁（跨任务访问安全）
@@ -369,6 +371,10 @@ static inline bool output_mutex_take_with_retry(void)
 
 esp_err_t gpio_driver_set_inlet_valve(bool state)
 {
+    if (state && output_state.emergency_active) {
+        ESP_LOGW(TAG, "进水阀开启被拒绝：紧急停止激活中");
+        return ESP_ERR_INVALID_STATE;
+    }
     uint8_t trigger = safe_get_trigger_level();
     int level = calc_output_level_with_trigger(state, trigger);
     esp_err_t ret = gpio_set_level(GPIO_INLET_VALVE, level);
@@ -389,6 +395,10 @@ esp_err_t gpio_driver_set_inlet_valve(bool state)
 
 esp_err_t gpio_driver_set_waste_valve(bool state)
 {
+    if (state && output_state.emergency_active) {
+        ESP_LOGW(TAG, "废水阀开启被拒绝：紧急停止激活中");
+        return ESP_ERR_INVALID_STATE;
+    }
     uint8_t trigger = safe_get_trigger_level();
     int level = calc_output_level_with_trigger(state, trigger);
     esp_err_t ret = gpio_set_level(GPIO_WASTE_VALVE, level);
@@ -408,6 +418,10 @@ esp_err_t gpio_driver_set_waste_valve(bool state)
 
 esp_err_t gpio_driver_set_return_valve(bool state)
 {
+    if (state && output_state.emergency_active) {
+        ESP_LOGW(TAG, "回水阀开启被拒绝：紧急停止激活中");
+        return ESP_ERR_INVALID_STATE;
+    }
     uint8_t trigger = safe_get_trigger_level();
     int level = calc_output_level_with_trigger(state, trigger);
     esp_err_t ret = gpio_set_level(GPIO_RETURN_VALVE, level);
@@ -427,6 +441,10 @@ esp_err_t gpio_driver_set_return_valve(bool state)
 
 esp_err_t gpio_driver_set_boost_pump(bool state)
 {
+    if (state && output_state.emergency_active) {
+        ESP_LOGW(TAG, "增压泵开启被拒绝：紧急停止激活中");
+        return ESP_ERR_INVALID_STATE;
+    }
     uint8_t trigger = safe_get_trigger_level();
     int level = calc_output_level_with_trigger(state, trigger);
     esp_err_t ret = gpio_set_level(GPIO_BOOST_PUMP, level);
@@ -446,7 +464,7 @@ esp_err_t gpio_driver_set_boost_pump(bool state)
 
 esp_err_t gpio_driver_emergency_stop(void)
 {
-    ESP_LOGW(TAG, "紧急停止！关闭所有输出设备");
+    ESP_LOGW(TAG, "紧急停止！关闭所有输出设备并锁定");
 
     uint8_t trigger = safe_get_trigger_level();
     int inactive_level = calc_output_level_with_trigger(false, trigger);
@@ -463,17 +481,35 @@ esp_err_t gpio_driver_emergency_stop(void)
         output_state.waste_valve = false;
         output_state.return_valve = false;
         output_state.boost_pump = false;
+        output_state.emergency_active = true;  // 锁定：阻止后续set_*开启输出
         xSemaphoreGive(output_mutex);
     } else {
-        /* 最终降级：直接写（硬件已关闭，软件状态短暂不一致）
-         * 软件状态将在下次gpio_driver_set_*调用时通过mutex恢复一致 */
+        /* 最终降级：直接写（硬件已关闭，软件状态短暂不一致） */
         output_state.inlet_valve = false;
         output_state.waste_valve = false;
         output_state.return_valve = false;
         output_state.boost_pump = false;
-        ESP_LOGE(TAG, "emergency_stop: mutex重试失败，软件状态已直接更新（下次操作时恢复一致）");
+        output_state.emergency_active = true;
+        ESP_LOGE(TAG, "emergency_stop: mutex重试失败，软件状态已直接更新");
     }
 
+    return ESP_OK;
+}
+
+esp_err_t gpio_driver_clear_emergency(void)
+{
+    if (!output_state.emergency_active) {
+        return ESP_OK;  // 未在紧急状态，无需操作
+    }
+
+    if (output_mutex && output_mutex_take_with_retry()) {
+        output_state.emergency_active = false;
+        xSemaphoreGive(output_mutex);
+        ESP_LOGI(TAG, "紧急停止已解除，允许正常操作");
+    } else {
+        output_state.emergency_active = false;  // 降级：直接清除
+        ESP_LOGW(TAG, "紧急停止已解除（降级模式）");
+    }
     return ESP_OK;
 }
 

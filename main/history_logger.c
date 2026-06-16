@@ -305,6 +305,21 @@ esp_err_t history_logger_deinit(void)
         return ESP_OK;
     }
 
+    // 反初始化前保存所有dirty数据，防止丢失
+    if (ctx.mutex && xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (ctx.history_dirty) {
+            ESP_LOGI(TAG, "反初始化时保存历史记录");
+            save_to_nvs();
+        }
+        if (ctx.daily_stats_dirty) {
+            ESP_LOGI(TAG, "反初始化时保存每日统计");
+            save_daily_to_nvs();
+        }
+        xSemaphoreGive(ctx.mutex);
+    } else {
+        ESP_LOGW(TAG, "deinit: mutex获取失败，脏数据可能丢失");
+    }
+
     if (ctx.mutex) {
         vSemaphoreDelete(ctx.mutex);
         ctx.mutex = NULL;
@@ -546,8 +561,9 @@ esp_err_t history_update_daily_tds(float tds_in, float tds_out)
     if (ctx.today.tds_sample_count < UINT16_MAX) {
         ctx.today.tds_sample_count++;
     }
-    // 计算alpha：当样本数达到上限时，使用固定alpha防止平均值冻结
-    float alpha = 1.0f / (float)ctx.today.tds_sample_count;
+    // 计算alpha：防止除零（count为0时退化为简单赋值）
+    uint16_t count = ctx.today.tds_sample_count;
+    float alpha = (count > 0) ? (1.0f / (float)count) : 1.0f;
     if (alpha < 0.0005f) {
         // 样本数超过2000时，使用固定alpha确保平均值仍能响应新数据
         alpha = 0.0005f;  // 每2000次采样权重为1

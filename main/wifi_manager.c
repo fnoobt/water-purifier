@@ -320,12 +320,17 @@ esp_err_t wifi_manager_stop(void)
                 TaskHandle_t task = ctx.reconnect_task_handle;
                 ctx.reconnect_task_handle = NULL;
                 xSemaphoreGive(ctx.state_mutex);
-                // 先注销看门狗（任务可能已注册），防止资源泄漏
-                esp_err_t wdt_ret = esp_task_wdt_delete(task);
-                if (wdt_ret != ESP_OK && wdt_ret != ESP_ERR_NOT_FOUND) {
-                    ESP_LOGW(TAG, "注销重连任务看门狗异常: %s", esp_err_to_name(wdt_ret));
+                // 检查任务是否仍然存在（防止任务已自行退出导致use-after-free）
+                eTaskState task_state = eTaskGetState(task);
+                if (task_state != eDeleted && task_state != eInvalid) {
+                    esp_err_t wdt_ret = esp_task_wdt_delete(task);
+                    if (wdt_ret != ESP_OK && wdt_ret != ESP_ERR_NOT_FOUND) {
+                        ESP_LOGW(TAG, "注销重连任务看门狗异常: %s", esp_err_to_name(wdt_ret));
+                    }
+                    vTaskDelete(task);
+                } else {
+                    ESP_LOGD(TAG, "重连任务已自行退出，跳过删除");
                 }
-                vTaskDelete(task);
             } else {
                 xSemaphoreGive(ctx.state_mutex);
             }
@@ -335,14 +340,16 @@ esp_err_t wifi_manager_stop(void)
 
     if (!task_cleaned) {
         // 最后手段：强制清除标志并删除任务
-        // 注：vTaskDelete 对正在 vTaskDelay 中的任务是安全的（任务未持锁）
         ESP_LOGW(TAG, "获取mutex失败，强制清除重连任务");
         ctx.reconnect_active = false;
         TaskHandle_t task = ctx.reconnect_task_handle;
         ctx.reconnect_task_handle = NULL;
         if (task) {
-            esp_task_wdt_delete(task);  // 先注销看门狗
-            vTaskDelete(task);
+            eTaskState task_state = eTaskGetState(task);
+            if (task_state != eDeleted && task_state != eInvalid) {
+                esp_task_wdt_delete(task);
+                vTaskDelete(task);
+            }
         }
     }
 
@@ -361,8 +368,20 @@ esp_err_t wifi_manager_set_config(const char *ssid, const char *password)
 {
     if (!ssid || !password) return ESP_ERR_INVALID_ARG;
 
-    strncpy(ctx.ssid, ssid, sizeof(ctx.ssid) - 1);
-    strncpy(ctx.password, password, sizeof(ctx.password) - 1);
+    // mutex保护ssid/password写入，防止与重连任务并发读取竞态
+    if (ctx.state_mutex && xSemaphoreTake(ctx.state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        strncpy(ctx.ssid, ssid, sizeof(ctx.ssid) - 1);
+        ctx.ssid[sizeof(ctx.ssid) - 1] = '\0';
+        strncpy(ctx.password, password, sizeof(ctx.password) - 1);
+        ctx.password[sizeof(ctx.password) - 1] = '\0';
+        xSemaphoreGive(ctx.state_mutex);
+    } else {
+        ESP_LOGW(TAG, "set_config: mutex获取失败，直接更新（可能竞态）");
+        strncpy(ctx.ssid, ssid, sizeof(ctx.ssid) - 1);
+        ctx.ssid[sizeof(ctx.ssid) - 1] = '\0';
+        strncpy(ctx.password, password, sizeof(ctx.password) - 1);
+        ctx.password[sizeof(ctx.password) - 1] = '\0';
+    }
 
     wifi_config_t wifi_cfg = {0};
     strncpy((char*)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid));

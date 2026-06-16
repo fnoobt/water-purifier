@@ -149,6 +149,8 @@ WaterPurifier/
 
 **输出互斥锁**: `output_state` 结构体受 `output_mutex` 保护，防止跨任务访问竞态。`gpio_driver_set_*` 函数在 GPIO 设置成功后获取 mutex 更新软件状态，若 mutex 获取失败会重试 3 次（每次 50ms，总计最多 150ms），确保硬件状态与软件状态一致。紧急停止函数使用更短超时以优先保证响应速度。
 
+**紧急停止锁定**: `gpio_driver_emergency_stop()` 关闭全部输出并设置 `emergency_active` 标志，此后所有 `set_*` 函数拒绝开启输出（允许关闭）。需由 FSM 在安全条件下调用 `gpio_driver_clear_emergency()` 手动解除锁定。漏水报警时自动激活紧急锁定。
+
 **主要函数**:
 ```c
 esp_err_t gpio_driver_init_inputs(void);
@@ -170,6 +172,7 @@ esp_err_t gpio_driver_set_boost_pump(bool state);
 esp_err_t gpio_driver_set_led1(bool state);
 esp_err_t gpio_driver_set_led2(bool state);
 esp_err_t gpio_driver_emergency_stop(void);
+esp_err_t gpio_driver_clear_emergency(void);
 esp_err_t gpio_driver_get_output_states(bool *inlet, bool *waste, bool *return, bool *pump);
 
 esp_err_t gpio_driver_set_relay_trigger_level(uint8_t level);
@@ -1150,32 +1153,17 @@ POST /api/ota/rollback
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
-| 1.0.0 | 2025-02 | 初始版本，75G RO膜 + 3G压力桶 |
-| 1.0.1 | 2026-04 | 可配置RO膜/泵/压力桶，双维度滤芯管理，移除排空功能 |
-| 1.0.2 | 2026-04 | 双阶段冲洗，水锤控制，NVS脏数据节流，滤芯日历寿命NTP墙钟 |
-| 1.0.3 | 2026-04 | 故障改停止，水锤自适应，冲洗时间统计修复，API重命名 |
-| 1.0.4 | 2026-04 | 换芯冲洗，WiFi重连优化，mDNS/SNTP防护 |
-| 1.0.5 | 2026-04 | 滤芯管理独立为filter_manager，TDS校准持久化 |
-| 1.1.0 | 2026-04 | OTA固件升级功能，待机循环修复 |
-| 1.1.1 | 2026-04 | 换芯冲洗20分钟，standby_manual清除优化，FLUSH_PHASE_RUNNING守卫 |
-| 1.1.2 | 2026-04 | 滤芯默认容量修正，网页双维度设置，WiFi TX滞回窗口，fsm_force_standby修复 |
-| 1.2.0 | 2026-04 | ESP-IDF v6.0.0适配，ADC驱动重构，WiFi/MQTT API更新 |
-| 1.2.1 | 2026-05 | 滤芯水量精确计量（制水/冲洗分离），总用水量+制水量双显示，Web日志页，WiFi重连稳定性 |
-| 1.2.2 | 2026-05-17 | **代码审查修复**：TDS温度补偿方向修正、水锤控制竞态修复、线程安全增强（config/GPIO/MQTT）、NVS错误处理完善、OTA回滚时序修正、总制水量NVS持久化补全 |
-| 1.2.3 | 2026-05-19 | Web日志页增强：SNTP时间戳、DEBUG日志启用、级别过滤、空行跳过、自动滚动修复；OTA状态页增强：回滚状态检测、是否可升级提示、禁用按钮、错误提示；Flash保存周期新增4小时选项；日志噪声优化 |
-| 1.2.4 | 2026-05-19 | OTA分区切换功能：恢复出厂固件按钮、回滚到上一OTA固件按钮、API接口 `/api/ota/factory` 和 `/api/ota/rollback` |
-| 1.2.5 | 2026-05-20 | **代码审查修复（Critical/High）**：TDS温度补偿公式修正（multiply→divide）、Web服务器栈溢出修复（12KB）、FSM水量计算防绕过、日志缓冲区截断处理、FSM mutex泄漏修复、OTA写入计数修正（写入成功后增加） |
-| 1.2.6 | 2026-05-20 | **代码审查修复（Medium）**：WiFi/MQTT重连任务竞态修复（reconnect_active标志）、MQTT发布参数NULL验证、任务栈优化（WiFi/MQTT重连4KB）；**日志清理**：移除重复初始化日志、降级重连轮询日志为DEBUG级别、合并FSM水量重复日志；**内存优化**：移除config_manager冗余NVS检查 |
-| 1.2.7 | 2026-05-21 | **ESP-IDF v6.0兼容性修复**：httpd `max_open_sockets=3`（LWIP_MAX_SOCKETS=6，httpd内部占用3） |
-| 1.2.8 | 2026-05-22 | **Web日志缓冲区修复**：`s_log_head`快照避免竞态条件、解析边界检查（确保日志内容完整性）；**TDS纯水洗膜修复**：跳过报警检测（泵停止期间无水流导致读数无效） |
-| 1.2.9 | 2026-05-22 | **ESP32-C3专用优化**：简化pm_manager移除DFS死代码（ESP32-C3不支持动态频率调节），CPU固定160MHz；**管理页面**：新增重启按钮（二次确认），调整控制面板按钮顺序避免红色按钮相邻 |
-| 2.2.1 | 2026-05-21 | **固件优化**：编译器SIZE优化、禁用GDB stub、禁用mbedTLS证书捆绑包（节省~50KB）、日志缓冲区4KB、生产级日志级别INFO；**代码清理**：删除6个废弃函数、NVS错误处理简化、pm_manager ESP32-C3 DFS跳过；**Web日志页**：级别解析修复、浅色背景；**版本管理**：手动版本号（CMake VERSION） |
-| 2.2.5 | 2026-05-24 | **Web日志缓冲区修复**：snprintf返回值溢出修复（防止缓冲区填满时内容丢失）、日志拦截器提前启动（捕获全部初始化日志）；**OTA状态修复**：ESP_OTA_IMG_NEW状态处理、异常状态自动标记有效、错误状态显示修复；**Flash保存周期**：新增4小时选项；**日志级别**：完善全部OTA状态显示（NEW/PENDING_VERIFY/VALID/INVALID/ABORTED） |
-| 2.3.0 | 2026-05-24 | **NVS架构统一**：废弃独立命名空间（wifi/mqtt_config/wp_rt），统一到water_purifier/wp_filters/history/daily_stats四命名空间；**迁移机制**：首次启动自动迁移旧数据并清理废弃命名空间；**数据一致性**：消除总用水量761L vs 218L等重复存储问题；**代码简化**：WiFi/MQTT模块改用config_manager接口，移除wp_rt运行数据持久化（改为临时状态）；**Web Basic Auth**：管理页面/OTA/日志需认证，首页/WiFi配网公开；Session Cookie 24小时滑动过期；管理页面新增认证配置开关；**日志优化**：10KB HTML缓冲区、正向读取（新日志在底部）、智能跳过旧日志、内存检查保护；**HTTP稳定性**：接收/发送超时10秒；**Web日志显示优化**：两阶段扫描（逆向计算+正向输出），确保新日志完整显示，跳过提示"... (跳过X条旧日志，显示最新Y条)"；**OTA回滚配置**：启用CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE，bootloader自动转换NEW→PENDING_VERIFY状态；**OTA状态处理**：NEW状态显式处理，改进错误日志提示 |
-| 2.3.1 | 2026-05-25 | **电源管理模块完善**：pm_manager WiFi TX功率滞回算法文档完善（5档功率表+滞回阈值说明）、初始化流程添加步骤6 pm_manager_init() |
-| 2.3.4 | 2026-05-26 | **日志显示修复**：简化读取逻辑（移除复杂两阶段扫描+重试），输出缓冲区扩大至16KB（容纳HTML格式化后的日志）。原generation计数器验证不完整（仅检测缓冲区溢出，不检测绕回写入导致的数据损坏） |
-| 2.3.5 | 2026-06-07 | **存储优化**：CSS样式合并优化（4个HTML页面统一使用SHARED_CSS/LOG_CSS宏，消除重复约5KB），历史记录数量优化（HISTORY_MAX_RECORDS从20改为15，节省约500字节RAM+NVS） |
-| 2.4.x | 2026-06-11~12 | **三轮代码审计+架构优化（36项）**：PM低内存直接esp_restart()；history_clear_all原子化；filter负数检查+累加器余数提交+旧格式迁移；wifi_manager_stop 3次重试+看门狗注销；OTA版本sscanf数值比较+esp_ota_abort移出临界区+预览NULL检查；config_manager先写NVS后更新内存+迁移返回值检查+TDS校准钳位+validate范围校验；Web strcpy→strlcpy+session spinlock+cJSON统一构建+WiFi认证防劫持；mqtt spinlock获取client句柄+重连看门狗注销+subscribe竞态修复；FSM水量公共函数+mutex保护+冲洗双计修复；GPIO mutex重试+安全退出；tds mutex保护+安全退出；history脏标志保护+跨天NVS返回值检查；config_manager extern→include解耦；monitor_task去冗余。2026-06-15 | **第五轮审计+固件瘦身（12项）**：① sdkconfig裁剪未用特性（WiFi Mesh/以太网/企业WiFi/SAE-PK/OWE/SoftAP-SAE/GDB stub/IP分片），预估节省200-300KB Flash；② uptime uint32→uint64修复49.7天回绕（web_server + mqtt_client）；③ MQTT类型定义去重（mqtt_client.c删除5个重复类型，统一由app_mqtt.h提供）；④ gpio_config.h清理死代码（4个未引用枚举+2个pin mask宏+gpio_driver_set_led_mode死函数）；⑤ tds_sensor.c删除死代码temperature_compensation；⑥ board_params.h/gpio_config.h清理16个旧架构残留宏；⑦ GPIO防抖宏名统一（DEBOUNCE_MS→GPIO_DEBOUNCE_TIME_MS）；⑧ daily_stats NVS累积清理（跨天自动删除30天前key）；⑨ filter累加器单次输入上限保护（防uint32溢出）；⑩ filter waste/pump_flow_lph误设save_needed修复；⑪ handle_log_debug流式输出改造（httpd_resp_send_chunk分块传输，堆占用18KB→1KB，httpd栈20KB→8KB，净省~27KB RAM）；⑫ TDS任务栈2KB→3KB+栈水位监控（handle_status新增stackTDS/stackMonitor字段） |
+| 1.0.x | 2025-02~2026-04 | 基础功能：75G RO膜+3G压力桶，可配置参数，双阶段冲洗+水锤控制，滤芯管理独立，WiFi重连优化 |
+| 1.1.x | 2026-04 | OTA固件升级，换芯冲洗，网页双维度设置，WiFi TX滞回 |
+| 1.2.0~1.2.1 | 2026-04~05 | ESP-IDF v6.0适配，滤芯水量精确计量（制水/冲洗分离），Web日志页 |
+| 1.2.2~1.2.4 | 2026-05-17~19 | 代码审计修复（TDS温度补偿/竞态/线程安全/NVS），Web日志增强+OTA分区切换 |
+| 1.2.5~1.2.6 | 2026-05-20 | 代码审计 Critical~Medium：TDS公式修正，Web栈溢出，WiFi/MQTT竞态，日志噪声 |
+| 1.2.7~1.2.9 | 2026-05-21~22 | ESP-IDF兼容修复，Web日志竞态+TDS纯水修复，ESP32-C3 DFS优化，重启按钮 |
+| 2.2.x | 2026-05-21~24 | 固件瘦身（编译优化+mbedTLS裁剪~50KB），日志拦截器，OTA状态完善，手动版本号 |
+| 2.3.0 | 2026-05-24 | NVS四命名空间统一+自动迁移，Web Basic Auth+Session，日志两阶段优化，OTA回滚 |
+| 2.3.1~2.3.5 | 2026-05-25~06-07 | pm_manager TX滞回文档，日志显示修复，CSS合并+历史记录优化 |
+| 2.4.0 | 2026-06-11~12 | PM/history/filter/wifi/OTA/config/Web/mqtt/FSM/GPIO/tds 竞态修复+线程安全+架构优化 |
+| 2.4.1 | 2026-06-16 | sdkconfig裁剪，uptime uint64溢出修复，死代码清理，NVS daily_stats自动清理，log_debug流式输出省27KB RAM，冲洗时长修复，config原子操作，GPIO紧急锁定，history除零保护+deinit保存，WiFi use-after-free修复，FSM漏水锁定+clear_emergency，pm功率表修正，OTA sscanf校验，冲洗时长日志修复 |
 
 ---
 

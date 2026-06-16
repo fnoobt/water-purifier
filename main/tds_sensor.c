@@ -566,6 +566,14 @@ esp_err_t tds_sensor_set_alarm_threshold(tds_sensor_id_t sensor_id, float thresh
         return ESP_ERR_INVALID_ARG;
     }
 
+    // 范围校验：进水0-2000ppm，出水0-500ppm
+    float max_val = (sensor_id == TDS_SENSOR_INLET) ? 2000.0f : 500.0f;
+    if (threshold < 0.0f || threshold > max_val) {
+        ESP_LOGW(TAG, "set_alarm_threshold(%s): %.1f超出范围[0,%.0f]，拒绝",
+                 sensor_names[sensor_id], threshold, max_val);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         tds_ctx.alarm_threshold[sensor_id] = threshold;
         xSemaphoreGive(tds_ctx.data_mutex);

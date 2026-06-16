@@ -258,15 +258,19 @@ esp_err_t ota_update_write(const uint8_t *data, size_t len)
         // 版本比较：解析为数值进行语义化版本比较（避免字符串字典序问题 "1.0.10" < "1.0.9"）
         int new_major = 0, new_minor = 0, new_patch = 0;
         int run_major = 0, run_minor = 0, run_patch = 0;
-        sscanf(app_desc->version, "%d.%d.%d", &new_major, &new_minor, &new_patch);
-        sscanf(s_ctx.running_version, "%d.%d.%d", &run_major, &run_minor, &run_patch);
+        int new_parsed = sscanf(app_desc->version, "%d.%d.%d", &new_major, &new_minor, &new_patch);
+        int run_parsed = sscanf(s_ctx.running_version, "%d.%d.%d", &run_major, &run_minor, &run_patch);
 
-        bool same_version = (new_major == run_major && new_minor == run_minor && new_patch == run_patch);
-        if (same_version) {
-            ESP_LOGW(TAG, "固件版本号相同 (%s)，允许升级（可能包含bug修复）", app_desc->version);
-            // 不阻止升级，只是输出警告
+        if (new_parsed < 3 || run_parsed < 3) {
+            ESP_LOGW(TAG, "版本格式异常: new=%s(parsed=%d), run=%s(parsed=%d)，允许升级",
+                     app_desc->version, new_parsed, s_ctx.running_version, run_parsed);
         } else {
-            ESP_LOGI(TAG, "版本变更: %s -> %s", s_ctx.running_version, app_desc->version);
+            bool same_version = (new_major == run_major && new_minor == run_minor && new_patch == run_patch);
+            if (same_version) {
+                ESP_LOGW(TAG, "固件版本号相同 (%s)，允许升级（可能包含bug修复）", app_desc->version);
+            } else {
+                ESP_LOGI(TAG, "版本变更: %s -> %s", s_ctx.running_version, app_desc->version);
+            }
         }
 
         // 启动 OTA 写入

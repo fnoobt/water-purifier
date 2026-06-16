@@ -292,14 +292,8 @@ static void transition_to_pure_flush(void)
              fsm_ctx.water_hammer_pump_stop_delay_ms,
              fsm_ctx.water_hammer_valve_close_delay_ms);
 
-    // 冲洗时长已在execute_normal_flush中统计，此处无需重复
-
-    // 保存常规冲洗时间供transition_to日志使用
-    if (fsm_ctx.flush_start_time > 0) {
-        fsm_ctx.pending_flush_duration_sec = (uint32_t)get_elapsed_sec(fsm_ctx.flush_start_time);
-    } else {
-        fsm_ctx.pending_flush_duration_sec = 0;
-    }
+    // 冲洗时长和 pending_flush_duration_sec 已在 execute_normal_flush 中正确设置
+    // 此处不再重复计算（accumulate_flush_water(true) 已清零 flush_start_time）
 
     gpio_driver_set_boost_pump(false);   // 先停泵
 
@@ -365,6 +359,7 @@ static void record_stop(stop_type_t type, const char *description)
         fsm_ctx.stop_history[idx].description[copy_len] = '\0';
         fsm_ctx.stop_history_index++;
 
+        fsm_ctx.runtime_dirty = true;  // 在mutex内设置脏标志
         xSemaphoreGive(fsm_ctx.runtime_data_mutex);
     } else {
         /* mutex获取失败，丢弃本次记录以保证数据一致性
@@ -373,8 +368,6 @@ static void record_stop(stop_type_t type, const char *description)
     }
 
     ESP_LOGE(TAG, "停止记录: %s", description);
-
-    fsm_ctx.runtime_dirty = true;
 }
 
 static void transition_to(fsm_state_t new_state)
@@ -404,6 +397,45 @@ static void transition_to(fsm_state_t new_state)
     fsm_ctx.state_init_done = false;
     taskEXIT_CRITICAL(&fsm_spinlock);
 
+    /* 冲洗状态退出时：如果冲洗计时器仍运行（中断退出），计算实际时长和水量
+     * 正常完成时 flush_start_time 已被 execute_* 清零，不会进入此分支
+     * 覆盖所有中断路径：用水中断→待机、漏水→报警、缺水→保护
+     * 注意：必须先于 accumulate_flush_water 执行，否则计时器被清后无法计算 */
+    /* 中断路径：计算冲洗时长和水统计 */
+    if ((old_state == FSM_STATE_PURE_FLUSH || old_state == FSM_STATE_NORMAL_FLUSH)
+        && (fsm_ctx.flush_start_time > 0 || (fsm_ctx.filter_flush_mode && fsm_ctx.filter_flush_start > 0))) {
+
+        uint64_t flush_sec = 0;
+
+        // 换芯冲洗使用总计时器
+        if (fsm_ctx.filter_flush_mode && fsm_ctx.filter_flush_start > 0) {
+            flush_sec = get_elapsed_sec(fsm_ctx.filter_flush_start);
+            fsm_ctx.filter_flush_start = 0;
+            fsm_ctx.filter_flush_mode = false;
+        }
+        // 常规冲洗/纯水洗膜使用单循环计时器
+        else if (fsm_ctx.flush_start_time > 0) {
+            flush_sec = get_elapsed_sec(fsm_ctx.flush_start_time);
+            fsm_ctx.flush_start_time = 0;
+        }
+
+        fsm_ctx.pending_flush_duration_sec = (uint32_t)flush_sec;
+
+        /* 中断路径的水量统计（仅常规冲洗有水量，纯水洗膜泵已关闭无水） */
+        if (old_state == FSM_STATE_NORMAL_FLUSH && flush_sec > 0 &&
+            (new_state == FSM_STATE_LEAK_ALARM || new_state == FSM_STATE_STOP ||
+             new_state == FSM_STATE_WATER_SHORTAGE || new_state == FSM_STATE_STANDBY)) {
+            float pump_rate = filter_mgr_get_pump_flow_lph();
+            float pre_liters = (float)flush_sec * pump_rate / 3600.0f;
+            if (pre_liters > 0.1f) {
+                filter_mgr_update_water_usage_dual(pre_liters, 0.0f);
+            }
+            fsm_ctx.runtime_data.total_flush_time_sec += flush_sec;
+            fsm_ctx.runtime_data.last_flush_time = esp_timer_get_time();
+            fsm_ctx.runtime_dirty = true;
+        }
+    }
+
     /* 重置LED闪烁静态变量，避免跨状态残留 */
     led_reset_blink_state();
 
@@ -430,6 +462,21 @@ static void transition_to(fsm_state_t new_state)
         ESP_LOGI(TAG, "状态转换: 纯水洗膜(%lu秒) -> 待机",
                  fsm_ctx.pending_flush_duration_sec);
         fsm_ctx.pending_flush_duration_sec = 0;  // 清除临时变量
+        if (fsm_ctx.state_callback) {
+            fsm_ctx.state_callback(old_state, new_state);
+        }
+        return;
+    }
+
+    /* 常规冲洗 -> 待机：包含冲洗时长（网页中断或换芯冲洗完成） */
+    if (new_state == FSM_STATE_STANDBY && old_state == FSM_STATE_NORMAL_FLUSH) {
+        if (fsm_ctx.pending_flush_duration_sec > 0) {
+            ESP_LOGI(TAG, "状态转换: 常规冲洗(%lu秒) -> 待机",
+                     fsm_ctx.pending_flush_duration_sec);
+        } else {
+            ESP_LOGI(TAG, "状态转换: 常规冲洗 -> 待机");
+        }
+        fsm_ctx.pending_flush_duration_sec = 0;
         if (fsm_ctx.state_callback) {
             fsm_ctx.state_callback(old_state, new_state);
         }
@@ -727,6 +774,10 @@ static void execute_normal_flush(void)
             // 完整冲洗周期（常规+纯水）的每日计数由 execute_pure_flush 完成时统一递增，
             // 避免一次完整冲洗被计为两次
 
+            // accumulate_flush_water(true) 已将 flush_start_time 清零，
+            // 必须在此处保存常规冲洗时长，供 transition_to 日志使用
+            fsm_ctx.pending_flush_duration_sec = (uint32_t)flush_dur_sec;
+
             transition_to_pure_flush();
         }
     }
@@ -823,7 +874,7 @@ static void execute_water_shortage(void)
 static void execute_leak_alarm(void)
 {
     if (!fsm_ctx.state_init_done) {
-        stop_all_outputs();
+        gpio_driver_emergency_stop();  // 紧急停止并锁定，防止恢复前误操作
         fsm_ctx.state_init_done = true;
         record_stop(STOP_TYPE_WATER_LEAK, "检测到漏水");
     }
@@ -1027,6 +1078,7 @@ static void fsm_task(void *arg)
                     fsm_ctx.leak_detected = false;
                     fsm_ctx.leak_detect_start_time = 0;
                     fsm_ctx.standby_manual = false;
+                    gpio_driver_clear_emergency();  // 解除GPIO紧急锁定，允许输出操作
                     transition_to(FSM_STATE_STANDBY);
                 }
             } else if (event == FSM_EVENT_FORCE_FLUSH) {

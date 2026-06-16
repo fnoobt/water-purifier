@@ -72,32 +72,41 @@ esp_err_t pm_manager_set_cpu_mode(bool low_power)
 /**
  * @brief WiFi TX功率滞回表
  *
- * ESP32-C3只支持特定的离散功率值，API输入值与实际功率有映射关系：
- * - 输入范围[34,43] → 实际值34 → 8dBm
- * - 输入范围[44,51] → 实际值44 → 11dBm
- * - 输入范围[60,65] → 实际值60 → 15dBm
- * - 输入范围[72,79] → 实际值72 → 18dBm
- * - 输入范围[80,84] → 实际值80 → 20dBm
+ * ESP32-C3的WiFi TX功率仅支持以下离散值（wifi_power_t枚举）：
+ * -1, 2, 5, 8.5, 11, 13, 15, 17, 18.5, 19.5 dBm
+ * API输入值(qdbm) = dBm × 4，非枚举值的输入会被硬件舍入到邻近有效值
+ *
+ * 本表选取5个有效离散值：8.5/11/15/18.5/20 dBm
  *
  * up_rssi: 低于此值 → 升一档功率（信号变差确认）
  * down_rssi: 高于此值 → 降一档功率（信号变好确认）
- * tx_dbm:  该档位的目标功率(dBm)，使用ESP32-C3支持的离散值
+ * tx_dbm:  该档位的目标功率(dBm)
  * tx_qdbm: API输入值(0.25dBm单位)，直接传给esp_wifi_set_max_tx_power()
  *
- * 滞回设计原则：相邻档位的阈值至少相差10dB，防止边界波动频繁切换
+ * 滞回设计原则：
+ *   1. 每档自滞回窗口 ≥ 10dB（down - up ≥ 10），防止同档位内频繁切换
+ *   2. 相邻档位切换点间距 ≥ 10dB（down_i - up_{i-1} ≥ 10），防止跨档位振荡
+ *   3. 滞回带互不重叠，任意RSSI下只有一个稳定档位
  * 连续确认机制：RSSI需连续3次超出阈值才触发调整
+ *
+ * 档位布局（10dB等间隔）：
+ *   20dBm   | up≤-95  down≥-85
+ *   18.5dBm | up≤-85  down≥-75   gap=10
+ *   15dBm   | up≤-75  down≥-65   gap=10
+ *   11dBm   | up≤-65  down≥-55   gap=10
+ *   8.5dBm  | up≤-55  down≥-45   gap=10
  */
 static const struct {
     int8_t up_rssi;    // 升功率阈值（低于此值升一档）
     int8_t down_rssi;  // 降功率阈值（高于此值降一档）
-    int8_t tx_dbm;     // 目标功率(dBm) - ESP32-C3支持的离散值
+    int8_t tx_dbm;     // 目标功率(dBm) - 对应wifi_power_t离散值
     uint8_t tx_qdbm;   // API输入值(0.25dBm) - 直接传给API
 } s_pwr_table[] = {
-    { -60, -45,  8,  34 },  // 8dBm:  RSSI<-60升到11dBm, >=-45保持
-    { -70, -50, 11,  44 },  // 11dBm: RSSI<-70升到15dBm, >=-50降到8dBm
-    { -80, -55, 15,  60 },  // 15dBm: RSSI<-80升到18dBm, >=-55降到11dBm
-    { -90, -60, 18,  72 },  // 18dBm: RSSI<-90升到20dBm, >=-60降到15dBm
-    { -99, -70, 20,  80 },  // 20dBm: >=-70降到18dBm, 不自动升更高
+    { -55, -45,  8,  34 },  // 8.5dBm:  RSSI<-55升, ≥-45降  (自滞回10dB)
+    { -65, -55, 11,  44 },  // 11dBm:   RSSI<-65升, ≥-55降  (自滞回10dB, 邻距10dB)
+    { -75, -65, 15,  60 },  // 15dBm:   RSSI<-75升, ≥-65降  (自滞回10dB, 邻距10dB)
+    { -85, -75, 18,  74 },  // 18.5dBm: RSSI<-85升, ≥-75降  (自滞回10dB, 邻距10dB)
+    { -95, -85, 20,  80 },  // 20dBm:   RSSI<-95升, ≥-85降  (自滞回10dB, 邻距10dB)
 };
 
 #define PWR_TABLE_SIZE (sizeof(s_pwr_table) / sizeof(s_pwr_table[0]))
@@ -129,11 +138,11 @@ esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
     }
 
     if (current_idx < 0) {
-        // 当前功率不在表中（可能被外部修改），默认使用中间档位(15dBm=60)
+        // 当前功率不在表中（可能被外部修改），默认使用中间档位
         // 选择中间档位而非最大功率，避免功耗过高；后续滞回算法会自动调整到合适档位
-        current_idx = 2;  // 15dBm档
-        ESP_LOGD(TAG, "当前功率%d(%.2fdBm)不在表中，默认中间档位15dBm",
-                 actual_power, actual_power / 4.0f);
+        current_idx = PWR_TABLE_SIZE / 2;  // 动态取中间档位
+        ESP_LOGD(TAG, "当前功率%d(%.2fdBm)不在表中，默认中间档位%ddBm",
+                 actual_power, actual_power / 4.0f, s_pwr_table[current_idx].tx_dbm);
     }
 
     // 滞回判断
@@ -194,11 +203,11 @@ esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
     s_ctx.pending_direction = 0;
     s_ctx.pending_count = 0;
     // 更新日志所需的功率值（使用spinlock内的实际值，而非函数开头读取的值）
-    uint8_t old_power_log = s_pwr_table[current_idx].tx_qdbm;
+    int8_t old_dbm = s_pwr_table[current_idx].tx_dbm;
     taskEXIT_CRITICAL(&pm_spinlock);
 
-    ESP_LOGI(TAG, "WiFi TX功率调整: RSSI=%ddBm, %ddBm→%ddBm (连续3次确认)",
-             rssi, old_power_log / 4, s_pwr_table[new_idx].tx_dbm);
+    ESP_LOGI(TAG, "WiFi TX功率调整: RSSI=%ddBm, %d→%ddBm (连续3次确认)",
+             rssi, old_dbm, s_pwr_table[new_idx].tx_dbm);
     return ESP_OK;
 }
 
