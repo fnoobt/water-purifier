@@ -30,10 +30,13 @@ esp_err_t pm_manager_set_cpu_mode(bool low_power);
 
 /**
  * @brief 根据RSSI动态调整WiFi TX功率
- * @note ESP32-C3只支持离散功率值: 8, 11, 15, 18, 20 dBm
- *       使用滞回算法避免频繁切换：
+ * @note ESP32-C3只支持离散功率值: 8.5, 11, 15, 18.5, 20 dBm
+ *       使用滞回算法+冷却机制避免频繁切换：
+ *       - 15dB滞回窗口，相邻档位间产生5dB死区
  *       - RSSI < up_rssi: 升一档功率（信号变差）
  *       - RSSI >= down_rssi: 降一档功率（信号变好）
+ *       - RSSI在死区内: 不切换（防止边界振荡）
+ *       - 调整后5分钟冷却期，冷却期内不启动新的调整计数
  * @param rssi 当前RSSI值(dBm)
  * @return ESP_OK 成功
  */

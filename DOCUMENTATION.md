@@ -846,19 +846,22 @@ esp_err_t ota_update_rollback(void);
 
 **ESP32-C3限制**: 该芯片不支持DFS动态频率调节，CPU固定160MHz。`pm_manager_set_cpu_mode()` 函数保留接口兼容性但不执行操作。
 
-**WiFi TX功率调整（滞回算法）**:
+**WiFi TX功率调整（滞回算法+冷却机制）**:
 
-| 功率档位 | 升功率阈值(RSSI<) | 降功率阈值(RSSI>=) | 目标功率 |
-|---------|------------------|-------------------|---------|
-| 8 dBm | -55 dBm | -48 dBm | 8 dBm |
-| 11 dBm | -60 dBm | -50 dBm | 11 dBm |
-| 15 dBm | -65 dBm | -53 dBm | 15 dBm |
-| 18 dBm | -75 dBm | -58 dBm | 18 dBm |
-| 20 dBm | -99 dBm | -68 dBm | 20 dBm |
+| 功率档位 | 升功率阈值(RSSI<) | 降功率阈值(RSSI>=) | 目标功率 | 死区范围 |
+|---------|------------------|-------------------|---------|---------|
+| 8.5 dBm | -60 dBm | -45 dBm | 8.5 dBm | -60~-45 |
+| 11 dBm | -70 dBm | -45 dBm | 11 dBm | -60~-45 |
+| 15 dBm | -80 dBm | -55 dBm | 15 dBm | -70~-55 |
+| 18.5 dBm | -90 dBm | -65 dBm | 18.5 dBm | -80~-65 |
+| 20 dBm | -95 dBm | -75 dBm | 20 dBm | -90~-75 |
 
-- **滞回效果**: RSSI在边界附近波动时保持当前功率，只有信号明显变化（跨越滞回窗口）才切换功率
+- **滞回窗口**: 每档15dB（`down - up = 15`），相邻档位间产生5dB死区
+- **死区效果**: RSSI在死区内时不切换功率，防止边界振荡
+- **冷却机制**: 功率调整成功后5分钟内不再启动新的调整计数，作为额外安全网
+- **连续确认**: RSSI需连续3次超出阈值才触发实际调整
 - **调用时机**: WiFi连接后定期调用 `pm_manager_adjust_wifi_tx_power(rssi)`
-- **示例**: 当前11dBm时，RSSI<-60升至15dBm，RSSI>=-50降至8dBm
+- **示例**: 当前11dBm时，RSSI<-70升至15dBm，RSSI>=-45降至8.5dBm，-70~-45范围内保持11dBm不变
 
 **堆内存监控**:
 - 可用堆 < 30KB → 输出警告日志
@@ -1164,6 +1167,7 @@ POST /api/ota/rollback
 | 2.3.1~2.3.5 | 2026-05-25~06-07 | pm_manager TX滞回文档，日志显示修复，CSS合并+历史记录优化 |
 | 2.4.0 | 2026-06-11~12 | PM/history/filter/wifi/OTA/config/Web/mqtt/FSM/GPIO/tds 竞态修复+线程安全+架构优化 |
 | 2.4.1 | 2026-06-16 | sdkconfig裁剪，uptime uint64溢出修复，死代码清理，NVS daily_stats自动清理，log_debug流式输出省27KB RAM，冲洗时长修复，config原子操作，GPIO紧急锁定，history除零保护+deinit保存，WiFi use-after-free修复，FSM漏水锁定+clear_emergency，pm功率表修正，OTA sscanf校验，冲洗时长日志修复 |
+| 2.4.2 | 2026-06-18 | pm_manager滞回表扩大至15dB窗口+5dB死区，新增5分钟冷却期，修复RSSI边界振荡（8.5↔11dBm频繁切换） |
 
 ---
 

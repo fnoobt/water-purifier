@@ -9,10 +9,14 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "PM";
+
+// 功率调整冷却期：调整后至少等待5分钟再允许新的调整
+#define PM_ADJUST_COOLDOWN_US  (5 * 60 * 1000LL)
 
 // ==================== 状态 ====================
 
@@ -24,6 +28,7 @@ static struct {
     bool wifi_tx_adjusted;         // 是否已调整过WiFi功率
     int8_t pending_direction;      // 待调整方向: 0=无, 1=升, -1=降
     uint8_t pending_count;         // 连续超出阈值的次数计数
+    int64_t last_adjust_time_us;   // 上次功率调整的时间戳(微秒)
 } s_ctx = {0};
 
 // ==================== 初始化 ====================
@@ -84,17 +89,18 @@ esp_err_t pm_manager_set_cpu_mode(bool low_power)
  * tx_qdbm: API输入值(0.25dBm单位)，直接传给esp_wifi_set_max_tx_power()
  *
  * 滞回设计原则：
- *   1. 每档自滞回窗口 ≥ 10dB（down - up ≥ 10），防止同档位内频繁切换
- *   2. 相邻档位切换点间距 ≥ 10dB（down_i - up_{i-1} ≥ 10），防止跨档位振荡
- *   3. 滞回带互不重叠，任意RSSI下只有一个稳定档位
+ *   1. 每档自滞回窗口 = 15dB（down - up = 15），产生相邻档位间的死区
+ *   2. 死区 = [上一档down_rssi, 当前档up_rssi]，RSSI在死区内时不切换
+ *   3. 死区覆盖典型RSSI波动范围（~10dB），防止边界振荡
+ *   4. 冷却机制：调整成功后5分钟内不再启动新的调整计数
  * 连续确认机制：RSSI需连续3次超出阈值才触发调整
  *
- * 档位布局（10dB等间隔）：
- *   20dBm   | up≤-95  down≥-85
- *   18.5dBm | up≤-85  down≥-75   gap=10
- *   15dBm   | up≤-75  down≥-65   gap=10
- *   11dBm   | up≤-65  down≥-55   gap=10
- *   8.5dBm  | up≤-55  down≥-45   gap=10
+ * 档位布局（15dB滞回 + 5dB死区）：
+ *   20dBm   | up≤-95  down≥-75
+ *   18.5dBm | up≤-90  down≥-65   死区: -90~-75
+ *   15dBm   | up≤-80  down≥-55   死区: -80~-65
+ *   11dBm   | up≤-70  down≥-45   死区: -70~-55
+ *   8.5dBm  | up≤-60  down≥-45   死区: -60~-45
  */
 static const struct {
     int8_t up_rssi;    // 升功率阈值（低于此值升一档）
@@ -102,11 +108,11 @@ static const struct {
     int8_t tx_dbm;     // 目标功率(dBm) - 对应wifi_power_t离散值
     uint8_t tx_qdbm;   // API输入值(0.25dBm) - 直接传给API
 } s_pwr_table[] = {
-    { -55, -45,  8,  34 },  // 8.5dBm:  RSSI<-55升, ≥-45降  (自滞回10dB)
-    { -65, -55, 11,  44 },  // 11dBm:   RSSI<-65升, ≥-55降  (自滞回10dB, 邻距10dB)
-    { -75, -65, 15,  60 },  // 15dBm:   RSSI<-75升, ≥-65降  (自滞回10dB, 邻距10dB)
-    { -85, -75, 18,  74 },  // 18.5dBm: RSSI<-85升, ≥-75降  (自滞回10dB, 邻距10dB)
-    { -95, -85, 20,  80 },  // 20dBm:   RSSI<-95升, ≥-85降  (自滞回10dB, 邻距10dB)
+    { -60, -45,  8,  34 },  // 8.5dBm:  RSSI<-60升, ≥-45降  (自滞回15dB)
+    { -70, -45, 11,  44 },  // 11dBm:   RSSI<-70升, ≥-45降  (自滞回15dB, 死区-60~-45)
+    { -80, -55, 15,  60 },  // 15dBm:   RSSI<-80升, ≥-55降  (自滞回15dB, 死区-70~-55)
+    { -90, -65, 18,  74 },  // 18.5dBm: RSSI<-90升, ≥-65降  (自滞回15dB, 死区-80~-65)
+    { -95, -75, 20,  80 },  // 20dBm:   RSSI<-95升, ≥-75降  (自滞回15dB, 死区-90~-75)
 };
 
 #define PWR_TABLE_SIZE (sizeof(s_pwr_table) / sizeof(s_pwr_table[0]))
@@ -119,6 +125,14 @@ esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
         return ESP_ERR_INVALID_STATE;
     }
     taskEXIT_CRITICAL(&pm_spinlock);
+
+    // 冷却期检查：调整成功后5分钟内不再启动新的调整计数
+    if (s_ctx.wifi_tx_adjusted) {
+        int64_t now = esp_timer_get_time();
+        if (now - s_ctx.last_adjust_time_us < PM_ADJUST_COOLDOWN_US) {
+            return ESP_OK;  // 冷却期内，跳过调整
+        }
+    }
 
     // 获取当前实际功率值（直接从WiFi驱动读取）
     int8_t actual_power = 0;
@@ -200,6 +214,7 @@ esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
     taskENTER_CRITICAL(&pm_spinlock);
     s_ctx.current_wifi_tx_power = new_power;
     s_ctx.wifi_tx_adjusted = true;
+    s_ctx.last_adjust_time_us = esp_timer_get_time();  // 记录调整时间，启动冷却期
     s_ctx.pending_direction = 0;
     s_ctx.pending_count = 0;
     // 更新日志所需的功率值（使用spinlock内的实际值，而非函数开头读取的值）
