@@ -118,7 +118,7 @@ WaterPurifier/
 ```
 
 **回调函数**:
-- `fsm_state_callback()`: 状态变化时发布MQTT状态更新
+- `fsm_state_callback()`: 状态变化时发布MQTT状态更新，纯水洗膜期间跳过TDS报警检测，离开纯水洗膜时设置5秒TDS稳定窗口
 - `wifi_state_callback()`: WiFi连接后启动MQTT和发送HA发现配置
 
 ---
@@ -224,6 +224,7 @@ esp_err_t tds_sensor_set_alarm_threshold(tds_sensor_id_t id, float threshold);
 esp_err_t tds_sensor_get_alarm_threshold(tds_sensor_id_t id, float *threshold);
 bool tds_sensor_is_alarm(tds_sensor_id_t id);
 esp_err_t tds_sensor_set_skip_alarm_detection(bool skip);  // 纯水冲洗期间跳过
+void tds_sensor_skip_alarm_for_ms(uint32_t duration_ms);   // 泵停机稳定期定时跳过
 ```
 
 **数据结构**:
@@ -595,7 +596,7 @@ water-purifier/set/flush           # 冲洗控制
 **主要功能**:
 - 首页（只读监控，30秒自动刷新，无需认证）
 - 管理页（配置控制，需认证）
-- 日志页（实时串口日志，SNTP同步后显示真实时间戳，需认证）
+- 日志页（实时串口日志，SNTP同步后显示真实时间戳 `[yyyy-mm-dd hh:mm:ss]`，需认证）
 - OTA升级页（固件上传，需认证）
 - RESTful API接口
 - Basic Auth + Session Cookie认证
@@ -618,8 +619,8 @@ water-purifier/set/flush           # 冲洗控制
 - 8KB环形缓冲区 `s_log_buf[LOG_BUF_SIZE]`，存储ESP-IDF原始日志
 - `log_vprintf_hook()` 通过 `esp_log_set_vprintf()` 拦截所有 `ESP_LOG*` 输出
 - 日志拦截器在初始化最开始启动，捕获全部初始化日志
-- `handle_log_debug()` 简单正向读取（旧→新），最新日志显示在底部
-- 输出缓冲区18KB（`LOG_BUF_SIZE * 2 + 2048`），容纳HTML格式化后的日志（约2.2倍膨胀）
+- `handle_log_debug()` 简单正向读取（旧→新），最新日志显示在底部，使用分块流式传输（1KB chunk），避免大块内存分配
+- 日志时间戳格式 `[yyyy-mm-dd hh:mm:ss]`，SNTP同步后由HTTP handler将启动毫秒时间戳转换为墙钟时间
 - 内存检查：可用堆 < 20KB时返回简单错误消息
 
 **HTTP服务器配置**:
@@ -1168,6 +1169,7 @@ POST /api/ota/rollback
 | 2.4.0 | 2026-06-11~12 | PM/history/filter/wifi/OTA/config/Web/mqtt/FSM/GPIO/tds 竞态修复+线程安全+架构优化 |
 | 2.4.1 | 2026-06-16 | sdkconfig裁剪，uptime uint64溢出修复，死代码清理，NVS daily_stats自动清理，log_debug流式输出省27KB RAM，冲洗时长修复，config原子操作，GPIO紧急锁定，history除零保护+deinit保存，WiFi use-after-free修复，FSM漏水锁定+clear_emergency，pm功率表修正，OTA sscanf校验，冲洗时长日志修复 |
 | 2.4.2 | 2026-06-18 | pm_manager滞回表扩大至15dB窗口+5dB死区，新增5分钟冷却期，修复RSSI边界振荡（8.5↔11dBm频繁切换） |
+| 2.4.3 | 2026-06-28 | TDS泵停机瞬态误报修复（5秒定时跳过窗口），日志时间戳改为[yyyy-mm-dd hh:mm:ss]格式 |
 
 ---
 

@@ -16,6 +16,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <stdint.h>
 
 static const char *TAG = "TDS";
 
@@ -27,6 +28,11 @@ static const char *TAG = "TDS";
 
 // 报警迟滞：解除报警需要低于阈值5%，防止阈值附近频繁切换
 #define ALARM_HYSTERESIS_PERCENT 0.05f  // 5%迟滞
+
+// 报警跳过的特殊截止时间值
+#define ALARM_SKIP_INDEFINITE   UINT64_MAX  // 无限期跳过（纯水洗膜期间）
+// 其他非零值：跳过到该时间点（泵停机稳定期）
+// 0：不跳过
 
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
 
@@ -42,8 +48,9 @@ static struct {
     // 报警状态标志（避免重复日志）
     bool alarm_active[TDS_SENSOR_COUNT];
 
-    // 跳过报警检测标志（纯水洗膜期间使用）
-    bool skip_alarm_detection;
+    // 报警跳过截止时间（毫秒，基于esp_timer）
+    // 0=不跳过, UINT64_MAX=无限期跳过(纯水洗膜), 其他值=跳过到该时间点(泵停机稳定期)
+    uint64_t skip_alarm_until_ms;
 
     // 校准参数
     tds_calibration_t calibration[TDS_SENSOR_COUNT];
@@ -57,7 +64,7 @@ static struct {
     .initialized = false,
     .running = false,
     .alarm_threshold = {500.0f, 100.0f},  // 进水500ppm，出水100ppm
-    .skip_alarm_detection = false,
+    .skip_alarm_until_ms = 0,
     .temperature = 25.0f,
 };
 
@@ -191,11 +198,12 @@ static void tds_sensor_task(void *arg)
                      dual.inlet.tds_value, dual.outlet.tds_value, dual.reduction_rate);
 
             // 检查报警（纯水洗膜期间跳过，因无水流导致测量无效）
-            // 在mutex内读取报警相关标志，防止与其他任务并发修改竞态
+            // 在mutex内读取报警跳过截止时间，防止与其他任务并发修改竞态
             bool skip_alarm = false;
+            uint64_t skip_until_ms = 0;
             float alarm_thr[TDS_SENSOR_COUNT];
             if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                skip_alarm = tds_ctx.skip_alarm_detection;
+                skip_until_ms = tds_ctx.skip_alarm_until_ms;
                 alarm_thr[0] = tds_ctx.alarm_threshold[0];
                 alarm_thr[1] = tds_ctx.alarm_threshold[1];
                 xSemaphoreGive(tds_ctx.data_mutex);
@@ -204,6 +212,24 @@ static void tds_sensor_task(void *arg)
                 // 避免无锁读取float数组的潜在数据竞争
                 ESP_LOGD(TAG, "报警检测跳过: mutex获取失败");
                 skip_alarm = true;
+            }
+
+            // 统一跳过判断（单字段双模式）：
+            // skip_until_ms == UINT64_MAX → 无限期跳过（纯水洗膜期间）
+            // skip_until_ms > now_ms     → 定时跳过未到期（泵停机稳定期）
+            // skip_until_ms <= now_ms    → 定时跳过已到期，自动清除
+            // skip_until_ms == 0         → 正常检测
+            uint64_t now_ms = esp_timer_get_time() / 1000;
+            if (skip_until_ms == ALARM_SKIP_INDEFINITE) {
+                skip_alarm = true;
+            } else if (skip_until_ms > 0 && now_ms < skip_until_ms) {
+                skip_alarm = true;
+            } else if (skip_until_ms > 0 && now_ms >= skip_until_ms) {
+                // 定时跳过已过期，自动清除
+                if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    tds_ctx.skip_alarm_until_ms = 0;
+                    xSemaphoreGive(tds_ctx.data_mutex);
+                }
             }
 
             if (!skip_alarm) {
@@ -620,16 +646,31 @@ bool tds_sensor_is_alarm(tds_sensor_id_t sensor_id)
 
 void tds_sensor_set_skip_alarm_detection(bool skip)
 {
-    // 使用mutex保护标志更新
+    // 统一字段：true → UINT64_MAX（无限期跳过），false → 0（清除）
+    uint64_t until = skip ? ALARM_SKIP_INDEFINITE : 0;
     if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        tds_ctx.skip_alarm_detection = skip;
+        tds_ctx.skip_alarm_until_ms = until;
         xSemaphoreGive(tds_ctx.data_mutex);
         if (skip) {
-            ESP_LOGD(TAG, "跳过报警检测（纯水洗膜期间）");
+            ESP_LOGD(TAG, "跳过报警检测（纯水洗膜期间，无限期）");
         }
     } else {
         // 降级处理：直接更新（非关键标志）
-        tds_ctx.skip_alarm_detection = skip;
+        tds_ctx.skip_alarm_until_ms = until;
+    }
+}
+
+void tds_sensor_skip_alarm_for_ms(uint32_t duration_ms)
+{
+    // 统一字段：设置截止时间 = 当前时间 + duration_ms
+    uint64_t until_ms = esp_timer_get_time() / 1000 + duration_ms;
+    if (tds_ctx.data_mutex && xSemaphoreTake(tds_ctx.data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        tds_ctx.skip_alarm_until_ms = until_ms;
+        xSemaphoreGive(tds_ctx.data_mutex);
+        ESP_LOGD(TAG, "跳过报警检测 %lums（泵停机稳定期）", duration_ms);
+    } else {
+        // 降级处理：直接更新
+        tds_ctx.skip_alarm_until_ms = until_ms;
     }
 }
 

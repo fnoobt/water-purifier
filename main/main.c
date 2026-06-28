@@ -49,6 +49,9 @@ static void fsm_state_callback(fsm_state_t old_state, fsm_state_t new_state)
         tds_sensor_set_skip_alarm_detection(true);
     } else if (old_state == FSM_STATE_PURE_FLUSH) {
         tds_sensor_set_skip_alarm_detection(false);
+        // 泵停机后TDS传感器需要稳定时间（电极表面水层瞬变导致短暂读数异常）
+        // 设置5秒定时跳过窗口，防止瞬态读数触发误报
+        tds_sensor_skip_alarm_for_ms(5000);
     }
 
     // 发布MQTT状态更新

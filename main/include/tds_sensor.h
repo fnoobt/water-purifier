@@ -214,11 +214,22 @@ const char* tds_sensor_get_name(tds_sensor_id_t sensor_id);
 
 /**
  * @brief 设置是否跳过报警检测（纯水洗膜期间使用）
- * @param skip true=跳过报警检测，false=恢复报警检测
+ * @param skip true=无限期跳过报警检测，false=恢复报警检测
  * @note 纯水洗膜期间泵停止、进水阀关闭，TDS传感器测量停滞水/气泡导致读数异常，
- *       调用此函数跳过报警检测以避免假报警
+ *       调用此函数跳过报警检测以避免假报警。
+ *       内部与 tds_sensor_skip_alarm_for_ms 共享同一 skip_alarm_until_ms 字段，
+ *       true 对应 UINT64_MAX（无限期），false 对应 0（清除）。
  */
 void tds_sensor_set_skip_alarm_detection(bool skip);
+
+/**
+ * @brief 在指定时间内跳过TDS报警检测（泵停机稳定期使用）
+ * @param duration_ms 跳过持续时间（毫秒）
+ * @note 泵停机后TDS传感器电极表面水层瞬变导致短暂读数异常（1-2秒），
+ *       此函数设置一个定时跳过窗口，到期后自动恢复报警检测。
+ *       内部与 tds_sensor_set_skip_alarm_detection 共享同一 skip_alarm_until_ms 字段。
+ */
+void tds_sensor_skip_alarm_for_ms(uint32_t duration_ms);
 
 #ifdef __cplusplus
 }

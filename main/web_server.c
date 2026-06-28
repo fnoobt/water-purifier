@@ -973,14 +973,14 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
             html[hpos++] = '\''; html[hpos++] = lvl; html[hpos++] = '\''; html[hpos++] = '>';
         }
 
-        // 时间戳 [MM-DD HH:MM:SS]
+        // 时间戳 [YYYY-MM-DD HH:MM:SS]
         if (has_wall_time && boot_ms > 0 && lvl) {
             time_t log_time = boot_wall + (boot_ms / 1000);
             struct tm tm_log;
             localtime_r(&log_time, &tm_log);
             hpos += snprintf(html + hpos, sizeof(html) - hpos,
-                "[%02d-%02d %02d:%02d:%02d] ",
-                tm_log.tm_mon + 1, tm_log.tm_mday,
+                "[%04d-%02d-%02d %02d:%02d:%02d] ",
+                tm_log.tm_year + 1900, tm_log.tm_mon + 1, tm_log.tm_mday,
                 tm_log.tm_hour, tm_log.tm_min, tm_log.tm_sec);
         }
 
