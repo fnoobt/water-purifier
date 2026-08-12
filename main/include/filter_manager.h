@@ -49,6 +49,7 @@ typedef struct {
     uint32_t total_liters;        // 滤芯总容量（升）
     uint32_t time_limit_hours;    // 时间寿命上限（小时）
     uint32_t last_reset_time;     // 上次重置时间戳（Unix秒，用于日历寿命计算）
+    uint32_t water_used_at_reset; // 重置时的累计总量基线（前三级=total_water，后两级=total_prod）
     bool replacement_needed;       // 是否需要更换
     char name[16];                // 滤芯名称
 } filter_info_t;

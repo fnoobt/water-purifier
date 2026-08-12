@@ -873,18 +873,62 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     int cpos = 0;
 
     // ==================== 第一步：发送HTML头部（CSS + 信息栏）====================
-    uint32_t tail = s_log_tail;
-    uint32_t head = s_log_head;
+    // 原子快照：在 critical section 内同时读取 head/tail/generation，防止中间被 writer 修改
+    uint32_t tail, head, gen;
+    taskENTER_CRITICAL(&s_log_lock);
+    tail = s_log_tail;
+    head = s_log_head;
+    gen = s_log_generation;
+    taskEXIT_CRITICAL(&s_log_lock);
     unsigned long used_bytes = (head >= tail) ? (head - tail) : (LOG_BUF_SIZE - tail + head);
 
+    // 解析最近一条日志的 boot_ms（从 head 向前回溯找最新完整行）
+    uint32_t latest_boot_ms = 0;
+    if (head != tail) {
+        uint32_t p = head;
+        // 跳过行尾可能的 \r\n
+        do {
+            p = (p == 0) ? (LOG_BUF_SIZE - 1) : (p - 1);
+            if (s_log_buf[p] != '\n' && s_log_buf[p] != '\r') {
+                p = (p + 1) % LOG_BUF_SIZE;  // 恢复到最后一个内容字符
+                break;
+            }
+        } while (p != tail);
+        // 向前找行首
+        uint32_t line_end = p;
+        while (p != tail) {
+            p = (p == 0) ? (LOG_BUF_SIZE - 1) : (p - 1);
+            if (s_log_buf[p] == '\n' || s_log_buf[p] == '\r') {
+                p = (p + 1) % LOG_BUF_SIZE;
+                break;
+            }
+        }
+        // 解析 boot_ms：查找 '(' 和 ')' 之间的数字
+        uint32_t q = p;
+        while (q != line_end && s_log_buf[q] != '(') q = (q + 1) % LOG_BUF_SIZE;
+        if (q != line_end) {
+            uint32_t r = (q + 1) % LOG_BUF_SIZE;
+            char ts_buf[16];
+            int ts_len = 0;
+            while (r != line_end && s_log_buf[r] != ')' && ts_len < 15) {
+                ts_buf[ts_len++] = s_log_buf[r];
+                r = (r + 1) % LOG_BUF_SIZE;
+            }
+            ts_buf[ts_len] = '\0';
+            if (ts_len > 0) latest_boot_ms = (uint32_t)atol(ts_buf);
+        }
+    }
+
     httpd_resp_set_type(req, "text/html");
-    char header[384];
+    char header[420];
     int hlen = snprintf(header, sizeof(header),
         "<style>.E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}</style>"
         "<div style='padding:4px 8px;border-bottom:1px solid #e0e0e0;font-size:10px;color:#888;background:#f0f0f0'>"
-        "缓冲区 %lu/%lu 字节 | %s | 过滤: %s</div>",
+        "缓冲区 %lu/%lu 字节 | %s | gen:%lu H:%lu T:%lu | 最新:+%lus | 过滤: %s</div>",
         used_bytes, (unsigned long)LOG_BUF_SIZE,
         has_wall_time ? "时间戳已同步" : "时间戳未同步",
+        (unsigned long)gen, (unsigned long)head, (unsigned long)tail,
+        (unsigned long)(latest_boot_ms / 1000),
         level_filter);
     // snprintf截断安全：即使hlen >= sizeof(header)，snprintf已保证null终止
     // 但使用返回值作为实际长度，避免发送被截断的不完整HTML
@@ -924,7 +968,8 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
         int line_len = 0;
 
         // 读取一行原始内容
-        while (read_pos != head && line_len < 299) {
+        // 增加 read_pos != tail 防止穿越到已覆写的数据区域（消除交叉排列）
+        while (read_pos != head && read_pos != tail && line_len < 299) {
             char c = s_log_buf[read_pos];
             if (c == '\n' || c == '\r') break;
             line_buf[line_len++] = c;

@@ -105,6 +105,7 @@ static void load_from_nvs(void);
 static esp_err_t save_to_nvs_locked(void);  // 假定已持有锁
 static void fixup_filter_time_on_ntp_sync_locked(void);  // 假定已持有锁
 static void update_filter_time_percentage_locked(void);  // 假定已持有锁
+static void recalc_water_percentages_locked(void);  // 重新计算各滤芯水量百分比（前三级用总用水量，后两级用总制水量）
 static bool commit_accumulators_locked(void);  // 提交累加器水量，返回是否实际提交
 
 // ==================== 辅助宏 ====================
@@ -239,14 +240,18 @@ static void load_from_nvs(void)
             fctx.filters[i].time_limit_hours = t;
         }
 
-        // 重新计算水量百分比
-        if (fctx.filters[i].total_liters > 0) {
-            float remaining = 1.0f - (float)fctx.filters[i].used_liters / fctx.filters[i].total_liters;
-            if (remaining < 0) remaining = 0;
-            if (remaining > 1) remaining = 1;
-            fctx.filters[i].percentage = (uint8_t)(remaining * 100);
+        // 水量百分比基线（重置时的累计总量，向后兼容：不存在则默认0）
+        snprintf(key, sizeof(key), "f%d_base", i);
+        uint32_t b;
+        if (nvs_get_u32(handle, key, &b) == ESP_OK) {
+            fctx.filters[i].water_used_at_reset = b;
         }
+        // else: water_used_at_reset 已随结构体初始化为 0
+
     }
+
+    // 统一重新计算水量百分比（前三级用总用水量减基线，后两级用总制水量减基线）
+    recalc_water_percentages_locked();
 
     nvs_close(handle);
     ESP_LOGI(TAG, "滤芯数据已加载: 总用水%luL, 总制水%luL, 累加器[%lu,%lu,%lu,%lu,%lu]mL",
@@ -291,6 +296,9 @@ static esp_err_t save_to_nvs_locked(void)
 
         snprintf(key, sizeof(key), "f%d_time", i);
         nvs_set_u32(handle, key, fctx.filters[i].time_limit_hours);
+
+        snprintf(key, sizeof(key), "f%d_base", i);
+        nvs_set_u32(handle, key, fctx.filters[i].water_used_at_reset);
     }
 
     err = nvs_commit(handle);
@@ -338,11 +346,37 @@ static void fixup_filter_time_on_ntp_sync_locked(void)
 }
 
 /**
+ * @brief 重新计算所有滤芯的水量百分比
+ * @note 前三级使用 total_water_used（总用水量，串联处理相同进水）
+ *       后两级使用 total_production_water（总制水量，仅计算纯水产出）
+ *       各滤芯减去自身的 water_used_at_reset 基线，保证重置后百分比从100%开始
+ *       假定已持有锁
+ */
+static void recalc_water_percentages_locked(void)
+{
+    for (int i = 0; i < FILTER_COUNT; i++) {
+        if (fctx.filters[i].total_liters > 0) {
+            // 前三级用总用水量，后两级用总制水量，减去重置时的基线
+            uint32_t total = (i <= 2) ? fctx.total_water_used : fctx.total_production_water;
+            uint32_t baseline = fctx.filters[i].water_used_at_reset;
+            uint32_t used = (total > baseline) ? (total - baseline) : 0;
+            float remaining = 1.0f - (float)used / fctx.filters[i].total_liters;
+            if (remaining < 0) remaining = 0;
+            if (remaining > 1) remaining = 1;
+            fctx.filters[i].percentage = (uint8_t)(remaining * 100);
+        }
+    }
+}
+
+/**
  * @brief 更新所有滤芯的时间维度寿命百分比
  * @note 假定已持有锁
  */
 static void update_filter_time_percentage_locked(void)
 {
+    // 先重新计算水量百分比（前三级用总用水量，后两级用总制水量）
+    recalc_water_percentages_locked();
+
     time_t now_sec = time(NULL);
     uint64_t boot_elapsed_sec = 0;
 
@@ -418,14 +452,6 @@ static bool commit_accumulators_locked(void)
                 fctx.filters[i].used_liters = UINT32_MAX;
             }
 
-            // 更新剩余寿命百分比
-            if (fctx.filters[i].total_liters > 0) {
-                float remaining = 1.0f - (float)fctx.filters[i].used_liters / fctx.filters[i].total_liters;
-                if (remaining < 0) remaining = 0;
-                if (remaining > 1) remaining = 1;
-                fctx.filters[i].percentage = (uint8_t)(remaining * 100);
-            }
-
             // 累加到总用水量/制水量（检查溢出）
             if (i <= 2) {  // 前三级计入总用水量
                 if (UINT32_MAX - fctx.total_water_used >= liters) {
@@ -471,14 +497,6 @@ static void force_commit_accumulator_locked(int filter_idx)
     } else {
         fctx.filters[filter_idx].used_liters = UINT32_MAX;
         ESP_LOGW(TAG, "滤芯%d已用水量溢出，设置为最大值", filter_idx + 1);
-    }
-
-    // 更新剩余寿命百分比
-    if (fctx.filters[filter_idx].total_liters > 0) {
-        float remaining = 1.0f - (float)fctx.filters[filter_idx].used_liters / fctx.filters[filter_idx].total_liters;
-        if (remaining < 0) remaining = 0;
-        if (remaining > 1) remaining = 1;
-        fctx.filters[filter_idx].percentage = (uint8_t)(remaining * 100);
     }
 
     // 累加到总用水量/制水量（检查溢出）
@@ -776,12 +794,18 @@ esp_err_t filter_mgr_reset_filter(filter_type_t filter_type)
     time_t now_sec = time(NULL);
     uint32_t reset_time = (now_sec > 1) ? (uint32_t)now_sec : 0;
 
-    fctx.filters[filter_type].percentage = 100;
+    // 设置基线：记录重置时的累计总量，使 effective_used = 0 → percentage = 100%
+    // 前三级用 total_water_used，后两级用 total_production_water
+    fctx.filters[filter_type].water_used_at_reset =
+        (filter_type <= 2) ? fctx.total_water_used : fctx.total_production_water;
     fctx.filters[filter_type].time_percentage = 100;
     fctx.filters[filter_type].effective_percentage = 100;
     fctx.filters[filter_type].used_liters = 0;
     fctx.filters[filter_type].last_reset_time = reset_time;  // 更新为本次重置时间
     fctx.filters[filter_type].replacement_needed = false;
+
+    // 统一计算水量百分比（percentage 由 recalc 基于基线计算，= 100%）
+    recalc_water_percentages_locked();
 
     fctx.save_needed = true;
 
@@ -808,7 +832,9 @@ esp_err_t filter_mgr_reset_all_filters(void)
     uint32_t reset_time = (now_sec > 1) ? (uint32_t)now_sec : 0;
 
     for (int i = 0; i < FILTER_COUNT; i++) {
-        fctx.filters[i].percentage = 100;
+        // 设置基线：记录重置时的累计总量，使 effective_used = 0 → percentage = 100%
+        fctx.filters[i].water_used_at_reset =
+            (i <= 2) ? fctx.total_water_used : fctx.total_production_water;
         fctx.filters[i].time_percentage = 100;
         fctx.filters[i].effective_percentage = 100;
         fctx.filters[i].used_liters = 0;
@@ -816,6 +842,8 @@ esp_err_t filter_mgr_reset_all_filters(void)
         fctx.filters[i].replacement_needed = false;
     }
     // 保留历史总用水量和总制水量（已在force_commit中更新，跨滤芯重置累积，不因换芯清零）
+    // 统一计算水量百分比（percentage 由 recalc 基于基线计算，= 100%）
+    recalc_water_percentages_locked();
 
     fctx.save_needed = true;
     esp_err_t ret = save_to_nvs_locked();
@@ -841,12 +869,11 @@ esp_err_t filter_mgr_set_all_filter_capacity(const uint32_t capacities[FILTER_CO
 
     for (int i = 0; i < FILTER_COUNT; i++) {
         fctx.filters[i].total_liters = capacities[i];
-        if (capacities[i] > 0) {
-            float remaining = 1.0f - (float)fctx.filters[i].used_liters / capacities[i];
-            if (remaining < 0) remaining = 0;
-            if (remaining > 1) remaining = 1;
-            fctx.filters[i].percentage = (uint8_t)(remaining * 100);
-        }
+    }
+    // 统一重新计算水量百分比（前三级用总用水量减基线，后两级用总制水量减基线）
+    recalc_water_percentages_locked();
+
+    for (int i = 0; i < FILTER_COUNT; i++) {
         fctx.filters[i].effective_percentage =
             (fctx.filters[i].percentage < fctx.filters[i].time_percentage) ?
             fctx.filters[i].percentage : fctx.filters[i].time_percentage;
