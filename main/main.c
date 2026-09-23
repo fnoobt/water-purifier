@@ -5,6 +5,7 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -12,6 +13,7 @@
 #include "esp_chip_info.h"  // 芯片信息
 #include "esp_wifi.h"
 #include "esp_task_wdt.h"  // 任务看门狗
+#include "nvs_flash.h"     // NVS用量诊断
 
 // 模块头文件
 #include "gpio_driver.h"
@@ -100,6 +102,42 @@ static void wifi_state_callback(wifi_state_t state)
     }
 }
 
+// ==================== NVS用量诊断 ====================
+
+// NVS低空间告警阈值（可用条目数）：PHY校准数据(~2KB≈65条目)在此之前就已无法保存，
+// 告警需预留余量让配置/统计保存还能继续工作
+#define NVS_AVAIL_WARN_THRESHOLD    150
+// 告警恢复滞回，防止边界抖动反复告警
+#define NVS_AVAIL_WARN_HYSTERESIS   50
+
+/**
+ * @brief 检查NVS剩余空间，低于阈值时告警（边沿触发，恢复滞回后重新武装）
+ * @note NVS写满时配置/统计保存会静默失败，提前告警避免事后才发现
+ *       用量明细输出见 config_manager_log_nvs_usage()
+ */
+static void check_nvs_space(void)
+{
+    static bool nvs_low_warned = false;
+
+    nvs_stats_t stats;
+    if (nvs_get_stats(NULL, &stats) != ESP_OK) {
+        return;
+    }
+
+    if (!nvs_low_warned && stats.available_entries < NVS_AVAIL_WARN_THRESHOLD) {
+        nvs_low_warned = true;
+        ESP_LOGW(TAG, "NVS空间不足! 可用条目%u/%u (阈值%u), 配置保存可能失败, "
+                 "命名空间明细见启动日志",
+                 (unsigned)stats.available_entries, (unsigned)stats.total_entries,
+                 (unsigned)NVS_AVAIL_WARN_THRESHOLD);
+    } else if (nvs_low_warned &&
+               stats.available_entries >= NVS_AVAIL_WARN_THRESHOLD + NVS_AVAIL_WARN_HYSTERESIS) {
+        nvs_low_warned = false;
+        ESP_LOGI(TAG, "NVS空间恢复: 可用条目%u/%u",
+                 (unsigned)stats.available_entries, (unsigned)stats.total_entries);
+    }
+}
+
 // ==================== 监控任务 ====================
 
 static void monitor_task(void *arg)
@@ -152,6 +190,11 @@ static void monitor_task(void *arg)
                 // MQTT发布后重置看门狗
                 esp_task_wdt_reset();
             }
+        }
+
+        // 每小时检查一次NVS剩余空间（低空间时边沿告警，偏移半小时错开启动统计）
+        if (loop_count % 3600 == 1800) {
+            check_nvs_space();
         }
 
         loop_count++;
@@ -289,6 +332,10 @@ void app_main(void)
     ESP_LOGI(TAG, "[10/10] 初始化Web服务器...");
     web_server_init();
     web_server_start();
+
+    // NVS用量诊断：输出分区统计+按命名空间键数/条目估算明细
+    // （此时WiFi/PHY校准数据的写入已尝试，统计反映真实占用状态）
+    config_manager_log_nvs_usage();
 
     // 创建监控任务（高优先级，确保能及时reset看门狗）
     // 优先级必须高于fsm_task(5)，否则会被阻塞导致看门狗超时

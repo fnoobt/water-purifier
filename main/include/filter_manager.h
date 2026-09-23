@@ -216,6 +216,12 @@ esp_err_t filter_mgr_update_water_usage_dual(float pre_pump_liters, float post_p
  */
 bool filter_mgr_periodic_save(void);
 
+/**
+ * @brief 强制保存滤芯数据到NVS（忽略脏标志，用于NVS整理）
+ * @return ESP_OK 成功，ESP_ERR_TIMEOUT mutex超时
+ */
+esp_err_t filter_mgr_force_save(void);
+
 #ifdef __cplusplus
 }
 #endif

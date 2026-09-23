@@ -23,6 +23,7 @@
 #include "esp_system.h"
 #include "esp_random.h"
 #include "esp_heap_caps.h"
+#include "nvs_flash.h"     // NVS用量统计（状态API）
 #include "cJSON.h"
 #include "mbedtls/base64.h"
 #include <string.h>
@@ -262,6 +263,7 @@ static const char html_page[] =
 "<div class='stat'><div class='stat-label'>HTTP栈</div><div id='stackHTTP' class='stat-value'>-</div></div>"
 "<div class='stat'><div class='stat-label'>TDS栈</div><div id='stackTDS' class='stat-value'>-</div></div>"
 "<div class='stat'><div class='stat-label'>监控栈</div><div id='stackMonitor' class='stat-value'>-</div></div>"
+"<div class='stat'><div class='stat-label'>NVS剩余</div><div id='nvsFree' class='stat-value'>-</div></div>"
 "</div></div>"
 
 "<button class='btn btn-primary btn-center' onclick=\"location.href='/admin'\">管理设置</button>"
@@ -306,6 +308,9 @@ static const char html_page[] =
 "$('stackTDS').className='stat-value '+((d.stackTDS&&d.stackTDS>512)?'good':(d.stackTDS&&d.stackTDS>256)?'warn':'error');"
 "$('stackMonitor').textContent=formatSize(d.stackMonitor);"
 "$('stackMonitor').className='stat-value '+((d.stackMonitor&&d.stackMonitor>512)?'good':(d.stackMonitor&&d.stackMonitor>256)?'warn':'error');"
+"if(d.nvsAvail!=null&&d.nvsTotal>0){var np=Math.round(d.nvsAvail/d.nvsTotal*100);"
+"$('nvsFree').textContent=np+'% ('+d.nvsAvail+')';"
+"$('nvsFree').className='stat-value '+(np>30?'good':np>10?'warn':'error');}"
 "})}"
 "setInterval(update,3000);update();"
 "</script></body></html>";
@@ -439,6 +444,11 @@ static const char html_admin_page[] =
 "<div class='btn-group'><button class='btn btn-warning' onclick='saveWebAuth()'>保存认证配置</button></div>"
 "</div>"
 
+"<div class='card'><h3>NVS存储维护</h3>"
+"<p style='font-size:13px;color:#666'>可用条目: <span id='nvsStat'>-</span>（写入所需，过低时配置保存会失败）</p>"
+"<div class='btn-group'><button class='btn btn-warning' onclick='nvsCompact()'>NVS整理</button></div>"
+"<p style='font-size:11px;color:#999;margin-top:8px'>整理将擦除并重写存储分区以回收失效空间（约1秒），期间请勿断电；完成后设备自动重启</p></div>"
+
 "</div>"
 "<script>"
 "function $(id){return document.getElementById(id)}"
@@ -476,6 +486,9 @@ static const char html_admin_page[] =
 "function goStandby(){api('/api/control',{action:'standby'}).then(d=>alert(d.status||'已执行'))}"
 "function shutdown(){api('/api/control',{action:'shutdown'}).then(d=>alert(d.status||'已执行'))}"
 "function reboot(){if(confirm('确认重启设备？重启期间服务将暂时中断。')){api('/api/control',{action:'reboot'}).then(d=>alert(d.status||'重启中...'))}}"
+"function nvsCompact(){if(!confirm('确认执行NVS整理？将擦除并重写存储分区（约1秒），期间请勿断电，完成后设备自动重启。'))return;"
+"fetch('/api/nvs/compact',{method:'POST'}).then(r=>r.json()).then(d=>alert(d.message||'整理中，设备将重启，请30秒后刷新')).catch(e=>alert('设备整理中并重启，请30秒后刷新'))}"
+"function loadNvsStat(){fetch('/api/status').then(r=>r.json()).then(d=>{if(d.nvsAvail!=null&&d.nvsTotal>0){$('nvsStat').textContent=d.nvsAvail+'/'+d.nvsTotal+' ('+Math.round(d.nvsAvail/d.nvsTotal*100)+'%)';}}).catch(e=>{})}"
 "function resetFilter(i){if(confirm('确认重置该滤芯？')){api('/api/filter/reset',{filter:i}).then(d=>{alert(d.filter_name+' 已重置');loadFilters()})}}"
 "function saveFilterCaps(){api('/api/filter/capacity',{caps:[parseInt($('cap0').value),parseInt($('cap1').value),parseInt($('cap2').value),parseInt($('cap3').value),parseInt($('cap4').value)],times:[parseInt($('time0').value),parseInt($('time1').value),parseInt($('time2').value),parseInt($('time3').value),parseInt($('time4').value)]}).then(d=>alert(d.status||'已保存'))}"
 "function saveConfig(){api('/api/config',{normalFlushDur:parseInt($('normalFlushDur').value),pureFlushDur:parseInt($('pureFlushDur').value),filterFlushDur:parseInt($('filterFlushDur').value)*60,prodTimeout:parseInt($('prodTimeout').value)*60,leakConfirm:parseInt($('leakConfirm').value),tankConfirm:parseInt($('tankConfirm').value),saveInterval:parseInt($('saveInterval').value),relayLevel:parseInt($('relayLevel').value),tdsInTh:parseFloat($('tdsInTh').value),tdsOutTh:parseFloat($('tdsOutTh').value),whValveOpen:parseInt($('whValveOpen').value),whPumpStop:parseInt($('whPumpStop').value),whValveClose:parseInt($('whValveClose').value)}).then(d=>alert(d.status||'已保存'))}"
@@ -488,7 +501,7 @@ static const char html_admin_page[] =
 "function saveMQTT(){api('/api/mqtt/config',{enabled:$('mqttEn').value==1,broker:$('mqttBroker').value,user:$('mqttUser').value,password:$('mqttPass').value,prefix:$('mqttPrefix').value}).then(d=>alert(d.status||'已保存'))}"
 "function loadWebAuth(){fetch('/api/config').then(r=>r.json()).then(d=>{$('webAuthEn').value=d.webAuthEnabled?1:0;$('webUser').value=d.webUsername||'admin';$('webPass').value='';})}"
 "function saveWebAuth(){const u=$('webUser').value.trim();const p=$('webPass').value;if($('webAuthEn').value==1){if(!u)return alert('启用认证时必须设置用户名');if(u.length<3)return alert('用户名至少3个字符');if(!p)return alert('启用认证时必须设置密码');if(p.length<4)return alert('密码至少4个字符');}api('/api/config',{webAuthEnabled:$('webAuthEn').value==1,webUsername:u,webPassword:p}).then(d=>{alert(d.status||'已保存');if($('webAuthEn').value==1)setTimeout(()=>location.reload(),500);})}"
-"loadConfig();loadFilters();loadMQTT();loadWebAuth();"
+"loadConfig();loadFilters();loadMQTT();loadWebAuth();loadNvsStat();"
 "</script></body></html>";
 
 // 固件升级页面 - 独立页面
@@ -1286,6 +1299,13 @@ static esp_err_t handle_status(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "freeHeap", esp_get_free_heap_size());
     cJSON_AddNumberToObject(root, "minHeap", esp_get_minimum_free_heap_size());
 
+    // NVS存储用量（1条目=32字节，available过低时PHY/WiFi校准及配置保存会失败）
+    nvs_stats_t nvs_stats;
+    if (nvs_get_stats(NULL, &nvs_stats) == ESP_OK) {
+        cJSON_AddNumberToObject(root, "nvsTotal", nvs_stats.total_entries);
+        cJSON_AddNumberToObject(root, "nvsAvail", nvs_stats.available_entries);
+    }
+
     TaskHandle_t fsm_task = xTaskGetHandle("fsm_task");
     TaskHandle_t httpd_task = xTaskGetHandle("httpd");
     TaskHandle_t tds_task = xTaskGetHandle("tds_task");
@@ -1376,6 +1396,25 @@ static esp_err_t handle_control(httpd_req_t *req)
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+/**
+ * @brief NVS整理API处理器（擦除分区+从RAM重写，完成后自动重启）
+ * @note 响应先发出再执行整理，整理流程见 config_manager_compact_nvs()
+ */
+static esp_err_t handle_nvs_compact(httpd_req_t *req)
+{
+    if (!check_auth(req)) {
+        send_401(req);
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "用户请求NVS整理");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"success\",\"message\":\"NVS整理中，设备将自动重启\"}");
+    vTaskDelay(pdMS_TO_TICKS(500));  // 等待HTTP响应发出
+    config_manager_compact_nvs();    // 正常不返回（内部esp_restart）
     return ESP_OK;
 }
 
@@ -2621,6 +2660,9 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(ctx.server, &uri);
 
     uri.uri = "/api/ota/rollback", uri.method = HTTP_POST, uri.handler = ota_rollback_handler;
+    httpd_register_uri_handler(ctx.server, &uri);
+
+    uri.uri = "/api/nvs/compact", uri.method = HTTP_POST, uri.handler = handle_nvs_compact;
     httpd_register_uri_handler(ctx.server, &uri);
 
     uri.uri = "/ota", uri.method = HTTP_GET, uri.handler = handle_ota;

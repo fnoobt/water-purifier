@@ -213,6 +213,38 @@ uint32_t history_get_recent_stats(daily_stats_t *stats, uint32_t max_days);
  */
 bool history_periodic_save(uint32_t min_interval_sec);
 
+/**
+ * @brief 强制保存历史记录和今日统计（忽略脏标志，用于NVS整理）
+ * @return ESP_OK 成功，ESP_ERR_TIMEOUT mutex超时
+ */
+esp_err_t history_logger_force_save(void);
+
+// ==================== NVS整理备份接口 ====================
+
+/**
+ * @brief 每日统计备份条目（NVS整理时的内存中转，历史每日数据仅存于NVS）
+ */
+typedef struct {
+    char key[12];           // "dYYYYMMDD" 或 "bXXX"
+    daily_stats_t stats;
+} daily_stats_backup_t;
+
+/**
+ * @brief 备份全部每日统计到动态分配的内存（NVS整理擦除前调用）
+ * @param out_entries 输出：备份数组（调用方负责free），无数据时为NULL
+ * @param out_count 输出：备份条数
+ * @return ESP_OK 成功，ESP_ERR_NO_MEM 分配失败
+ */
+esp_err_t history_logger_backup_all_daily_stats(daily_stats_backup_t **out_entries, uint32_t *out_count);
+
+/**
+ * @brief 从备份恢复每日统计到NVS（NVS整理重写后调用）
+ * @param entries 备份数组
+ * @param count 备份条数
+ * @return ESP_OK 成功
+ */
+esp_err_t history_logger_restore_daily_stats(const daily_stats_backup_t *entries, uint32_t count);
+
 #ifdef __cplusplus
 }
 #endif

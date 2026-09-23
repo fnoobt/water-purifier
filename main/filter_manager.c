@@ -990,3 +990,21 @@ bool filter_mgr_periodic_save(void)
 
     return success;
 }
+
+esp_err_t filter_mgr_force_save(void)
+{
+    if (!fctx.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    LOCK_GET(500);
+
+    esp_err_t err = save_to_nvs_locked();
+
+    LOCK_GIVE();
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "强制保存失败: %s", esp_err_to_name(err));
+    }
+    return err;
+}

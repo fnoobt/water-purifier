@@ -204,6 +204,13 @@ esp_err_t fsm_get_runtime_data(fsm_runtime_data_t *data);
 esp_err_t fsm_reset_runtime_data(void);
 
 /**
+ * @brief 强制将运行统计同步到config_manager（忽略脏标志，用于NVS整理）
+ * @note 统计实际由config_manager持久化到fsm_*键，本函数仅完成RAM间同步
+ * @return ESP_OK 成功，ESP_ERR_TIMEOUT mutex超时
+ */
+esp_err_t fsm_force_save_runtime(void);
+
+/**
  * @brief 清除停止状态
  * @return ESP_OK 成功
  */

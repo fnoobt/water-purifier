@@ -600,7 +600,7 @@ esp_err_t mqtt_client_set_config(const mqtt_config_t *config);
 - **滑动过期**: 每次请求自动刷新session时间，活跃用户不会过期
 - **HTTP超时**: 接收/发送超时10秒（默认5秒）
 - **max_open_sockets**: 3（ESP-IDF v6.0 LWIP限制）
-- **保护范围**: `/admin`, `/ota`, `/logs`, `/api/config`, `/api/control`, `/api/filter/*`, `/api/tds/*`, `/api/mqtt/*`, `/api/ota/*`, `/api/logs`
+- **保护范围**: `/admin`, `/ota`, `/logs`, `/api/config`, `/api/control`, `/api/filter/*`, `/api/tds/*`, `/api/mqtt/*`, `/api/ota/*`, `/api/nvs/compact`, `/api/logs`
 - **公开范围**: `/`, `/api/status`, `/api/wifi`, `/api/wifi/scan`, `/favicon.ico`
 
 **认证配置**:
@@ -644,6 +644,7 @@ esp_err_t mqtt_client_set_config(const mqtt_config_t *config);
 | `/api/ota/preview` | POST | 需要 | 固件预览（上传前解析版本信息） |
 | `/api/ota/factory` | POST | 需要 | 恢复出厂固件 |
 | `/api/ota/rollback` | POST | 需要 | 回滚到上一OTA固件 |
+| `/api/nvs/compact` | POST | 需要 | NVS整理（擦除重写回收死条目，自动重启） |
 | `/logs` | GET | 需要 | 实时串口日志页面 |
 | `/api/logs/debug` | GET | 需要 | 日志缓冲区内容（HTML格式） |
 | `/api/logs` | GET | 需要 | 日志缓冲区内容（JSON数组） |
@@ -705,6 +706,7 @@ esp_err_t mqtt_client_set_config(const mqtt_config_t *config);
 | MQTT配置 | Broker地址、用户名、密码 |
 | OTA升级 | 固件上传、进度显示、恢复出厂固件、回滚上一版本 |
 | 日志查看 | 实时串口日志，远程监控设备状态 |
+| NVS存储维护 | （页面底部，低频操作）NVS可用条目显示、NVS整理（全分区擦除重写回收死条目，整理后自动重启，过程约1秒请勿断电） |
 
 **访问方式**: `http://<设备IP>` 或 `http://waterpurifier.local`（mDNS）
 
@@ -1102,6 +1104,22 @@ POST /api/ota/rollback
 - `wifi` → 已合并到 `water_purifier`
 - `mqtt_config` → 已合并到 `water_purifier`
 - `wp_rt` → 已删除（运行数据移至 `water_purifier` 命名空间 `fsm_*` 键持久化）
+
+WiFi驱动NVS持久化（`CONFIG_ESP_WIFI_NVS_ENABLED=n`）和PHY校准数据存储（`CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n`，每次启动全量校准，启动时间+~150ms）已在sdkconfig中关闭，24KB分区只服务应用数据——这两项曾是分区主要空间消耗（PHY校准blob约65条目≈2KB）及持续写入源。
+
+`daily_stats` 每日统计保留14天（原30天，24KB分区空间紧张），跨天时自动清理过期key。
+
+### NVS用量诊断与维护
+
+- **启动统计**：每次启动输出分区总量/已用/空闲/可用条目数（1条目=32字节），并按命名空间列出明细（键数+条目估算，blob/str按实际长度折算`2+ceil(len/32)`条目——键数≠占用空间，单个大blob键可占数十条目）
+- **周期告警**：monitor_task每小时检查可用条目数，低于150条（约4.7KB）时边沿触发WARN告警，恢复滞回50条；NVS写满会导致配置/统计保存静默失败，告警提供提前处置窗口
+- **首页卡片**：首页"系统状态"区显示"NVS剩余"（可用条目百分比+绝对数），>30%绿色、>10%黄色、否则红色
+- **状态API**：`/api/status` 返回 `nvsTotal`（总条目）和 `nvsAvail`（可用条目）字段
+- **NVS整理**（管理页"NVS存储维护"卡片 / `POST /api/nvs/compact`，需认证）：`config_manager_compact_nvs()` 执行全分区擦除重写——先将daily_stats备份到RAM（≤40条），停WiFi，`nvs_flash_erase()`后按序重写全部存活数据（FSM运行统计→系统配置→滤芯数据→恢复daily_stats→历史记录），2秒后自动重启。NVS无在线整理机制，长短寿命键混排导致页无法整体擦除时死条目永久流失，擦除重写是唯一回收手段。整理前后各输出一次用量明细日志供对比。**注意**：擦除到重写完成约1秒，期间断电将丢失全部持久化数据（配置回默认+进入AP配网），UI已明确警告；若擦除前备份/准备失败则中止不动分区
+
+#### NVS空间耗尽案例（2026-09-24现场）
+
+24KB分区（6页×126条目=756，其中1页保留给GC，可用上限630条目）被完全写满（available=0），所有持久化静默失效：启动日志出现 `phy_init store cal failed(0x1105)` 和 `wifi_nvs_set fail ret=4357`，配置/统计/滤芯/历史保存全部失败（总制水量跨重启冻结为证）。根因：长短寿命键混排（PHY校准blob、daily_stats日更、history频写与config等长寿命键交织），无任何页能整体变空，死条目逐月累积直至写满。处置：本节诊断三件套+整理功能+削源（关闭PHY/WiFi驱动NVS写入、daily_stats缩至14天）。
 
 ---
 

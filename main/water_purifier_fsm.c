@@ -1617,6 +1617,31 @@ esp_err_t fsm_reset_runtime_data(void)
     return ESP_ERR_TIMEOUT;
 }
 
+esp_err_t fsm_force_save_runtime(void)
+{
+    if (!fsm_ctx.runtime_data_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* mutex内拷贝统计值并清除脏标志，与周期保存路径(:1270)行为一致 */
+    uint32_t prod_cycles, flush_cycles;
+    uint64_t prod_time_sec, flush_time_sec;
+    if (xSemaphoreTake(fsm_ctx.runtime_data_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGW(TAG, "fsm_force_save_runtime: mutex获取超时");
+        return ESP_ERR_TIMEOUT;
+    }
+    prod_cycles = fsm_ctx.runtime_data.total_production_cycles;
+    flush_cycles = fsm_ctx.runtime_data.total_flush_cycles;
+    prod_time_sec = fsm_ctx.runtime_data.total_production_time_sec;
+    flush_time_sec = fsm_ctx.runtime_data.total_flush_time_sec;
+    fsm_ctx.runtime_dirty = false;
+    xSemaphoreGive(fsm_ctx.runtime_data_mutex);
+
+    /* 同步到config_manager内存（由其统一持久化到water_purifier命名空间fsm_*键） */
+    config_manager_sync_fsm_stats(prod_cycles, flush_cycles, prod_time_sec, flush_time_sec);
+    return ESP_OK;
+}
+
 esp_err_t fsm_clear_stop(void)
 {
     /* 通过事件队列复位，避免与 fsm_task 竞态 */

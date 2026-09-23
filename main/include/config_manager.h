@@ -189,6 +189,33 @@ esp_err_t config_manager_set_bool(const char *key, bool value);
  */
 bool config_manager_periodic_save_all(uint32_t min_interval_sec);
 
+// ==================== NVS维护 ====================
+
+/**
+ * @brief 强制保存配置（忽略脏标志，用于NVS整理）
+ * @return ESP_OK 成功，ESP_ERR_TIMEOUT mutex超时
+ */
+esp_err_t config_manager_force_save(void);
+
+/**
+ * @brief 输出NVS分区用量统计和按命名空间的键数/条目估算明细
+ * @note 空间占用以 nvs_get_stats 条目数为准（1条目=32字节）；
+ *       blob/string键跨多条目，条目数为按数据长度估算值
+ */
+void config_manager_log_nvs_usage(void);
+
+/**
+ * @brief NVS整理：擦除分区并从RAM重写全部实时数据，完成后自动重启
+ * @note 用于回收失效条目占用的空间（NVS无在线压缩能力，长寿键与短命键
+ *       交错分布导致页无法腾空，最终可用条目归零、所有写入失败）。
+ *       流程：备份daily_stats历史→停WiFi→nvs_flash_erase→nvs_flash_init
+ *       →各模块force_save→恢复daily_stats→esp_restart()。
+ *       WiFi驱动/PHY校准数据由驱动在重启后自动重建。
+ * @warning 擦除到重写完成约1秒，期间断电将丢失全部配置（落回默认值+AP模式）
+ * @return 正常不返回（内部esp_restart）；擦除前失败时返回错误码，分区未动
+ */
+esp_err_t config_manager_compact_nvs(void);
+
 // ==================== 配置验证 ====================
 
 /**

@@ -12,6 +12,7 @@
 #include "freertos/semphr.h"
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 
 static const char *TAG = "CONFIG";
 
@@ -1332,6 +1333,8 @@ bool config_manager_has_mqtt_config(void)
 
 #include "filter_manager.h"
 #include "history_logger.h"
+#include "water_purifier_fsm.h"  // fsm_force_save_runtime（NVS整理）
+#include "wifi_manager.h"        // wifi_manager_stop（NVS整理）
 
 // 上次统一保存时间
 static uint64_t s_last_unified_save_time = 0;
@@ -1390,6 +1393,178 @@ bool config_manager_periodic_save_all(uint32_t min_interval_sec)
     }
 
     return did_save;
+}
+
+// ==================== NVS维护 ====================
+
+esp_err_t config_manager_force_save(void)
+{
+    if (!ctx.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!ctx.mutex || xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGE(TAG, "force_save: mutex获取超时");
+        return ESP_ERR_TIMEOUT;
+    }
+    ctx.config_dirty = true;  // 强制标记，config_manager_save仅在脏时写入
+    xSemaphoreGive(ctx.mutex);
+
+    return config_manager_save();
+}
+
+void config_manager_log_nvs_usage(void)
+{
+    nvs_stats_t stats;
+    esp_err_t err = nvs_get_stats(NULL, &stats);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS用量统计读取失败: %s", esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "NVS用量: 总条目%u, 已用%u, 空闲%u, 可用%u, 命名空间%u (1条目=32字节)",
+             (unsigned)stats.total_entries, (unsigned)stats.used_entries,
+             (unsigned)stats.free_entries, (unsigned)stats.available_entries,
+             (unsigned)stats.namespace_count);
+
+    // 按命名空间统计键数和条目估算（static避免占用调用者栈，非线程安全，仅启动/整理时调用）
+    // blob/string条目估算 = 2开销 + ceil(数据长度/32)（nvs.h文档口径）；每个命名空间本身另占1条目
+    #define NVS_DIAG_MAX_NS 12
+    static struct {
+        char ns[NVS_NS_NAME_MAX_SIZE];
+        uint16_t keys;
+        uint32_t est_entries;
+        nvs_handle_t handle;    // 按命名空间缓存只读句柄，避免每键开关
+    } ns_count[NVS_DIAG_MAX_NS];
+    memset(ns_count, 0, sizeof(ns_count));
+    uint8_t ns_num = 0;
+    uint32_t total_keys = 0;
+    uint32_t total_est = 0;
+
+    nvs_iterator_t it = NULL;
+    // 注意：nvs_entry_find 的 part_name 不允许为 NULL（与 nvs_get_stats 不同），
+    // 必须显式传默认分区名，否则返回 ESP_ERR_INVALID_ARG
+    esp_err_t res = nvs_entry_find(NVS_DEFAULT_PART_NAME, NULL, NVS_TYPE_ANY, &it);
+    if (res != ESP_OK && res != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "NVS条目遍历失败: %s", esp_err_to_name(res));
+    }
+    while (res == ESP_OK) {
+        nvs_entry_info_t info;
+        if (nvs_entry_info(it, &info) == ESP_OK) {
+            total_keys++;
+            uint8_t i;
+            for (i = 0; i < ns_num; i++) {
+                if (strncmp(ns_count[i].ns, info.namespace_name, NVS_NS_NAME_MAX_SIZE) == 0) {
+                    break;
+                }
+            }
+            if (i == ns_num) {
+                if (ns_num >= NVS_DIAG_MAX_NS) {
+                    res = nvs_entry_next(&it);
+                    continue;  // 超出数组上限，跳过归类（仍计入total_keys）
+                }
+                strlcpy(ns_count[ns_num].ns, info.namespace_name, sizeof(ns_count[ns_num].ns));
+                ns_count[ns_num].est_entries = 1;  // 命名空间自身占1条目
+                nvs_open(info.namespace_name, NVS_READONLY, &ns_count[ns_num].handle);
+                ns_num++;
+            }
+            ns_count[i].keys++;
+
+            // 变长类型按数据长度估算占用条目，找到真正的空间大户
+            uint32_t est = 1;
+            if (ns_count[i].handle && info.type == NVS_TYPE_BLOB) {
+                size_t len = 0;
+                if (nvs_get_blob(ns_count[i].handle, info.key, NULL, &len) == ESP_OK) {
+                    est = 2 + (uint32_t)(len + 31) / 32;
+                }
+            } else if (ns_count[i].handle && info.type == NVS_TYPE_STR) {
+                size_t len = 0;
+                if (nvs_get_str(ns_count[i].handle, info.key, NULL, &len) == ESP_OK) {
+                    est = 2 + (uint32_t)(len + 31) / 32;
+                }
+            }
+            ns_count[i].est_entries += est;
+            total_est += est;
+        }
+        res = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+
+    for (uint8_t i = 0; i < ns_num; i++) {
+        if (ns_count[i].handle) {
+            nvs_close(ns_count[i].handle);
+        }
+        ESP_LOGI(TAG, "  NVS命名空间 %-16s: %u键, ~%lu条目",
+                 ns_count[i].ns, (unsigned)ns_count[i].keys,
+                 (unsigned long)ns_count[i].est_entries);
+    }
+    ESP_LOGI(TAG, "NVS键总数: %lu, 估算占用~%lu条目 (已用%u含已失效条目)",
+             (unsigned long)total_keys, (unsigned long)total_est + ns_num,
+             (unsigned)stats.used_entries);
+}
+
+esp_err_t config_manager_compact_nvs(void)
+{
+    ESP_LOGW(TAG, "===== NVS整理开始 =====");
+
+    // 整理前快照：记录当前占用明细到日志（重启后可在/logs查看对比）
+    config_manager_log_nvs_usage();
+
+    // 1. 备份每日统计历史到内存（历史每日数据仅存于NVS，RAM中只有今天）
+    daily_stats_backup_t *stats_backup = NULL;
+    uint32_t stats_backup_count = 0;
+    esp_err_t err = history_logger_backup_all_daily_stats(&stats_backup, &stats_backup_count);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "每日统计备份失败: %s，中止整理（分区未动）", esp_err_to_name(err));
+        return err;
+    }
+
+    // 2. 停止WiFi（防止驱动在擦除期间写NVS；WiFi状态回调会联动停止MQTT）
+    ESP_LOGW(TAG, "停止WiFi...");
+    wifi_manager_stop();
+
+    // 3. 擦除并重新初始化NVS分区
+    ESP_LOGW(TAG, "擦除NVS分区...");
+    err = nvs_flash_erase();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS擦除失败: %s，中止整理（分区未动）", esp_err_to_name(err));
+        free(stats_backup);
+        return err;
+    }
+    err = nvs_flash_init();
+    if (err != ESP_OK) {
+        // 分区已擦除但无法初始化：重写无意义，重启后按全新设备处理
+        // （默认配置+AP配网模式），比停留在无NVS状态更容易恢复
+        ESP_LOGE(TAG, "NVS重新初始化失败: %s，配置丢失，重启进入默认配置", esp_err_to_name(err));
+        free(stats_backup);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+    }
+
+    // 4. 从RAM重写所有模块数据（全部强制写入，忽略脏标志）
+    // FSM统计先同步到config_manager内存，再随配置一起写入
+    fsm_force_save_runtime();
+    esp_err_t err_cfg = config_manager_force_save();
+    esp_err_t err_filter = filter_mgr_force_save();
+    // 先恢复历史每日统计，再由force_save用RAM中最新的今日数据覆盖
+    esp_err_t err_restore = history_logger_restore_daily_stats(stats_backup, stats_backup_count);
+    esp_err_t err_history = history_logger_force_save();
+    free(stats_backup);
+
+    if (err_cfg != ESP_OK || err_filter != ESP_OK || err_restore != ESP_OK || err_history != ESP_OK) {
+        ESP_LOGE(TAG, "NVS整理部分数据重写失败: cfg=%s, filter=%s, restore=%s, history=%s",
+                 esp_err_to_name(err_cfg), esp_err_to_name(err_filter),
+                 esp_err_to_name(err_restore), esp_err_to_name(err_history));
+        // 继续重启：大部分数据已写入，重启后周期保存会补齐剩余部分
+    }
+
+    // 整理后快照（此时WiFi已停，日志重启后可见）
+    config_manager_log_nvs_usage();
+
+    ESP_LOGW(TAG, "===== NVS整理完成，2秒后重启 =====");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+    return ESP_OK;  // 不可达，保持函数完整性
 }
 
 // ==================== 调试 ====================

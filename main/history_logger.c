@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <stdlib.h>
 
 static const char *TAG = "HISTORY";
 
@@ -25,8 +26,8 @@ static const char *TAG = "HISTORY";
 // 最大假日期天数（约3年），超过后循环使用
 #define MAX_BOOT_DAYS           1000
 
-// 每日统计最大保留天数（防止NVS累积写满）
-#define DAILY_STATS_MAX_RETAIN_DAYS  30
+// 每日统计最大保留天数（防止NVS累积写满，24KB分区空间紧张，30→14）
+#define DAILY_STATS_MAX_RETAIN_DAYS  14
 
 // ==================== 私有变量 ====================
 
@@ -206,11 +207,13 @@ static void cleanup_old_daily_stats(void)
     }
 
     // 从当前日期向前扫描365天，删除早于截止日期的key
+    // 注意：必须从保留天数+1开始（首个过期日）。若从保留天数开始，
+    // 首日即等于截止日期会立即触发break，导致清理永远不生效（2026-09-24修复）
     struct tm tm_now;
     localtime_r(&now, &tm_now);
     int cleaned = 0;
 
-    for (int i = DAILY_STATS_MAX_RETAIN_DAYS; i < DAILY_STATS_MAX_RETAIN_DAYS + 365; i++) {
+    for (int i = DAILY_STATS_MAX_RETAIN_DAYS + 1; i < DAILY_STATS_MAX_RETAIN_DAYS + 366; i++) {
         struct tm tm_old = tm_now;
         tm_old.tm_mday -= i;
         mktime(&tm_old);
@@ -220,7 +223,7 @@ static void cleanup_old_daily_stats(void)
         if (year < 2000 || year > 2099) continue;
 
         uint32_t date = (uint32_t)(year * 10000 + (tm_old.tm_mon + 1) * 100 + tm_old.tm_mday);
-        if (date >= cutoff_date) break;  // 之后的日期都未过期
+        if (date >= cutoff_date) break;  // 防御：理论上不会触发（起始日已过期）
 
         char key[12];
         make_date_key(date, key, sizeof(key));
@@ -580,6 +583,109 @@ esp_err_t history_update_daily_tds(float tds_in, float tds_out)
  * @param min_interval_sec 最小保存间隔（秒）
  * @return true 执行了保存
  */
+esp_err_t history_logger_force_save(void)
+{
+    if (!ctx.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGE(TAG, "force_save: mutex获取超时");
+        return ESP_ERR_TIMEOUT;
+    }
+    save_to_nvs();
+    save_daily_to_nvs();
+    ctx.history_dirty = false;
+    ctx.daily_stats_dirty = false;
+    xSemaphoreGive(ctx.mutex);
+    return ESP_OK;
+}
+
+// ==================== NVS整理备份/恢复 ====================
+
+// 备份条数上限：14天真实日期 + bXXX回退键，40条充裕
+#define DAILY_STATS_BACKUP_MAX  40
+
+esp_err_t history_logger_backup_all_daily_stats(daily_stats_backup_t **out_entries, uint32_t *out_count)
+{
+    if (!out_entries || !out_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_entries = NULL;
+    *out_count = 0;
+
+    daily_stats_backup_t *buf = calloc(DAILY_STATS_BACKUP_MAX, sizeof(daily_stats_backup_t));
+    if (!buf) {
+        ESP_LOGE(TAG, "每日统计备份内存分配失败");
+        return ESP_ERR_NO_MEM;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_DAILY, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        free(buf);
+        // 命名空间不存在视为空备份（新设备），不算错误
+        return (err == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : err;
+    }
+
+    uint32_t count = 0;
+    nvs_iterator_t it = NULL;
+    esp_err_t res = nvs_entry_find(NVS_DEFAULT_PART_NAME, NVS_NAMESPACE_DAILY, NVS_TYPE_BLOB, &it);
+    while (res == ESP_OK && count < DAILY_STATS_BACKUP_MAX) {
+        nvs_entry_info_t info;
+        if (nvs_entry_info(it, &info) == ESP_OK) {
+            size_t len = sizeof(daily_stats_t);
+            if (nvs_get_blob(handle, info.key, &buf[count].stats, &len) == ESP_OK &&
+                len == sizeof(daily_stats_t)) {
+                strlcpy(buf[count].key, info.key, sizeof(buf[count].key));
+                count++;
+            } else {
+                ESP_LOGW(TAG, "跳过损坏的每日统计键: %s (len=%zu)", info.key, len);
+            }
+        }
+        res = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+    nvs_close(handle);
+
+    if (count == 0) {
+        free(buf);
+        buf = NULL;
+    }
+    *out_entries = buf;
+    *out_count = count;
+    ESP_LOGI(TAG, "每日统计已备份 %lu 条到内存", (unsigned long)count);
+    return ESP_OK;
+}
+
+esp_err_t history_logger_restore_daily_stats(const daily_stats_backup_t *entries, uint32_t count)
+{
+    if (!entries || count == 0) {
+        return ESP_OK;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "每日统计恢复: NVS打开失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (nvs_set_blob(handle, entries[i].key, &entries[i].stats, sizeof(daily_stats_t)) == ESP_OK) {
+            written++;
+        } else {
+            ESP_LOGW(TAG, "每日统计恢复失败: %s", entries[i].key);
+        }
+    }
+    err = nvs_commit(handle);
+    nvs_close(handle);
+
+    ESP_LOGI(TAG, "每日统计已恢复 %lu/%lu 条", (unsigned long)written, (unsigned long)count);
+    return err;
+}
+
 bool history_periodic_save(uint32_t min_interval_sec)
 {
     if (!ctx.initialized) {
@@ -693,6 +799,8 @@ bool history_periodic_save(uint32_t min_interval_sec)
                 memset(&ctx.today, 0, sizeof(daily_stats_t));
                 ctx.today.date = today;
                 ctx.daily_stats_dirty = false;
+                // 无数据跨天同样清理过期key，保证清理无条件执行
+                cleanup_old_daily_stats();
                 xSemaphoreGive(ctx.mutex);
             }
         }

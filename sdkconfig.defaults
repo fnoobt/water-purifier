@@ -68,6 +68,12 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # 禁用断言（choice选项：选DISABLE替代默认的ENABLE）
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
 
+# === NVS空间优化（24KB分区，防止写满）===
+# PHY校准数据不存NVS（每次启动全量校准，+~150ms启动时间，省~2KB blob及写入）
+CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n
+# WiFi驱动不持久化配置到NVS（SSID/密码由config_manager管理并显式esp_wifi_set_config）
+CONFIG_ESP_WIFI_NVS_ENABLED=n
+
 # === LWIP进一步精简（节省~5KB Flash）===
 # 局域网环境不需要IP分片
 CONFIG_LWIP_IP4_FRAG=n
