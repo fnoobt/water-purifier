@@ -269,6 +269,7 @@ static bool config_equal(const system_config_t *a, const system_config_t *b)
     // 系统参数
     if (a->production_timeout_sec != b->production_timeout_sec) return false;
     if (a->leak_confirm_time_sec != b->leak_confirm_time_sec) return false;
+    if (a->tank_confirm_time_sec != b->tank_confirm_time_sec) return false;
     if (a->runtime_save_interval_min != b->runtime_save_interval_min) return false;
 
     // 冲洗参数
@@ -316,6 +317,7 @@ static const system_config_t default_config = {
     .waste_valve_flow_cc = 300,          // 300CC (18L/h)
     .production_timeout_sec = 3 * 3600,    // 3小时
     .leak_confirm_time_sec = 5,            // 5秒（漏水确认时间）
+    .tank_confirm_time_sec = 5,            // 5秒（压力桶水满/需水确认时间）
     .runtime_save_interval_min = 120,      // 2小时（默认保存间隔）
 
     // 冲洗参数
@@ -501,6 +503,10 @@ esp_err_t config_manager_load(void)
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGW(TAG, "读取leak_confirm失败: %s", esp_err_to_name(err));
     }
+    err = nvs_get_u32(handle, "tank_confirm", &ctx.config.tank_confirm_time_sec);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "读取tank_confirm失败: %s", esp_err_to_name(err));
+    }
 
     // 冲洗参数（添加错误检查）
     err = nvs_get_u32(handle, "nflush_dur", &ctx.config.normal_flush_duration_sec);
@@ -667,6 +673,7 @@ esp_err_t config_manager_save(void)
     // 系统参数
     nvs_set_u32(handle, "prod_timeout", config_copy.production_timeout_sec);
     nvs_set_u32(handle, "leak_confirm", config_copy.leak_confirm_time_sec);
+    nvs_set_u32(handle, "tank_confirm", config_copy.tank_confirm_time_sec);
 
     // 冲洗参数
     nvs_set_u32(handle, "nflush_dur", config_copy.normal_flush_duration_sec);
@@ -1002,6 +1009,7 @@ static void update_config_int_from_key(const char *key, int value, bool *changed
     UPDATE_U16_FIELD(waste_valve_flow_cc);
     UPDATE_U32_FIELD(production_timeout_sec);
     UPDATE_U32_FIELD(leak_confirm_time_sec);
+    UPDATE_U32_FIELD(tank_confirm_time_sec);
     UPDATE_U32_FIELD(normal_flush_duration_sec);
     UPDATE_U32_FIELD(pure_flush_duration_sec);
     UPDATE_U32_FIELD(filter_flush_duration_sec);
@@ -1032,6 +1040,7 @@ esp_err_t config_manager_set_int(const char *key, int value)
     // 关键字段范围检查
     if ((strcmp(key, "production_timeout_sec") == 0 && (value < 600 || value > 86400)) ||
         (strcmp(key, "leak_confirm_time_sec") == 0 && (value < 1 || value > 60)) ||
+        (strcmp(key, "tank_confirm_time_sec") == 0 && (value < 1 || value > 60)) ||
         (strcmp(key, "normal_flush_duration_sec") == 0 && (value < 5 || value > 300)) ||
         (strcmp(key, "pure_flush_duration_sec") == 0 && (value < 5 || value > 300)) ||
         (strcmp(key, "filter_flush_duration_sec") == 0 && (value < 60 || value > 7200)) ||
@@ -1224,6 +1233,9 @@ bool config_manager_validate(const system_config_t *config)
     if (config->leak_confirm_time_sec < 1 || config->leak_confirm_time_sec > 60) {
         return false;
     }
+    if (config->tank_confirm_time_sec < 1 || config->tank_confirm_time_sec > 60) {
+        return false;
+    }
 
     // 验证冲洗参数
     if (config->normal_flush_duration_sec < 5 || config->normal_flush_duration_sec > 300) {
@@ -1412,6 +1424,7 @@ void config_manager_print_config(void)
              cfg.filter_flush_duration_sec);
     ESP_LOGI(TAG, "制水超时: %lu秒", cfg.production_timeout_sec);
     ESP_LOGI(TAG, "漏水确认: %lu秒", cfg.leak_confirm_time_sec);
+    ESP_LOGI(TAG, "水满确认: %lu秒", cfg.tank_confirm_time_sec);
     ESP_LOGI(TAG, "继电平: %s", cfg.relay_trigger_level ? "高" : "低");
     ESP_LOGI(TAG, "TDS阈值: 进水%.0f/出水%.0f ppm",
              cfg.tds_inlet_threshold, cfg.tds_outlet_threshold);

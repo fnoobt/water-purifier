@@ -41,6 +41,7 @@ typedef struct {
     // 系统参数
     uint32_t production_timeout_sec;    // 制水超时时间（秒），默认3小时
     uint32_t leak_confirm_time_sec;     // 漏水确认时间（秒），默认5秒
+    uint32_t tank_confirm_time_sec;     // 压力桶水满/需水确认时间（秒），默认5秒
     uint16_t runtime_save_interval_min;  // 运行数据保存间隔（分钟），默认120
 
     // 冲洗参数

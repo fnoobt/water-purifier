@@ -16,7 +16,8 @@
 static const char *TAG = "PM";
 
 // 功率调整冷却期：调整后至少等待5分钟再允许新的调整
-#define PM_ADJUST_COOLDOWN_US  (5 * 60 * 1000LL)
+// 注意：esp_timer_get_time() 返回微秒，5分钟 = 5*60*1000*1000 µs
+#define PM_ADJUST_COOLDOWN_US  (5 * 60 * 1000 * 1000LL)
 
 // ==================== 状态 ====================
 

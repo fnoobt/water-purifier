@@ -257,6 +257,7 @@ void app_main(void)
     fsm_set_filter_flush_duration(cfg.filter_flush_duration_sec);
     fsm_set_production_timeout(cfg.production_timeout_sec);
     fsm_set_leak_confirm_time(cfg.leak_confirm_time_sec);
+    fsm_set_tank_confirm_time(cfg.tank_confirm_time_sec);
     fsm_set_water_hammer_delays(cfg.water_hammer_valve_open_delay_ms,
                                  cfg.water_hammer_pump_stop_delay_ms,
                                  cfg.water_hammer_valve_close_delay_ms);

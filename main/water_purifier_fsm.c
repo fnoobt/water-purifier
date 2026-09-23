@@ -45,8 +45,9 @@ static portMUX_TYPE fsm_spinlock = portMUX_INITIALIZER_UNLOCKED;
 #define PRODUCTION_TIMEOUT_DEFAULT_SEC   (3 * 3600)
 #define NORMAL_FLUSH_DURATION_DEFAULT_SEC 20
 #define PURE_FLUSH_DURATION_DEFAULT_SEC   15
-#define FILTER_FLUSH_DURATION_DEFAULT_SEC 1200
+#define FILTER_FLUSH_DURATION_DEFAULT_SEC 3600
 #define LEAK_CONFIRM_TIME_DEFAULT_SEC     5
+#define TANK_CONFIRM_TIME_DEFAULT_SEC     5
 #define CHECK_INTERVAL_MS                 100
 #define LED_BLINK_SLOW_MS                 1000
 #define LED_BLINK_FAST_MS                 200
@@ -84,6 +85,7 @@ static struct {
     uint32_t normal_flush_duration_sec;   // 常规冲洗时间
     uint32_t pure_flush_duration_sec;     // 纯水洗膜时间
     uint32_t leak_confirm_time_ms;
+    uint32_t tank_confirm_time_ms;        // 压力桶水满/需水确认时间（毫秒）
     uint32_t short_prod_threshold_sec;    // 短制水判断阈值
     uint32_t water_hammer_valve_open_delay_ms;
     uint32_t water_hammer_pump_stop_delay_ms;
@@ -111,6 +113,12 @@ static struct {
     // 漏水检测确认时间（防止凝露误报）
     uint64_t leak_detect_start_time;
     bool leak_detected;           // 漏水信号已触发，等待确认
+
+    // 压力桶开关确认（防止泵脉动/水锤导致开关抖动误判）
+    uint64_t tank_full_detect_start_time;
+    bool tank_full_detected;      // 水满信号已触发，等待确认
+    uint64_t need_water_detect_start_time;
+    bool need_water_detected;     // 需水信号已触发，等待确认
 
     // 手动待机标志（阻止check_inputs自动进入制水）
     bool standby_manual;
@@ -395,6 +403,18 @@ static void transition_to(fsm_state_t new_state)
         fsm_ctx.current_phase = FLUSH_PHASE_NONE;
     }
     fsm_ctx.state_init_done = false;
+
+    /* 压力开关确认状态入口复位：进入制水/待机时清除对应确认计时，
+     * 防止陈旧时间戳跨状态残留导致瞬时误确认。
+     * 此处是所有状态转换（传感器/事件/恢复）的唯一咽喉点 */
+    if (new_state == FSM_STATE_PRODUCTION) {
+        fsm_ctx.tank_full_detected = false;
+        fsm_ctx.tank_full_detect_start_time = 0;
+    }
+    if (new_state == FSM_STATE_STANDBY) {
+        fsm_ctx.need_water_detected = false;
+        fsm_ctx.need_water_detect_start_time = 0;
+    }
     taskEXIT_CRITICAL(&fsm_spinlock);
 
     /* 冲洗状态退出时：如果冲洗计时器仍运行（中断退出），计算实际时长和水量
@@ -914,6 +934,70 @@ static bool check_leak_confirmed(bool water_leak)
     }
 }
 
+/**
+ * @brief 压力桶水满确认（防泵脉动/水锤导致开关颤动误判）
+ * @param tank_pressure false=断开(水满信号) true=闭合(需要水)
+ * @return true=水满已确认（断开持续≥确认时长）
+ * @note  仅在PRODUCTION状态轮询调用；确认后自清，下次断开重新计时
+ */
+static bool check_tank_full_confirmed(bool tank_pressure)
+{
+    uint64_t now_ms = esp_timer_get_time() / 1000;
+
+    if (!tank_pressure) {  // 开关断开 = 水满信号
+        if (!fsm_ctx.tank_full_detected) {
+            fsm_ctx.tank_full_detected = true;
+            fsm_ctx.tank_full_detect_start_time = now_ms;
+            ESP_LOGI(TAG, "检测到水满信号，开始确认计时(%lu秒)", fsm_ctx.tank_confirm_time_ms / 1000);
+        } else if (now_ms - fsm_ctx.tank_full_detect_start_time >= fsm_ctx.tank_confirm_time_ms) {
+            ESP_LOGI(TAG, "水满确认，持续%lu秒", fsm_ctx.tank_confirm_time_ms / 1000);
+            fsm_ctx.tank_full_detected = false;
+            fsm_ctx.tank_full_detect_start_time = 0;
+            return true;
+        }
+        return false;
+    } else {
+        if (fsm_ctx.tank_full_detected) {
+            ESP_LOGD(TAG, "水满信号消失，取消确认");
+            fsm_ctx.tank_full_detected = false;
+            fsm_ctx.tank_full_detect_start_time = 0;
+        }
+        return false;
+    }
+}
+
+/**
+ * @brief 压力桶需水确认（与check_tank_full_confirmed镜像对称）
+ * @param tank_pressure true=闭合(需水信号) false=断开(水满)
+ * @return true=需水已确认（闭合持续≥确认时长）
+ * @note  仅在STANDBY状态轮询调用；确认后自清，下次闭合重新计时
+ */
+static bool check_need_water_confirmed(bool tank_pressure)
+{
+    uint64_t now_ms = esp_timer_get_time() / 1000;
+
+    if (tank_pressure) {  // 开关闭合 = 需水信号
+        if (!fsm_ctx.need_water_detected) {
+            fsm_ctx.need_water_detected = true;
+            fsm_ctx.need_water_detect_start_time = now_ms;
+            ESP_LOGD(TAG, "检测到需水信号，开始确认计时(%lu秒)", fsm_ctx.tank_confirm_time_ms / 1000);
+        } else if (now_ms - fsm_ctx.need_water_detect_start_time >= fsm_ctx.tank_confirm_time_ms) {
+            ESP_LOGI(TAG, "需水确认，持续%lu秒", fsm_ctx.tank_confirm_time_ms / 1000);
+            fsm_ctx.need_water_detected = false;
+            fsm_ctx.need_water_detect_start_time = 0;
+            return true;
+        }
+        return false;
+    } else {
+        if (fsm_ctx.need_water_detected) {
+            ESP_LOGD(TAG, "需水信号消失，取消确认");
+            fsm_ctx.need_water_detected = false;
+            fsm_ctx.need_water_detect_start_time = 0;
+        }
+        return false;
+    }
+}
+
 static void check_inputs(void)
 {
     bool low_pressure = gpio_driver_read_low_pressure();
@@ -921,21 +1005,31 @@ static void check_inputs(void)
     bool water_leak = gpio_driver_read_water_leak();
     bool leak_confirmed = check_leak_confirmed(water_leak);
 
+    /* 压力开关确认值按当前状态门控计算（辅助函数仅在所属状态内调用，
+     * 配合 transition_to() 的入口复位，保证确认计时不会跨状态残留） */
+    bool tank_full_confirmed = false;
+    bool need_water_confirmed = false;
+    if (fsm_ctx.current_state == FSM_STATE_PRODUCTION) {
+        tank_full_confirmed = check_tank_full_confirmed(tank_pressure);
+    } else if (fsm_ctx.current_state == FSM_STATE_STANDBY) {
+        need_water_confirmed = check_need_water_confirmed(tank_pressure);
+    }
+
     switch (fsm_ctx.current_state) {
         case FSM_STATE_STANDBY:
             if (leak_confirmed) {
                 transition_to(FSM_STATE_LEAK_ALARM);
                 return;
             }
-            // 传感器条件变化时清除手动待机标志（缺水恢复或桶缺水时清除，允许自动恢复制水）
-            if (fsm_ctx.standby_manual && (!low_pressure || tank_pressure)) {
+            // 传感器条件变化时清除手动待机标志（缺水恢复或桶缺水确认后清除，允许自动恢复制水）
+            if (fsm_ctx.standby_manual && (!low_pressure || need_water_confirmed)) {
                 fsm_ctx.standby_manual = false;
             }
             if (!low_pressure) {
                 transition_to(FSM_STATE_WATER_SHORTAGE);
                 return;
             }
-            if (low_pressure && tank_pressure && !fsm_ctx.standby_manual) {
+            if (low_pressure && need_water_confirmed && !fsm_ctx.standby_manual) {
                 transition_to(FSM_STATE_PRODUCTION);
                 return;
             }
@@ -952,7 +1046,7 @@ static void check_inputs(void)
                 transition_to(FSM_STATE_WATER_SHORTAGE);
                 return;
             }
-            if (!tank_pressure) {
+            if (tank_full_confirmed) {
                 transition_to(FSM_STATE_TANK_FULL);
                 return;
             }
@@ -1263,6 +1357,7 @@ esp_err_t fsm_init(void)
     fsm_ctx.pure_flush_duration_sec = PURE_FLUSH_DURATION_DEFAULT_SEC;
     fsm_ctx.filter_flush_duration_sec = FILTER_FLUSH_DURATION_DEFAULT_SEC;
     fsm_ctx.leak_confirm_time_ms = LEAK_CONFIRM_TIME_DEFAULT_SEC * 1000;
+    fsm_ctx.tank_confirm_time_ms = TANK_CONFIRM_TIME_DEFAULT_SEC * 1000;
     fsm_ctx.short_prod_threshold_sec = SHORT_PRODUCTION_THRESHOLD_SEC;
     fsm_ctx.water_hammer_valve_open_delay_ms = WATER_HAMMER_VALVE_OPEN_DELAY_MS;
     fsm_ctx.water_hammer_pump_stop_delay_ms = WATER_HAMMER_PUMP_STOP_DELAY_MS;
@@ -1300,6 +1395,10 @@ esp_err_t fsm_init(void)
     fsm_ctx.current_state = FSM_STATE_STANDBY;
     fsm_ctx.leak_detected = false;
     fsm_ctx.leak_detect_start_time = 0;
+    fsm_ctx.tank_full_detected = false;
+    fsm_ctx.tank_full_detect_start_time = 0;
+    fsm_ctx.need_water_detected = false;
+    fsm_ctx.need_water_detect_start_time = 0;
     fsm_ctx.current_phase = FLUSH_PHASE_NONE;
     fsm_ctx.standby_manual = false;
 
@@ -1612,6 +1711,13 @@ esp_err_t fsm_set_leak_confirm_time(uint32_t time_sec)
 {
     fsm_ctx.leak_confirm_time_ms = time_sec * 1000;
     ESP_LOGI(TAG, "漏水确认时间设置: %lu秒", time_sec);
+    return ESP_OK;
+}
+
+esp_err_t fsm_set_tank_confirm_time(uint32_t time_sec)
+{
+    fsm_ctx.tank_confirm_time_ms = time_sec * 1000;
+    ESP_LOGI(TAG, "压力桶确认时间设置: %lu秒", time_sec);
     return ESP_OK;
 }
 

@@ -128,6 +128,19 @@ esp_err_t web_server_init_log_interceptor(void)
     return ESP_OK;
 }
 
+/**
+ * @brief 解析日志行首括号内的毫秒时间戳文本
+ * @note  IDF日志以无符号打印esp_log_timestamp()（如 "2766429000"），
+ *        预编译WiFi驱动以有符号%d打印同一uint32值（如 "-2107206213"）。
+ *        运行24.86天后毫秒数超过INT32_MAX，atoi/atol会钳位到2147483647
+ *        导致网页日志时间戳冻结；strtoll为64位解析不钳位，
+ *        截断回uint32_t后两种文本形式都能还原真实值。
+ */
+static uint32_t parse_log_timestamp_ms(const char *s)
+{
+    return (uint32_t)strtoll(s, NULL, 10);
+}
+
 // ==================== HTML页面 ====================
 
 // ==================== 统一CSS样式（使用宏定义支持字符串拼接）====================
@@ -363,6 +376,7 @@ static const char html_admin_page[] =
 "<div class='form-row'><label>换芯冲洗时间 (分钟)</label><input type='number' id='filterFlushDur' value='60'></div>"
 "<div class='form-row'><label>制水超时 (分钟)</label><input type='number' id='prodTimeout' value='180'></div>"
 "<div class='form-row'><label>漏水确认 (秒)</label><input type='number' id='leakConfirm' value='5'></div>"
+"<div class='form-row'><label>水满确认 (秒)</label><input type='number' id='tankConfirm' value='5'></div>"
 "<div class='form-row'><label>Flash保存周期</label><select id='saveInterval'><option value='10'>10分钟</option><option value='60'>1小时</option><option value='120'>2小时 (默认)</option><option value='240'>4小时</option><option value='360'>6小时</option><option value='720'>12小时</option><option value='1440'>24小时</option></select></div>"
 "<div class='form-row'><label>继电器触发电平</label><select id='relayLevel'><option value='0'>低电平触发</option><option value='1'>高电平触发</option></select></div>"
 "<div class='form-row'><label>TDS进水阈值 (ppm)</label><input type='number' id='tdsInTh' value='500'></div>"
@@ -435,6 +449,7 @@ static const char html_admin_page[] =
 "$('filterFlushDur').value=d.filterFlushDur;"
 "$('prodTimeout').value=d.prodTimeout;"
 "$('leakConfirm').value=d.leakConfirm||5;"
+"$('tankConfirm').value=d.tankConfirm||5;"
 "$('saveInterval').value=d.saveInterval||120;"
 "$('relayLevel').value=d.relayLevel;"
 "$('tdsInTh').value=d.tdsInTh;"
@@ -463,7 +478,7 @@ static const char html_admin_page[] =
 "function reboot(){if(confirm('确认重启设备？重启期间服务将暂时中断。')){api('/api/control',{action:'reboot'}).then(d=>alert(d.status||'重启中...'))}}"
 "function resetFilter(i){if(confirm('确认重置该滤芯？')){api('/api/filter/reset',{filter:i}).then(d=>{alert(d.filter_name+' 已重置');loadFilters()})}}"
 "function saveFilterCaps(){api('/api/filter/capacity',{caps:[parseInt($('cap0').value),parseInt($('cap1').value),parseInt($('cap2').value),parseInt($('cap3').value),parseInt($('cap4').value)],times:[parseInt($('time0').value),parseInt($('time1').value),parseInt($('time2').value),parseInt($('time3').value),parseInt($('time4').value)]}).then(d=>alert(d.status||'已保存'))}"
-"function saveConfig(){api('/api/config',{normalFlushDur:parseInt($('normalFlushDur').value),pureFlushDur:parseInt($('pureFlushDur').value),filterFlushDur:parseInt($('filterFlushDur').value)*60,prodTimeout:parseInt($('prodTimeout').value)*60,leakConfirm:parseInt($('leakConfirm').value),saveInterval:parseInt($('saveInterval').value),relayLevel:parseInt($('relayLevel').value),tdsInTh:parseFloat($('tdsInTh').value),tdsOutTh:parseFloat($('tdsOutTh').value),whValveOpen:parseInt($('whValveOpen').value),whPumpStop:parseInt($('whPumpStop').value),whValveClose:parseInt($('whValveClose').value)}).then(d=>alert(d.status||'已保存'))}"
+"function saveConfig(){api('/api/config',{normalFlushDur:parseInt($('normalFlushDur').value),pureFlushDur:parseInt($('pureFlushDur').value),filterFlushDur:parseInt($('filterFlushDur').value)*60,prodTimeout:parseInt($('prodTimeout').value)*60,leakConfirm:parseInt($('leakConfirm').value),tankConfirm:parseInt($('tankConfirm').value),saveInterval:parseInt($('saveInterval').value),relayLevel:parseInt($('relayLevel').value),tdsInTh:parseFloat($('tdsInTh').value),tdsOutTh:parseFloat($('tdsOutTh').value),whValveOpen:parseInt($('whValveOpen').value),whPumpStop:parseInt($('whPumpStop').value),whValveClose:parseInt($('whValveClose').value)}).then(d=>alert(d.status||'已保存'))}"
 "function saveHardware(){api('/api/config/hardware',{roMem:parseInt($('roMem').value),pumpType:parseInt($('pumpType').value),tankSize:parseInt($('tankSize').value),wasteFlow:parseInt($('wasteFlow').value)}).then(d=>alert(d.status||'已保存'))}"
 "function scanWiFi(){$('wifiList').innerHTML='扫描中...';fetch('/api/wifi/scan').then(r=>r.json()).then(d=>{let h='';if(d.networks)d.networks.forEach(function(n){let s=encodeURIComponent(n.ssid);h+='<div class=\"wifi-item\" data-ssid=\"'+s+'\">'+n.ssid+' ('+n.rssi+'dBm)</div>'});$('wifiList').innerHTML=h||'未找到网络'})}"
 "$('wifiList').addEventListener('click',function(e){var item=e.target.closest('.wifi-item');if(item){$('ssid').value=decodeURIComponent(item.getAttribute('data-ssid'))}});"
@@ -880,6 +895,10 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     head = s_log_head;
     gen = s_log_generation;
     taskEXIT_CRITICAL(&s_log_lock);
+    // 当前墙钟与日志时钟快照（在head快照之后获取，保证buffer内所有行的时间戳不晚于now_log_ms）
+    // 用于按"日志年龄"换算每行墙钟时间，避免esp_log_timestamp()的uint32在49.7天回绕后时间错误
+    time_t now_wall = time(NULL);
+    uint32_t now_log_ms = esp_log_timestamp();
     unsigned long used_bytes = (head >= tail) ? (head - tail) : (LOG_BUF_SIZE - tail + head);
 
     // 解析最近一条日志的 boot_ms（从 head 向前回溯找最新完整行）
@@ -915,7 +934,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
                 r = (r + 1) % LOG_BUF_SIZE;
             }
             ts_buf[ts_len] = '\0';
-            if (ts_len > 0) latest_boot_ms = (uint32_t)atol(ts_buf);
+            if (ts_len > 0) latest_boot_ms = parse_log_timestamp_ms(ts_buf);
         }
     }
 
@@ -924,11 +943,11 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
     int hlen = snprintf(header, sizeof(header),
         "<style>.E{color:#d32f2f;font-weight:bold}.W{color:#f57c00}.I{color:#388e3c}.D{color:#1976d2}</style>"
         "<div style='padding:4px 8px;border-bottom:1px solid #e0e0e0;font-size:10px;color:#888;background:#f0f0f0'>"
-        "缓冲区 %lu/%lu 字节 | %s | gen:%lu H:%lu T:%lu | 最新:+%lus | 过滤: %s</div>",
+        "缓冲区 %lu/%lu 字节 | %s | gen:%lu H:%lu T:%lu | 最新:%lus前 | 过滤: %s</div>",
         used_bytes, (unsigned long)LOG_BUF_SIZE,
         has_wall_time ? "时间戳已同步" : "时间戳未同步",
         (unsigned long)gen, (unsigned long)head, (unsigned long)tail,
-        (unsigned long)(latest_boot_ms / 1000),
+        (unsigned long)(latest_boot_ms > 0 ? (now_log_ms - latest_boot_ms) / 1000 : 0),
         level_filter);
     // snprintf截断安全：即使hlen >= sizeof(header)，snprintf已保证null终止
     // 但使用返回值作为实际长度，避免发送被截断的不完整HTML
@@ -991,7 +1010,7 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
                     int ts_len = ts_end - 3;
                     if (ts_len > 0 && ts_len < 16) {
                         memcpy(ts_str, line_buf + 3, ts_len);
-                        boot_ms = (uint32_t)atoi(ts_str);
+                        boot_ms = parse_log_timestamp_ms(ts_str);
                     }
                 }
             }
@@ -1019,8 +1038,11 @@ static esp_err_t handle_log_debug(httpd_req_t *req)
         }
 
         // 时间戳 [YYYY-MM-DD HH:MM:SS]
+        // 按"当前墙钟 - 日志年龄"换算：uint32回绕减法使日志时钟49.7天回绕后仍正确，
+        // 且不受boot_wall建立后SNTP时钟与日志时钟漂移累积的影响
         if (has_wall_time && boot_ms > 0 && lvl) {
-            time_t log_time = boot_wall + (boot_ms / 1000);
+            uint32_t age_ms = now_log_ms - boot_ms;
+            time_t log_time = now_wall - (time_t)(age_ms / 1000);
             struct tm tm_log;
             localtime_r(&log_time, &tm_log);
             hpos += snprintf(html + hpos, sizeof(html) - hpos,
@@ -1375,6 +1397,7 @@ static esp_err_t handle_config_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "filterFlushDur", cfg.filter_flush_duration_sec / 60);
     cJSON_AddNumberToObject(root, "prodTimeout", cfg.production_timeout_sec / 60);
     cJSON_AddNumberToObject(root, "leakConfirm", cfg.leak_confirm_time_sec);
+    cJSON_AddNumberToObject(root, "tankConfirm", cfg.tank_confirm_time_sec);
     cJSON_AddNumberToObject(root, "saveInterval", cfg.runtime_save_interval_min);
     cJSON_AddNumberToObject(root, "relayLevel", cfg.relay_trigger_level);
     cJSON_AddNumberToObject(root, "tdsInTh", cfg.tds_inlet_threshold);
@@ -1436,6 +1459,7 @@ static esp_err_t handle_config_set(httpd_req_t *req)
     if ((v = cJSON_GetObjectItem(root, "filterFlushDur"))) cfg.filter_flush_duration_sec = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "prodTimeout"))) cfg.production_timeout_sec = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "leakConfirm"))) cfg.leak_confirm_time_sec = v->valueint;
+    if ((v = cJSON_GetObjectItem(root, "tankConfirm"))) cfg.tank_confirm_time_sec = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "saveInterval"))) cfg.runtime_save_interval_min = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "relayLevel"))) cfg.relay_trigger_level = v->valueint;
     if ((v = cJSON_GetObjectItem(root, "tdsInTh"))) cfg.tds_inlet_threshold = v->valuedouble;
@@ -1471,6 +1495,7 @@ static esp_err_t handle_config_set(httpd_req_t *req)
     fsm_set_filter_flush_duration(cfg.filter_flush_duration_sec);
     fsm_set_production_timeout(cfg.production_timeout_sec);
     fsm_set_leak_confirm_time(cfg.leak_confirm_time_sec);
+    fsm_set_tank_confirm_time(cfg.tank_confirm_time_sec);
     fsm_set_water_hammer_delays(cfg.water_hammer_valve_open_delay_ms,
                                  cfg.water_hammer_pump_stop_delay_ms,
                                  cfg.water_hammer_valve_close_delay_ms);

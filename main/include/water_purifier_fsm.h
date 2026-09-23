@@ -273,6 +273,15 @@ esp_err_t fsm_set_production_timeout(uint32_t timeout_sec);
 esp_err_t fsm_set_leak_confirm_time(uint32_t time_sec);
 
 /**
+ * @brief 设置压力桶水满/需水确认时间
+ * @param time_sec 确认时间（秒），默认5，范围1-60
+ * @note  水满与需水共用一个确认时长：防止增压泵脉动/水锤导致
+ *        压力开关在阈值附近颤动，单次采样误判水满或需水
+ * @return ESP_OK 成功
+ */
+esp_err_t fsm_set_tank_confirm_time(uint32_t time_sec);
+
+/**
  * @brief 设置水锤效应控制延时
  * @param valve_open_delay_ms 开阀延时（毫秒），默认1000
  * @param pump_stop_delay_ms 停泵延时（毫秒），默认1000

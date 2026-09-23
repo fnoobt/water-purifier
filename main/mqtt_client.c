@@ -496,7 +496,10 @@ esp_err_t mqtt_publish_system_status(void)
              (unsigned long)free_heap, (unsigned long long)uptime,
              wifi_manager_is_connected() ? "true" : "false");
 
-    return mqtt_client_publish("system/status", json_buf, strlen(json_buf), 0, true);
+    // 使用配置的topic前缀（与其他发布保持一致）
+    char topic[128];
+    mqtt_get_topic("system/status", topic, sizeof(topic));
+    return mqtt_client_publish(topic, json_buf, strlen(json_buf), 0, true);
 }
 
 // ==================== 订阅接口 ====================
@@ -667,24 +670,35 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
                 // 处理控制消息
                 if (strstr(topic, "/set/state")) {
+                    /* 支持两种payload格式：
+                     * 纯文本（HA开关直接发送 "producing"/"idle"）
+                     * JSON（{"state":"producing"}，兼容手动发布） */
+                    char cmd[32] = {0};
                     cJSON *root = cJSON_Parse(data);
-                    if (root == NULL) {
-                        ESP_LOGW(TAG, "MQTT消息JSON解析失败: %s", data);
+                    if (root) {
+                        cJSON *state = cJSON_GetObjectItem(root, "state");
+                        if (state && cJSON_IsString(state)) {
+                            strlcpy(cmd, state->valuestring, sizeof(cmd));
+                        }
+                        cJSON_Delete(root);
+                    } else {
+                        strlcpy(cmd, data, sizeof(cmd));
+                    }
+                    if (cmd[0] == '\0') {
+                        ESP_LOGW(TAG, "MQTT消息格式无法识别: %s", data);
                         break;
                     }
-                    cJSON *state = cJSON_GetObjectItem(root, "state");
-                    if (state && cJSON_IsString(state)) {
-                        if (strcmp(state->valuestring, "producing") == 0) {
-                            fsm_send_event(FSM_EVENT_FORCE_PRODUCTION);
-                        } else if (strcmp(state->valuestring, "idle") == 0) {
-                            fsm_force_standby();
-                        } else if (strcmp(state->valuestring, "flushing") == 0) {
-                            fsm_send_event(FSM_EVENT_FORCE_FLUSH);
-                        } else if (strcmp(state->valuestring, "reset") == 0) {
-                            fsm_clear_stop();
-                        }
+                    if (strcmp(cmd, "producing") == 0) {
+                        fsm_send_event(FSM_EVENT_FORCE_PRODUCTION);
+                    } else if (strcmp(cmd, "idle") == 0) {
+                        fsm_force_standby();
+                    } else if (strcmp(cmd, "flushing") == 0) {
+                        fsm_send_event(FSM_EVENT_FORCE_FLUSH);
+                    } else if (strcmp(cmd, "reset") == 0) {
+                        fsm_clear_stop();
+                    } else {
+                        ESP_LOGW(TAG, "未知MQTT控制命令: %s", cmd);
                     }
-                    cJSON_Delete(root);
                 } else if (strstr(topic, "/set/flush")) {
                     fsm_send_event(FSM_EVENT_FORCE_FLUSH);
                 }
@@ -816,7 +830,7 @@ esp_err_t mqtt_send_ha_discovery(void)
     mqtt_send_ha_sensor_config("TDS In", "tds_in", "ppm");
     mqtt_send_ha_sensor_config("TDS Out", "tds_out", "ppm");
     mqtt_send_ha_sensor_config("TDS Reduction Rate", "tds_reduction_rate", "%");
-    mqtt_send_ha_sensor_config("State", "purifier_state", NULL);
+    mqtt_send_ha_sensor_config("State", "state", NULL);
     mqtt_send_ha_switch_config("Water Purifier");
 
     return ESP_OK;
@@ -830,8 +844,8 @@ esp_err_t mqtt_send_ha_sensor_config(const char *sensor_name, const char *sensor
     snprintf(topic, sizeof(topic), "homeassistant/sensor/water_purifier/%s/config", sensor_name);
     snprintf(value_template, sizeof(value_template), "{{ value_json.%s }}", sensor_type);
 
-    // 使用配置的topic前缀构建state_topic
-    mqtt_get_topic("state", state_topic, sizeof(state_topic));
+    // 使用配置的topic前缀构建state_topic（状态实际发布在 <prefix>/status）
+    mqtt_get_topic("status", state_topic, sizeof(state_topic));
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddItemToObject(root, "name", cJSON_CreateString(sensor_name));
@@ -870,7 +884,9 @@ esp_err_t mqtt_send_ha_switch_config(const char *switch_name)
     snprintf(topic, sizeof(topic), "homeassistant/switch/water_purifier/%s/config", switch_name);
 
     // 使用配置的topic前缀构建state_topic和command_topic
-    mqtt_get_topic("state", state_topic, sizeof(state_topic));
+    // state_topic: 状态实际发布在 <prefix>/status（JSON，state字段为中文状态名）
+    // command_topic: 控制命令发布到 <prefix>/set/state
+    mqtt_get_topic("status", state_topic, sizeof(state_topic));
     mqtt_get_topic("set/state", command_topic, sizeof(command_topic));
 
     cJSON *root = cJSON_CreateObject();
@@ -878,8 +894,13 @@ esp_err_t mqtt_send_ha_switch_config(const char *switch_name)
     cJSON_AddItemToObject(root, "unique_id", cJSON_CreateString(topic));
     cJSON_AddItemToObject(root, "command_topic", cJSON_CreateString(command_topic));
     cJSON_AddItemToObject(root, "state_topic", cJSON_CreateString(state_topic));
+    // 状态JSON中提取state字段；命令与状态值分离：
+    // payload_on/off = 发送的控制命令(英文)，state_on/off = 状态匹配值(FSM中文状态名)
+    cJSON_AddItemToObject(root, "value_template", cJSON_CreateString("{{ value_json.state }}"));
     cJSON_AddItemToObject(root, "payload_on", cJSON_CreateString("producing"));
     cJSON_AddItemToObject(root, "payload_off", cJSON_CreateString("idle"));
+    cJSON_AddItemToObject(root, "state_on", cJSON_CreateString("制水"));
+    cJSON_AddItemToObject(root, "state_off", cJSON_CreateString("待机"));
 
     char *json_str = cJSON_PrintUnformatted(root);
     if (json_str) {
@@ -927,7 +948,7 @@ void mqtt_client_print_info(void)
 /**
  * @brief MQTT自动重连任务
  *
- * 策略：指数退避重连（1s→2s→4s→8s→16s→30s），连接成功后自动退出
+ * 策略：指数退避重连（1s→2s→4s→8s→16s→30s→60s上限），连接成功后自动退出
  * 收到stop_requested信号时安全退出
  */
 static void mqtt_reconnect_task(void *pvParameters)

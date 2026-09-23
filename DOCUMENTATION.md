@@ -54,8 +54,7 @@ WaterPurifier/
 │   │   ├── tds_sensor.h           # TDS传感器接口
 │   │   ├── water_purifier_fsm.h   # 状态机接口（8状态FSM）
 │   │   ├── wifi_manager.h         # WiFi管理器接口
-│   │   ├── mqtt_client.h          # MQTT客户端接口
-│   │   ├── app_mqtt.h             # MQTT客户端别名（app_前缀，避免与ESP-IDF冲突）
+│   │   ├── app_mqtt.h             # MQTT客户端接口（app_前缀，避免与ESP-IDF冲突）
 │   │   ├── app_mqtt_public.h      # MQTT公开接口
 │   │   ├── web_server.h           # Web服务器接口
 │   │   ├── config_manager.h       # 配置管理器接口
@@ -100,20 +99,20 @@ WaterPurifier/
 0. web_server_init_log_interceptor() -> 日志拦截器启动（捕获所有后续日志）
 1. config_manager_init()   -> NVS初始化，加载系统配置
 2. gpio_driver_init_*()    -> GPIO输入/输出/LED初始化
-3. tds_sensor_init()       -> ADC初始化
+3. pm_manager_init()       -> 电源管理初始化（FSM回调依赖，须先于FSM）
+4. tds_sensor_init()       -> ADC初始化
    filter_mgr_init()       -> 滤芯管理初始化
    tds_sensor_start()      -> TDS测量任务（1秒周期）
-4. fsm_init()              -> 状态机初始化
+5. fsm_init()              -> 状态机初始化
    fsm_start()             -> FSM任务（100ms周期）
-5. history_logger_init()   -> 历史记录初始化
-6. pm_manager_init()       -> 电源管理初始化（WiFi TX初始20dBm）
+6. history_logger_init()   -> 历史记录初始化
 7. wifi_manager_init()     -> WiFi初始化
    wifi_manager_start()    -> STA/AP模式
 8. mqtt_client_init()      -> MQTT客户端初始化
 9. ota_update_init()       -> OTA模块初始化（异常状态自动标记有效）
 10. web_server_init()      -> HTTP服务器初始化
     web_server_start()     -> 启动Web服务
-11. monitor_task           -> 监控任务（30秒周期）
+    monitor_task           -> 监控任务（Web服务后创建，30秒周期）
     pm_manager_check_heap()-> 堆内存检查
 ```
 
@@ -340,7 +339,7 @@ float filter_mgr_get_waste_flow_lph(void);
 |------|------|---------|
 | STANDBY | 待机 | 初始状态/冲洗完成/手动复位/网页切换 |
 | PRODUCTION | 制水中 | 需要制水/网页启动 |
-| TANK_FULL | 水满（瞬时） | 压力桶满 |
+| TANK_FULL | 水满（瞬时） | 压力桶满（持续确认≥5秒，防开关颤动） |
 | NORMAL_FLUSH | 常规冲洗 | 水满后自动/网页切换 |
 | PURE_FLUSH | 纯水洗膜 | 常规冲洗完成/网页切换 |
 | WATER_SHORTAGE | 缺水 | 进水压力不足 |
@@ -404,16 +403,16 @@ float filter_mgr_get_waste_flow_lph(void);
 
 | 状态 | 输出 | 转换条件 |
 |------|------|---------|
-| STANDBY | 全部关闭 | 有水+需制水+!standby_manual→PRODUCTION，无水→SHORTAGE，漏水→LEAK |
-| PRODUCTION | 进水阀+增压泵（开阀→延时→泵，废水阀关） | 压力桶满→TANK_FULL，缺水→SHORTAGE，漏水→LEAK，超时→STOP |
+| STANDBY | 全部关闭 | 有水+需制水确认(5s)+!standby_manual→PRODUCTION，无水→SHORTAGE，漏水→LEAK |
+| PRODUCTION | 进水阀+增压泵（开阀→延时→泵，废水阀关） | 压力桶满确认(5s)→TANK_FULL，缺水→SHORTAGE，漏水→LEAK，超时→STOP |
 | TANK_FULL | 无（瞬时过渡） | 无条件→NORMAL_FLUSH |
 | NORMAL_FLUSH | 进水阀+废水阀+增压泵（自适应水锤流程） | 完成→PURE_FLUSH，缺水→SHORTAGE，漏水→LEAK |
-| PURE_FLUSH | 回水阀+废水阀（停泵→延时→关进水阀→延时→开回水阀+废水阀） | 完成→STANDBY（设standby_manual），用户用水→STANDBY，缺水→SHORTAGE，漏水→LEAK |
+| PURE_FLUSH | 回水阀+废水阀（停泵→延时→关进水阀→延时→开回水阀+废水阀） | 完成→STANDBY，用户用水→STANDBY，缺水→SHORTAGE，漏水→LEAK |
 | WATER_SHORTAGE | 全部关闭 | 有水→STANDBY，漏水→LEAK |
 | LEAK_ALARM | 全部关闭 | 手动复位→STANDBY |
 | STOP | 全部关闭 | 手动复位→STANDBY |
 
-**水锤控制** (8阶段 `flush_phase_t`):
+**水锤控制** (`flush_phase_t` 共7个枚举值，其中 PUMP_DELAY/RETURN_DELAY 为未使用的预留值):
 - **制水启动**: 开进水阀 → 延时1000ms → 开增压泵（废水阀关闭）
 - **常规冲洗**: 检测进水阀是否已打开，未打开则先开阀延时再启泵，已打开则直接启泵
 - **常规冲洗→纯水洗膜**: 停泵 → 延时1000ms → 关进水阀 → 延时500ms → 开回水阀+废水阀
@@ -423,11 +422,13 @@ float filter_mgr_get_waste_flow_lph(void);
 
 **纯水中断**: 纯水冲洗期间若用户用水（压力开关闭合），且处于FLUSH_PHASE_RUNNING阶段，立即转入待机。
 
-**待机行为**: 冲洗完成后设 `standby_manual=true`，压力桶缺水时清除标志自动恢复制水。
+**待机行为**: 冲洗完成后进入待机；`standby_manual` 仅由网页"待机"按钮设置，压力桶需水确认后清除标志自动恢复制水。
 
-**换芯冲洗**: 网页"换芯冲洗"触发1小时连续冲洗（不切纯水，不计统计），可提前通过"待机"中断。
+**水满/需水确认**: 压力桶开关信号需持续 `tank_confirm_time_sec`（默认5秒，管理页"水满确认"可调）才生效——制水态确认水满（防泵脉动/水锤颤动误判提前水满），待机态确认需水；确认计时在进入所属状态时复位。
 
-**停止历史**: 循环缓冲区16条记录，索引自动防止溢出（>256时回绕）。
+**换芯冲洗**: 网页"换芯冲洗"触发1小时连续冲洗（不切纯水），可提前通过"待机"中断。不计入冲洗周期数，但冲洗时间/每日冲洗次数/前三级过水量仍正常统计。
+
+**停止历史**: 循环缓冲区16条记录，uint32索引按 %16 取模写入。
 
 **事件驱动**: FSM通过FreeRTOS事件队列接收外部命令，`fsm_force_standby()` 改用事件队列而非直接修改状态，避免跨线程竞态。
 
@@ -499,9 +500,8 @@ esp_err_t fsm_get_status_string(char *buf, size_t buf_size);
 
 **自动重连机制**:
 - WiFi断开后启动独立FreeRTOS任务执行指数退避重连（1s→2s→4s→8s→16s→30s→60s上限）
-- 约10分钟（15次尝试）后仍失败则进入AP模式并退出任务
-- 路由器恢复后下次WiFi断开时自动重建重连任务，避免无限循环导致设备不稳定
-- 重连任务不阻塞事件处理系统，重连成功后自动停止AP模式
+- 15次尝试（纯退避累计约10分钟）后仍失败则进入AP模式，任务不退出，转为每300秒后台重连直至成功
+- 路由器恢复后由后台重连自动连上并退出任务，重连成功后自动停止AP模式
 - AP模式使用APSTA混合模式，允许后台重连等待路由器恢复
 - `wifi_manager_stop()` 使用 3 次重试获取 mutex（每次 100ms，共 300ms）确保重连任务在 mutex 保护下正确清理，仅最终失败时强制删除任务（vTaskDelete 对正在 vTaskDelay 的任务是安全的）
 
@@ -533,7 +533,7 @@ esp_err_t wifi_manager_save_config(void);
 - 连接成功后自动同步Alibaba NTP服务器 `ntp.aliyun.com`
 - 用于滤芯日历寿命计算和日志时间戳转换
 - `wifi_manager_get_boot_wall_clock_time()` 获取启动时的墙钟时间
-- 未同步时使用启动后经过秒数估算
+- 日志页未同步时不显示时间戳（状态栏提示"时间戳未同步"）；滤芯日历寿命使用启动后经过秒数估算
 
 **mDNS服务注册**:
 - Hostname: `waterpurifier.local`
@@ -558,34 +558,27 @@ esp_err_t mqtt_send_ha_discovery(void);
 esp_err_t mqtt_client_set_config(const mqtt_config_t *config);
 ```
 
-**MQTT主题结构**:
+**MQTT主题结构**（`<prefix>` 默认为 `homeassistant/water_purifier`，可在MQTT配置中修改）:
 ```
 # 状态发布
-water-purifier/status              # 系统状态
-water-purifier/tds/in              # 进水TDS值
-water-purifier/tds/out             # 出水TDS值
-water-purifier/tds/reduction_rate  # TDS去除率
+<prefix>/status         # 系统状态+TDS（JSON: state/tds_in/tds_out/tds_reduction_rate）
+<prefix>/tds            # TDS数据（JSON: tds_in/tds_out/tds_reduction_rate）
+<prefix>/system/status  # 系统运行状态（JSON: free_heap/uptime/wifi_connected）
 
 # 控制订阅
-water-purifier/set/state           # 状态控制
-water-purifier/set/flush           # 冲洗控制
+<prefix>/set/state      # 状态控制（纯文本或JSON: producing/idle/flushing/reset）
+<prefix>/set/flush      # 冲洗控制（任意payload触发）
 ```
 
-**Home Assistant发现实体**:
+**Home Assistant发现实体**（连接成功后自动发送，4个sensor + 1个switch）:
 
-| 实体类型 | 实体ID | 说明 |
-|---------|--------|------|
-| Sensor | `water_purifier_tds_in` | 进水TDS值 (ppm) |
-| Sensor | `water_purifier_tds_out` | 出水TDS值 (ppm) |
-| Sensor | `water_purifier_tds_reduction_rate` | TDS去除率 (%) |
-| Sensor | `water_purifier_rssi` | WiFi信号强度 (dBm) |
-| Sensor | `water_purifier_cycles` | 总制水次数 |
-| Switch | `water_purifier_production` | 制水控制 |
-| Switch | `water_purifier_flush` | 冲洗控制 |
-| Binary Sensor | `water_purifier_high_pressure` | 高压开关状态 |
-| Binary Sensor | `water_purifier_low_pressure` | 低压开关状态 |
-| Binary Sensor | `water_purifier_tank_pressure` | 压力桶开关状态 |
-| Binary Sensor | `water_purifier_leak` | 漏水检测状态 |
+| 实体类型 | 名称 | state_topic | 说明 |
+|---------|------|-------------|------|
+| Sensor | TDS In | `<prefix>/status` | 进水TDS值 (ppm)，取自 value_json.tds_in |
+| Sensor | TDS Out | `<prefix>/status` | 出水TDS值 (ppm)，取自 value_json.tds_out |
+| Sensor | TDS Reduction Rate | `<prefix>/status` | TDS去除率 (%)，取自 value_json.tds_reduction_rate |
+| Sensor | State | `<prefix>/status` | FSM状态（中文状态名），取自 value_json.state |
+| Switch | Water Purifier | `<prefix>/status` | 制水=ON/待机=OFF；命令发到 `<prefix>/set/state`（producing/idle） |
 
 ---
 
@@ -594,7 +587,7 @@ water-purifier/set/flush           # 冲洗控制
 **职责**: HTTP服务器、Web控制界面、RESTful API、日志缓冲区管理、Basic Auth认证
 
 **主要功能**:
-- 首页（只读监控，30秒自动刷新，无需认证）
+- 首页（只读监控，3秒自动刷新，无需认证）
 - 管理页（配置控制，需认证）
 - 日志页（实时串口日志，SNTP同步后显示真实时间戳 `[yyyy-mm-dd hh:mm:ss]`，需认证）
 - OTA升级页（固件上传，需认证）
@@ -603,7 +596,7 @@ water-purifier/set/flush           # 冲洗控制
 
 **Web认证机制**:
 - **Basic Auth**: 浏览器弹出认证框，输入用户名/密码
-- **Session Cookie**: 认证成功后生成32字节随机token，24小时有效
+- **Session Cookie**: 认证成功后生成16字节随机数token（32字符hex），24小时有效
 - **滑动过期**: 每次请求自动刷新session时间，活跃用户不会过期
 - **HTTP超时**: 接收/发送超时10秒（默认5秒）
 - **max_open_sockets**: 3（ESP-IDF v6.0 LWIP限制）
@@ -621,10 +614,10 @@ water-purifier/set/flush           # 冲洗控制
 - 日志拦截器在初始化最开始启动，捕获全部初始化日志
 - `handle_log_debug()` 简单正向读取（旧→新），最新日志显示在底部，使用分块流式传输（1KB chunk），避免大块内存分配
 - 日志时间戳格式 `[yyyy-mm-dd hh:mm:ss]`，SNTP同步后由HTTP handler将启动毫秒时间戳转换为墙钟时间
-- 内存检查：可用堆 < 20KB时返回简单错误消息
+- 内存检查：1KB chunk缓冲区动态分配失败时返回错误消息
 
 **HTTP服务器配置**:
-- 任务栈: 12KB（buf是static不占用栈，足够HTTP处理）
+- 任务栈: 8KB（日志改流式输出后由20KB降至8KB）
 - 接收/发送超时: 10秒（默认5秒）
 - 最大socket: 3（ESP-IDF v6.0 LWIP限制）
 - 最大URI处理器: 26
@@ -648,6 +641,7 @@ water-purifier/set/flush           # 冲洗控制
 | `/ota` | GET | 需要 | OTA固件升级页面 |
 | `/api/ota/status` | GET | 需要 | OTA升级状态 |
 | `/api/ota/update` | POST | 需要 | 上传固件OTA升级 |
+| `/api/ota/preview` | POST | 需要 | 固件预览（上传前解析版本信息） |
 | `/api/ota/factory` | POST | 需要 | 恢复出厂固件 |
 | `/api/ota/rollback` | POST | 需要 | 回滚到上一OTA固件 |
 | `/logs` | GET | 需要 | 实时串口日志页面 |
@@ -663,6 +657,7 @@ water-purifier/set/flush           # 冲洗控制
 {"action": "standby"}           // 待机
 {"action": "shutdown"}          // 停止
 {"action": "reset"}             // 复位
+{"action": "reboot"}            // 重启
 ```
 
 **状态响应示例**:
@@ -671,8 +666,8 @@ water-purifier/set/flush           # 冲洗控制
   "state": "制水中",
   "tds_in": 150.5, "tds_out": 8.2, "rate": 94.5,
   "filters": [
-    {"name":"PP棉","waterPct":85,"timePct":90,"effPct":85,"total":3000},
-    {"name":"RO膜","waterPct":91,"timePct":88,"effPct":88,"total":8000}
+    {"waterPct":85,"timePct":90,"effPct":85,"used":450,"total":3000,"timeLimit":2190,"needReplace":false},
+    {"waterPct":91,"timePct":88,"effPct":88,"used":900,"total":10000,"timeLimit":17520,"needReplace":false}
   ],
   "totalWater": 1523, "prodWater": 432, "leak": false,
   "wifiState": "已连接", "ssid": "MyWiFi", "ip": "192.168.1.100",
@@ -684,10 +679,10 @@ water-purifier/set/flush           # 冲洗控制
 
 | 页面 | 路径 | 功能 |
 |------|------|------|
-| 首页 | `/` | 只读监控，30秒自动刷新 |
+| 首页 | `/` | 只读监控，3秒自动刷新 |
 | 管理页 | `/admin` | 配置控制 |
 | OTA页 | `/ota` | 固件升级、恢复出厂、回滚上一版本 |
-| 日志页 | `/logs` | 实时串口日志（SSE流式推送） |
+| 日志页 | `/logs` | 实时串口日志（HTTP分块传输 + JS轮询刷新） |
 
 **首页功能**:
 - 系统状态（待机/制水中/冲洗中等）
@@ -701,9 +696,9 @@ water-purifier/set/flush           # 冲洗控制
 
 | 区域 | 功能 |
 |------|------|
-| 控制面板 | 制水、常规冲洗、纯水洗膜、换芯冲洗、复位、待机、停止 |
+| 控制面板 | 常规冲洗、纯水洗膜、换芯冲洗、复位、待机、停止、重启（"制水"仅支持API动作） |
 | 硬件配置 | RO膜通量、增压泵、压力桶选择 |
-| 系统配置 | 冲洗时间、制水超时、漏水确认、水锤延时、继电器电平 |
+| 系统配置 | 冲洗时间、制水超时、漏水确认、水满确认、水锤延时、继电器电平 |
 | 滤芯管理 | 五级滤芯水量+时间寿命设置，单独重置 |
 | TDS校准 | 进水/出水TDS传感器一点校准 |
 | WiFi配置 | 扫描网络、保存配置 |
@@ -733,7 +728,8 @@ typedef struct {
     uint8_t tank_size;            // 0=3G, 1=3.2G, 2=4G, 3=6G, 4=10G
 
     // 系统参数
-    uint32_t flush_duration_sec, production_timeout_sec, leak_confirm_time_sec;
+    uint32_t production_timeout_sec, leak_confirm_time_sec;
+    uint32_t tank_confirm_time_sec;   // 压力桶水满/需水确认时间（秒），默认5
     uint16_t runtime_save_interval_min;   // 10/60/120/240/360/720/1440
 
     // 冲洗参数
@@ -743,13 +739,16 @@ typedef struct {
     uint32_t water_hammer_pump_stop_delay_ms;
     uint32_t water_hammer_valve_close_delay_ms;
 
-    // TDS/继电器/滤芯/Web配置
+    // TDS/继电器/Web配置
     uint8_t relay_trigger_level;
     float tds_inlet_threshold, tds_outlet_threshold;
     float tds_calibration_offset[2], tds_calibration_scale[2];
-    uint32_t filter_capacity_liters;
     uint16_t web_port; bool web_auth_enabled;
     char web_username[32], web_password[32];
+
+    // FSM运行统计（持久化，NVS键 fsm_prod_cyc/fsm_flush_cyc/fsm_prod_time/fsm_flush_time）
+    uint32_t fsm_prod_cycles, fsm_flush_cycles;
+    uint64_t fsm_prod_time_sec, fsm_flush_time_sec;
 } system_config_t;
 ```
 
@@ -767,11 +766,12 @@ typedef struct {
 
 | 命名空间 | 用途 |
 |---------|------|
-| `water_purifier` | 系统配置 + WiFi凭证 + MQTT配置 |
-| `wp_rt` | 运行数据（制水次数、冲洗次数、时间统计） |
+| `water_purifier` | 系统配置 + WiFi凭证 + MQTT配置 + FSM运行统计（fsm_*键） |
 | `wp_filters` | 滤芯数据（水量/时间寿命） |
-| `history` | 事件日志（20条循环） |
+| `history` | 事件日志（15条循环） |
 | `daily_stats` | 每日统计（制水时间、TDS均值） |
+
+注：`wp_rt`（旧运行数据命名空间）仅为迁移源，迁移成功后自动删除。
 
 **主要函数**:
 ```c
@@ -976,7 +976,7 @@ Content-Type: application/json
 {"action": "start_production"}
 ```
 
-**action参数**: `start_production` | `normal_flush` | `pure_flush` | `filter_flush` | `standby` | `shutdown` | `reset`
+**action参数**: `start_production` | `normal_flush` | `pure_flush` | `filter_flush` | `standby` | `shutdown` | `reset` | `reboot`
 
 ### WiFi配置
 
@@ -991,7 +991,7 @@ POST /api/wifi
 ```http
 GET /api/mqtt/config
 POST /api/mqtt/config
-{"enabled": true, "broker": "mqtt://homeassistant.local:1883", "user": "", "password": "", "prefix": "water-purifier"}
+{"enabled": true, "broker": "mqtt://homeassistant.local:1883", "user": "", "password": "", "prefix": "homeassistant/water_purifier"}
 ```
 
 ### OTA分区切换
@@ -1022,7 +1022,7 @@ POST /api/ota/rollback
 |---------|------|---------|
 | `water_purifier` | 系统配置（WiFi/MQTT/硬件/TDS） | config_manager |
 | `wp_filters` | 滤芯寿命 + 用水量统计 | filter_manager |
-| `history` | 事件日志（20条环形缓冲） | history_logger |
+| `history` | 事件日志（15条环形缓冲） | history_logger |
 | `daily_stats` | 每日统计（按日期键） | history_logger |
 
 #### water_purifier（系统配置）
@@ -1042,6 +1042,7 @@ POST /api/ota/rollback
 | `wv_flow` | u16 | 废水阀流量（CC） |
 | `prod_timeout` | u32 | 制水超时时间（秒） |
 | `leak_confirm` | u32 | 漏水确认时间（秒） |
+| `tank_confirm` | u32 | 压力桶水满/需水确认时间（秒） |
 | `save_intv` | u16 | 运行数据保存间隔（分钟） |
 | `nflush_dur` | u32 | 常规冲洗时间（秒） |
 | `pflush_dur` | u32 | 纯水洗膜时间（秒） |
@@ -1061,6 +1062,10 @@ POST /api/ota/rollback
 | `web_auth` | u8 | Web认证启用 |
 | `web_user` | string | Web用户名 |
 | `web_pass` | string | Web密码 |
+| `fsm_prod_cyc` | u32 | 总制水周期数 |
+| `fsm_flush_cyc` | u32 | 总冲洗周期数 |
+| `fsm_prod_time` | u64 | 总制水时间（秒） |
+| `fsm_flush_time` | u64 | 总冲洗时间（秒） |
 
 #### wp_filters（滤芯数据）
 
@@ -1068,13 +1073,15 @@ POST /api/ota/rollback
 |------|------|------|
 | `total_water` | u32 | 总用水量（升，含冲洗） |
 | `total_prod` | u32 | 总制水量（升，仅纯水） |
-| `pre_acc` | u32 | 前三级水量累加器（mL） |
-| `post_acc` | u32 | 后两级水量累加器（mL） |
+| `acc_0`~`acc_4` | u32 | 各级滤芯独立累加器（mL，<1L余数） |
 | `prod_rate` | i32 | 制水速率（L/h ×100） |
 | `f0_used`~`f4_used` | u32 | 各级滤芯已用水量 |
 | `f0_reset`~`f4_reset` | u32 | 各级滤芯重置时间戳 |
 | `f0_cap`~`f4_cap` | u32 | 各级滤芯自定义容量 |
 | `f0_time`~`f4_time` | u32 | 各级滤芯时间寿命（小时） |
+| `f0_base`~`f4_base` | u32 | 各级滤芯重置时的累计水量基线（前三级对应total_water，后两级对应total_prod） |
+
+注：`pre_acc`/`post_acc` 为旧格式累加器键，仅作迁移读取，迁移后擦除。
 
 #### history（事件日志）
 
@@ -1094,7 +1101,7 @@ POST /api/ota/rollback
 **废弃命名空间**（v2.3.0前，自动迁移）：
 - `wifi` → 已合并到 `water_purifier`
 - `mqtt_config` → 已合并到 `water_purifier`
-- `wp_rt` → 已删除（运行数据改为临时状态）
+- `wp_rt` → 已删除（运行数据移至 `water_purifier` 命名空间 `fsm_*` 键持久化）
 
 ---
 
@@ -1191,8 +1198,8 @@ POST /api/ota/rollback
 
 | 类别 | 大小 | 说明 |
 |------|------|------|
-| 静态缓冲区(BSS) | ~30 KB | 日志环形缓冲区(8KB) + HTML输出缓冲区(18KB) + 日志页缓冲区(4KB) + 全局结构体 |
-| 任务栈 | ~42 KB | fsm(3KB), httpd(20KB), wifi_reconnect(4KB), mqtt_reconnect(4KB), 其他(11KB) |
+| 静态缓冲区(BSS) | ~30 KB | 日志环形缓冲区(8KB) + 全局结构体（日志HTML输出已改为1KB动态chunk，不占BSS） |
+| 任务栈 | ~31 KB | fsm(3KB), httpd(8KB), wifi_reconnect(4KB), mqtt_reconnect(4KB), tds(3KB), 其他(9KB) |
 | WiFi/LWIP | ~25-30 KB | 协议栈缓冲区（动态分配） |
 | IDF系统开销 | ~20 KB | Heap管理器、定时器、系统任务 |
 | **已用总计** | ~117-122 KB | |
@@ -1205,10 +1212,10 @@ POST /api/ota/rollback
 | main_task | 3.5 KB | 1 | ESP-IDF默认 |
 | event_task | 4 KB | 1 | WiFi/系统事件处理 |
 | fsm_task | 3 KB | 5 | 状态机主循环 |
-| httpd | 20 KB | 5 | Web服务器（静态buf不占用栈，但handle_log_debug需要较大栈空间） |
+| httpd | 8 KB | 5 | Web服务器（日志改1KB chunk流式输出后由20KB降至8KB） |
 | wifi_reconnect | 4 KB | 5 | WiFi指数退避重连 |
 | mqtt_reconnect | 4 KB | 4 | MQTT指数退避重连 |
-| tds_task | 2 KB | 4 | TDS传感器测量 |
+| tds_task | 3 KB | 4 | TDS传感器测量 |
 | monitor_task | 2 KB | 6 | 系统监控（看门狗） |
 
 ### LED指示
