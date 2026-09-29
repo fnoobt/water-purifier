@@ -5,6 +5,7 @@
  */
 
 #include "ota_update.h"
+#include "config_manager.h"  // config_manager_save_all_dirty（计划重启前保存脏数据）
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_app_format.h"
@@ -486,6 +487,7 @@ esp_err_t ota_update_revert_to_factory(void)
     // 延迟重启，确保HTTP响应和日志完全发送（Web服务器响应可能需要缓冲）
     // 增加到1500ms以适应网络延迟和缓冲刷新
     vTaskDelay(pdMS_TO_TICKS(1500));
+    config_manager_save_all_dirty();  // 重启前保存脏数据（无脏零写入）
     ESP_LOGI(TAG, "执行重启...");
     esp_restart();
 
@@ -541,6 +543,7 @@ esp_err_t ota_update_rollback(void)
 
     ESP_LOGI(TAG, "已设置启动分区为 %s，即将重启...", target->label);
     vTaskDelay(pdMS_TO_TICKS(500));
+    config_manager_save_all_dirty();  // 回滚重启前保存脏数据（无脏零写入）
     esp_restart();
 
     return ESP_OK;

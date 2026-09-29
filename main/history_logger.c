@@ -114,25 +114,32 @@ static uint32_t get_today_date(void)
     return days_since_boot % MAX_BOOT_DAYS;
 }
 
-static void save_to_nvs(void)
+// 标准NVS为写穿模式：nvs_set_* 立即写入flash，nvs_commit 是空操作恒返回OK，
+// 必须检查set返回值——否则NVS写满时数据静默丢失且调用方误清脏标志
+static esp_err_t save_to_nvs(void)
 {
     nvs_handle_t handle;
-    if (nvs_open(NVS_NAMESPACE_HISTORY, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_HISTORY, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
     }
 
     // 保存记录数量和写入索引
-    nvs_set_u32(handle, "count", ctx.record_count);
-    nvs_set_u32(handle, "index", ctx.write_index);
+    esp_err_t set_err = nvs_set_u32(handle, "count", ctx.record_count);
+    esp_err_t e = nvs_set_u32(handle, "index", ctx.write_index);
+    if (set_err == ESP_OK) set_err = e;
 
     // 保存记录数据
-    nvs_set_blob(handle, "records", ctx.records, sizeof(ctx.records));
+    e = nvs_set_blob(handle, "records", ctx.records, sizeof(ctx.records));
+    if (set_err == ESP_OK) set_err = e;
 
-    esp_err_t err = nvs_commit(handle);
+    e = nvs_commit(handle);
     nvs_close(handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "历史记录NVS提交失败: %s", esp_err_to_name(err));
+    if (set_err == ESP_OK) set_err = e;
+    if (set_err != ESP_OK) {
+        ESP_LOGW(TAG, "历史记录NVS写入失败: %s（脏标志保留，将重试）", esp_err_to_name(set_err));
     }
+    return set_err;
 }
 
 static void load_from_nvs(void)
@@ -163,22 +170,25 @@ static void load_from_nvs(void)
     nvs_close(handle);
 }
 
-static void save_daily_to_nvs(void)
+static esp_err_t save_daily_to_nvs(void)
 {
     nvs_handle_t handle;
-    if (nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_DAILY, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
     }
 
     char key[12];  // 足够容纳 "b999" 或 "d20991231"
     make_date_key(ctx.today.date, key, sizeof(key));
-    nvs_set_blob(handle, key, &ctx.today, sizeof(daily_stats_t));
+    err = nvs_set_blob(handle, key, &ctx.today, sizeof(daily_stats_t));
 
-    esp_err_t err = nvs_commit(handle);
+    esp_err_t ce = nvs_commit(handle);
     nvs_close(handle);
+    if (err == ESP_OK) err = ce;
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "每日统计NVS提交失败: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "每日统计NVS写入失败: %s（脏标志保留，将重试）", esp_err_to_name(err));
     }
+    return err;
 }
 
 /**
@@ -593,12 +603,17 @@ esp_err_t history_logger_force_save(void)
         ESP_LOGE(TAG, "force_save: mutex获取超时");
         return ESP_ERR_TIMEOUT;
     }
-    save_to_nvs();
-    save_daily_to_nvs();
-    ctx.history_dirty = false;
-    ctx.daily_stats_dirty = false;
+    esp_err_t err1 = save_to_nvs();
+    esp_err_t err2 = save_daily_to_nvs();
+    // 仅保存成功才清除脏标志，失败保留以便重试
+    if (err1 == ESP_OK) {
+        ctx.history_dirty = false;
+    }
+    if (err2 == ESP_OK) {
+        ctx.daily_stats_dirty = false;
+    }
     xSemaphoreGive(ctx.mutex);
-    return ESP_OK;
+    return (err1 != ESP_OK) ? err1 : err2;
 }
 
 // ==================== NVS整理备份/恢复 ====================
@@ -719,13 +734,13 @@ bool history_periodic_save(uint32_t min_interval_sec)
     if (history_dirty && (date_changed || elapsed_sec >= min_interval_sec)) {
         // 需要在mutex内读取records数据进行保存
         if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            save_to_nvs();  // 内部检查nvs_commit返回值，失败时输出警告
-            // 仅在保存成功后清除脏标志（save_to_nvs内部commit失败时保留脏标志）
-            // 注意：save_to_nvs内部已在成功时清除save_needed标志
-            ctx.history_dirty = false;
+            // 仅保存成功才清除脏标志；失败保留以便下期间隔点重试
+            if (save_to_nvs() == ESP_OK) {
+                ctx.history_dirty = false;
+                did_save = true;
+                ESP_LOGD(TAG, "历史记录已保存（节流间隔%lu秒）", min_interval_sec);
+            }
             xSemaphoreGive(ctx.mutex);
-            did_save = true;
-            ESP_LOGD(TAG, "历史记录已保存（节流间隔%lu秒）", min_interval_sec);
         }
     }
 
@@ -752,8 +767,8 @@ bool history_periodic_save(uint32_t min_interval_sec)
             }
             // 在mutex内保存并更新状态
             if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                save_daily_to_nvs();
-                // 跨天时重置今日数据
+                bool saved = (save_daily_to_nvs() == ESP_OK);
+                // 跨天时重置今日数据（无论保存成败都执行，避免日期状态滞留）
                 if (date_changed) {
                     uint32_t yesterday = ctx.today.date;
                     char old_key[12];
@@ -774,7 +789,10 @@ bool history_periodic_save(uint32_t min_interval_sec)
                     // 跨天时清理过期每日统计（防止NVS长期累积写满）
                     cleanup_old_daily_stats();
                 }
-                ctx.daily_stats_dirty = false;
+                // 仅保存成功才清除脏标志；失败保留以便下期间隔点重试
+                if (saved) {
+                    ctx.daily_stats_dirty = false;
+                }
                 xSemaphoreGive(ctx.mutex);
             }
             did_save = true;

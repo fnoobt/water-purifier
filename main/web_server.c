@@ -1383,6 +1383,7 @@ static esp_err_t handle_control(httpd_req_t *req)
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"status\":\"重启中...\"}");
         vTaskDelay(pdMS_TO_TICKS(100));  // 等待HTTP响应完成
+        config_manager_save_all_dirty();  // 重启前保存脏数据（无脏零写入）
         esp_restart();
         return ESP_OK;  // 不会执行到这里
     }
@@ -2323,6 +2324,7 @@ cleanup_restart:
     s_ota_session_active = false;
     taskEXIT_CRITICAL(&s_ota_spinlock);
     vTaskDelay(pdMS_TO_TICKS(500));
+    config_manager_save_all_dirty();  // OTA重启前保存脏数据（无脏零写入）
     esp_restart();
     return result;  // 不可达，保留以消除编译器警告
 }

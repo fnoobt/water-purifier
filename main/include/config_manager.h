@@ -189,6 +189,17 @@ esp_err_t config_manager_set_bool(const char *key, bool value);
  */
 bool config_manager_periodic_save_all(uint32_t min_interval_sec);
 
+/**
+ * @brief 保存所有模块的脏数据（计划重启前调用）
+ * @note 全链路脏标志门控，无数据变化时不产生任何NVS写入：
+ *       FSM运行统计(值变才标config脏)→config(config_dirty)
+ *       →filter(save_needed)→history(history_dirty/daily_stats_dirty)
+ *       用于网页重启/OTA成功/恢复factory/回滚等计划重启路径，
+ *       防止重启发生在保存间隔中途时丢失未到期数据（如漏水/停机记录）。
+ *       非常规写入源：仅在重启事件且确有脏数据时落盘一次，不增加周期磨损
+ */
+void config_manager_save_all_dirty(void);
+
 // ==================== NVS维护 ====================
 
 /**

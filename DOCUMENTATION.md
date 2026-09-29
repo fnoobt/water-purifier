@@ -280,7 +280,7 @@ typedef struct {
 
 **Flash写入策略**:
 - `filter_mgr_update_water_usage()` — 仅标记脏，不调用NVS
-- `filter_mgr_periodic_save()` — FSM周期任务调用，检查脏标志后写入
+- `filter_mgr_periodic_save()` — 统一保存链调用（保存间隔到点/计划重启前），检查脏标志后写入
 - `filter_mgr_reset_filter()` / `filter_mgr_set_filter_capacity_ex()` — 用户操作，立即写入
 - `filter_mgr_set_all_filter_capacity()` — 批量设置5级滤芯，一次NVS写入
 - `filter_mgr_set_all_filter_times()` — 批量设置时间寿命，一次NVS写入
@@ -455,7 +455,7 @@ typedef struct {
 400G -> 62.4 L/h  (1.04 L/min)
 ```
 
-**周期保存**: FSM任务循环中按配置的保存间隔（默认120分钟，可选10/60/120/240/360/720/1440分钟）统一调用 `config_manager_periodic_save_all()`，协调所有模块脏数据保存。
+**数据保存（间隔点统一写入）**: 保存间隔内运行数据变化（FSM统计/滤芯水量/历史事件/每日统计）仅标记脏标志，不写NVS；FSM任务循环按配置的保存间隔（默认120分钟，可选10/60/120/240/360/720/1440分钟）到点统一调用 `config_manager_periodic_save_all()`，全链路脏标志门控（FSM统计值变才标config脏→config_dirty→save_needed→history_dirty/daily_stats_dirty）——脏才写，无脏跳过等待下一间隔点，不产生任何NVS写入，以间隔换Flash寿命。网页重启、OTA成功、恢复factory、回滚 4 条计划重启路径在 `esp_restart()` 前调用 `config_manager_save_all_dirty()`（非常规写入源，仅在确有脏数据时落盘一次），防止重启发生在间隔中途丢失未到期数据。用户操作（配置修改/滤芯重置/历史清除）即时写入，不经过保存间隔。
 
 **水量统计公共函数**: `accumulate_production_water()` 和 `accumulate_flush_water()` 提取了制水/冲洗水量的计算逻辑（流量计算、滤芯累加、计时器清除），消除了 `transition_to`、`execute_standby`、`execute_tank_full`、`execute_normal_flush` 和事件处理器中的 6+ 处重复代码。
 
@@ -658,7 +658,7 @@ esp_err_t mqtt_client_set_config(const mqtt_config_t *config);
 {"action": "standby"}           // 待机
 {"action": "shutdown"}          // 停止
 {"action": "reset"}             // 复位
-{"action": "reboot"}            // 重启
+{"action": "reboot"}            // 重启（重启前自动保存全部脏数据）
 ```
 
 **状态响应示例**:
@@ -762,7 +762,7 @@ typedef struct {
 
 **NVS字符串终止保护**: `nvs_get_str()` 读取后强制添加 `\0` 终止符，防止NVS数据损坏导致缓冲区溢出。
 
-**统一周期保存**: `config_manager_periodic_save_all()` 协调系统配置、滤芯数据、历史记录三个模块的脏数据批量保存。通过 `#include "filter_manager.h"` 和 `#include "history_logger.h"` 引入其他模块的保存函数声明（不使用 extern），确保模块化设计。
+**统一周期保存**: `config_manager_periodic_save_all()` 协调系统配置、滤芯数据、历史记录三个模块的脏数据批量保存。通过 `#include "filter_manager.h"` 和 `#include "history_logger.h"` 引入其他模块的保存函数声明（不使用 extern），确保模块化设计。`config_manager_save_all_dirty()` 在此基础上先同步FSM运行统计（`fsm_force_save_runtime()`），用于计划重启（网页重启/OTA/恢复factory/回滚）前的即时保存，全链路脏标志门控，无脏零写入。
 
 **NVS命名空间**:
 
@@ -798,9 +798,12 @@ bool config_manager_has_wifi_config(void);
 bool config_manager_has_mqtt_config(void);
 
 // 周期保存
-esp_err_t config_manager_periodic_save_all(void);
-esp_err_t config_manager_sync_fsm_stats(const fsm_runtime_data_t *data);
-esp_err_t config_manager_get_fsm_stats(fsm_runtime_data_t *data);
+bool config_manager_periodic_save_all(uint32_t min_interval_sec);
+void config_manager_save_all_dirty(void);
+void config_manager_sync_fsm_stats(uint32_t prod_cycles, uint32_t flush_cycles,
+                                   uint64_t prod_time_sec, uint64_t flush_time_sec);
+void config_manager_get_fsm_stats(uint32_t *prod_cycles, uint32_t *flush_cycles,
+                                  uint64_t *prod_time_sec, uint64_t *flush_time_sec);
 ```
 
 ---
@@ -813,7 +816,7 @@ esp_err_t config_manager_get_fsm_stats(fsm_runtime_data_t *data);
 1. `ota_update_begin()`: 获取OTA分区，初始化写入句柄
 2. `ota_update_write()`: 流式写入固件（直接调用esp_ota_write，无固定缓冲区），首次接收时用512字节init_buf解析镜像头
 3. `ota_update_end()`: 验证镜像，设置启动分区，取消回滚倒计时
-4. Reboot: `esp_restart()` 重启进入新固件
+4. Reboot: `config_manager_save_all_dirty()` 保存脏数据后 `esp_restart()` 重启进入新固件
 
 **版本检测**: 使用 `sscanf()` 解析 major.minor.patch 数值进行语义化版本比较（避免字符串字典序问题，如 "1.0.10" < "1.0.9"）。同版本固件允许升级（输出警告日志，用于修复bug或更新构建日期）。
 

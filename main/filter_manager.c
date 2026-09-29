@@ -270,39 +270,52 @@ static esp_err_t save_to_nvs_locked(void)
         return err;
     }
 
-    nvs_set_u32(handle, "total_water", fctx.total_water_used);
-    nvs_set_u32(handle, "total_prod", fctx.total_production_water);  // 保存总制水量
+    // 标准NVS为写穿模式：nvs_set_* 立即写入flash，nvs_commit 是空操作恒返回OK。
+    // 必须逐项检查set返回值，否则NVS写满时数据静默丢失且save_needed被误清。
+    // 单个set失败不中断后续键（尽力而为），任一失败即视为整体保存失败。
+    esp_err_t set_err = ESP_OK;
+#define NVS_SET_CHK(call) do { \
+    esp_err_t e_ = (call); \
+    if (e_ != ESP_OK && set_err == ESP_OK) set_err = e_; \
+} while (0)
+
+    NVS_SET_CHK(nvs_set_u32(handle, "total_water", fctx.total_water_used));
+    NVS_SET_CHK(nvs_set_u32(handle, "total_prod", fctx.total_production_water));  // 保存总制水量
 
     // 保存独立累加器（新格式）
     for (int i = 0; i < FILTER_COUNT; i++) {
         char key[16];
         snprintf(key, sizeof(key), "acc_%d", i);
-        nvs_set_u32(handle, key, fctx.filter_accumulator_ml[i]);
+        NVS_SET_CHK(nvs_set_u32(handle, key, fctx.filter_accumulator_ml[i]));
     }
 
-    nvs_set_i32(handle, "prod_rate", (int32_t)(fctx.production_rate_lph * 100));
+    NVS_SET_CHK(nvs_set_i32(handle, "prod_rate", (int32_t)(fctx.production_rate_lph * 100)));
 
     for (int i = 0; i < FILTER_COUNT; i++) {
         char key[16];
 
         snprintf(key, sizeof(key), "f%d_used", i);
-        nvs_set_u32(handle, key, fctx.filters[i].used_liters);
+        NVS_SET_CHK(nvs_set_u32(handle, key, fctx.filters[i].used_liters));
 
         snprintf(key, sizeof(key), "f%d_reset", i);
-        nvs_set_u32(handle, key, fctx.filters[i].last_reset_time);
+        NVS_SET_CHK(nvs_set_u32(handle, key, fctx.filters[i].last_reset_time));
 
         snprintf(key, sizeof(key), "f%d_cap", i);
-        nvs_set_u32(handle, key, fctx.filters[i].total_liters);
+        NVS_SET_CHK(nvs_set_u32(handle, key, fctx.filters[i].total_liters));
 
         snprintf(key, sizeof(key), "f%d_time", i);
-        nvs_set_u32(handle, key, fctx.filters[i].time_limit_hours);
+        NVS_SET_CHK(nvs_set_u32(handle, key, fctx.filters[i].time_limit_hours));
 
         snprintf(key, sizeof(key), "f%d_base", i);
-        nvs_set_u32(handle, key, fctx.filters[i].water_used_at_reset);
+        NVS_SET_CHK(nvs_set_u32(handle, key, fctx.filters[i].water_used_at_reset));
     }
+#undef NVS_SET_CHK
 
     err = nvs_commit(handle);
     nvs_close(handle);
+    if (set_err != ESP_OK) {
+        err = set_err;  // set失败视为保存失败：保留save_needed，触发重试与告警
+    }
 
     if (err == ESP_OK) {
         fctx.save_needed = false;

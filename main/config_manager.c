@@ -656,45 +656,55 @@ esp_err_t config_manager_save(void)
         return err;
     }
 
+    // 标准NVS（非加密）为写穿模式：nvs_set_* 立即写入flash，nvs_commit 是空操作
+    // 恒返回ESP_OK。必须逐项检查set返回值——否则NVS写满时set失败被吞、commit
+    // 仍返回OK、脏标志被误清，数据静默丢失（2026-09-24现场事故签名）。
+    // 单个set失败不中断后续键（尽力而为），任一失败即视为整体保存失败。
+    esp_err_t set_err = ESP_OK;
+#define NVS_SET_CHK(call) do { \
+    esp_err_t e_ = (call); \
+    if (e_ != ESP_OK && set_err == ESP_OK) set_err = e_; \
+} while (0)
+
     // WiFi配置
-    nvs_set_str(handle, "wifi_ssid", config_copy.wifi_ssid);
-    nvs_set_str(handle, "wifi_pass", config_copy.wifi_password);
+    NVS_SET_CHK(nvs_set_str(handle, "wifi_ssid", config_copy.wifi_ssid));
+    NVS_SET_CHK(nvs_set_str(handle, "wifi_pass", config_copy.wifi_password));
 
     // MQTT配置
-    nvs_set_u8(handle, "mqtt_en", config_copy.mqtt_enabled);
-    nvs_set_u8(handle, "ro_mem", config_copy.ro_membrane_type);
-    nvs_set_u8(handle, "pump", config_copy.pump_type);
-    nvs_set_u8(handle, "tank", config_copy.tank_size);
-    nvs_set_u16(handle, "wv_flow", config_copy.waste_valve_flow_cc);
-    nvs_set_str(handle, "mqtt_broker", config_copy.mqtt_broker);
-    nvs_set_str(handle, "mqtt_user", config_copy.mqtt_username);
-    nvs_set_str(handle, "mqtt_pass", config_copy.mqtt_password);
-    nvs_set_str(handle, "mqtt_topic", config_copy.mqtt_topic_prefix);
+    NVS_SET_CHK(nvs_set_u8(handle, "mqtt_en", config_copy.mqtt_enabled));
+    NVS_SET_CHK(nvs_set_u8(handle, "ro_mem", config_copy.ro_membrane_type));
+    NVS_SET_CHK(nvs_set_u8(handle, "pump", config_copy.pump_type));
+    NVS_SET_CHK(nvs_set_u8(handle, "tank", config_copy.tank_size));
+    NVS_SET_CHK(nvs_set_u16(handle, "wv_flow", config_copy.waste_valve_flow_cc));
+    NVS_SET_CHK(nvs_set_str(handle, "mqtt_broker", config_copy.mqtt_broker));
+    NVS_SET_CHK(nvs_set_str(handle, "mqtt_user", config_copy.mqtt_username));
+    NVS_SET_CHK(nvs_set_str(handle, "mqtt_pass", config_copy.mqtt_password));
+    NVS_SET_CHK(nvs_set_str(handle, "mqtt_topic", config_copy.mqtt_topic_prefix));
 
     // 系统参数
-    nvs_set_u32(handle, "prod_timeout", config_copy.production_timeout_sec);
-    nvs_set_u32(handle, "leak_confirm", config_copy.leak_confirm_time_sec);
-    nvs_set_u32(handle, "tank_confirm", config_copy.tank_confirm_time_sec);
+    NVS_SET_CHK(nvs_set_u32(handle, "prod_timeout", config_copy.production_timeout_sec));
+    NVS_SET_CHK(nvs_set_u32(handle, "leak_confirm", config_copy.leak_confirm_time_sec));
+    NVS_SET_CHK(nvs_set_u32(handle, "tank_confirm", config_copy.tank_confirm_time_sec));
 
     // 冲洗参数
-    nvs_set_u32(handle, "nflush_dur", config_copy.normal_flush_duration_sec);
-    nvs_set_u32(handle, "pflush_dur", config_copy.pure_flush_duration_sec);
-    nvs_set_u32(handle, "fflush_dur", config_copy.filter_flush_duration_sec);
-    nvs_set_u32(handle, "short_prod", config_copy.short_prod_threshold_sec);
-    nvs_set_u32(handle, "wh_vopn", config_copy.water_hammer_valve_open_delay_ms);
-    nvs_set_u32(handle, "wh_pstp", config_copy.water_hammer_pump_stop_delay_ms);
-    nvs_set_u32(handle, "wh_vcls", config_copy.water_hammer_valve_close_delay_ms);
+    NVS_SET_CHK(nvs_set_u32(handle, "nflush_dur", config_copy.normal_flush_duration_sec));
+    NVS_SET_CHK(nvs_set_u32(handle, "pflush_dur", config_copy.pure_flush_duration_sec));
+    NVS_SET_CHK(nvs_set_u32(handle, "fflush_dur", config_copy.filter_flush_duration_sec));
+    NVS_SET_CHK(nvs_set_u32(handle, "short_prod", config_copy.short_prod_threshold_sec));
+    NVS_SET_CHK(nvs_set_u32(handle, "wh_vopn", config_copy.water_hammer_valve_open_delay_ms));
+    NVS_SET_CHK(nvs_set_u32(handle, "wh_pstp", config_copy.water_hammer_pump_stop_delay_ms));
+    NVS_SET_CHK(nvs_set_u32(handle, "wh_vcls", config_copy.water_hammer_valve_close_delay_ms));
 
     // 继电器配置
-    nvs_set_u8(handle, "relay_lvl", config_copy.relay_trigger_level);
+    NVS_SET_CHK(nvs_set_u8(handle, "relay_lvl", config_copy.relay_trigger_level));
 
     // 运行数据保存间隔
-    nvs_set_u16(handle, "save_intv", config_copy.runtime_save_interval_min);
+    NVS_SET_CHK(nvs_set_u16(handle, "save_intv", config_copy.runtime_save_interval_min));
 
     // TDS配置（定点数存储：乘100保留2位小数精度）
     // 钳位防止float溢出int32_t范围（阈值0~2000ppm * 100 = 0~200000，安全）
-    nvs_set_i32(handle, "tds_in_th", (int32_t)(config_copy.tds_inlet_threshold * 100.0f));
-    nvs_set_i32(handle, "tds_out_th", (int32_t)(config_copy.tds_outlet_threshold * 100.0f));
+    NVS_SET_CHK(nvs_set_i32(handle, "tds_in_th", (int32_t)(config_copy.tds_inlet_threshold * 100.0f)));
+    NVS_SET_CHK(nvs_set_i32(handle, "tds_out_th", (int32_t)(config_copy.tds_outlet_threshold * 100.0f)));
 
     // TDS校准（定点数存储：offset乘100，scale乘10000）
     // 钳位到安全范围：offset [-1000,1000] → [-100000,100000]，scale [0.01,100] → [100,1000000]
@@ -710,25 +720,30 @@ esp_err_t config_manager_save(void)
     if (sc0 > 100.0f) sc0 = 100.0f;
     if (sc1 < 0.01f) sc1 = 0.01f;
     if (sc1 > 100.0f) sc1 = 100.0f;
-    nvs_set_i32(handle, "tds_in_off", (int32_t)(off0 * 100.0f));
-    nvs_set_i32(handle, "tds_out_off", (int32_t)(off1 * 100.0f));
-    nvs_set_i32(handle, "tds_in_scale", (int32_t)(sc0 * 10000.0f));
-    nvs_set_i32(handle, "tds_out_scale", (int32_t)(sc1 * 10000.0f));
+    NVS_SET_CHK(nvs_set_i32(handle, "tds_in_off", (int32_t)(off0 * 100.0f)));
+    NVS_SET_CHK(nvs_set_i32(handle, "tds_out_off", (int32_t)(off1 * 100.0f)));
+    NVS_SET_CHK(nvs_set_i32(handle, "tds_in_scale", (int32_t)(sc0 * 10000.0f)));
+    NVS_SET_CHK(nvs_set_i32(handle, "tds_out_scale", (int32_t)(sc1 * 10000.0f)));
 
     // Web配置
-    nvs_set_u16(handle, "web_port", config_copy.web_port);
-    nvs_set_u8(handle, "web_auth", config_copy.web_auth_enabled);
-    nvs_set_str(handle, "web_user", config_copy.web_username);
-    nvs_set_str(handle, "web_pass", config_copy.web_password);
+    NVS_SET_CHK(nvs_set_u16(handle, "web_port", config_copy.web_port));
+    NVS_SET_CHK(nvs_set_u8(handle, "web_auth", config_copy.web_auth_enabled));
+    NVS_SET_CHK(nvs_set_str(handle, "web_user", config_copy.web_username));
+    NVS_SET_CHK(nvs_set_str(handle, "web_pass", config_copy.web_password));
 
     // FSM运行统计
-    nvs_set_u32(handle, "fsm_prod_cyc", config_copy.fsm_prod_cycles);
-    nvs_set_u32(handle, "fsm_flush_cyc", config_copy.fsm_flush_cycles);
-    nvs_set_u64(handle, "fsm_prod_time", config_copy.fsm_prod_time_sec);
-    nvs_set_u64(handle, "fsm_flush_time", config_copy.fsm_flush_time_sec);
+    NVS_SET_CHK(nvs_set_u32(handle, "fsm_prod_cyc", config_copy.fsm_prod_cycles));
+    NVS_SET_CHK(nvs_set_u32(handle, "fsm_flush_cyc", config_copy.fsm_flush_cycles));
+    NVS_SET_CHK(nvs_set_u64(handle, "fsm_prod_time", config_copy.fsm_prod_time_sec));
+    NVS_SET_CHK(nvs_set_u64(handle, "fsm_flush_time", config_copy.fsm_flush_time_sec));
+#undef NVS_SET_CHK
 
     err = nvs_commit(handle);
     nvs_close(handle);
+    if (set_err != ESP_OK) {
+        err = set_err;  // set失败视为保存失败：保留脏标志，下期间隔点重试
+        ESP_LOGE(TAG, "配置NVS写入失败: %s（脏标志保留，将重试）", esp_err_to_name(set_err));
+    }
 
     // 使用mutex保护脏标志清除（确保一致性）
     if (err == ESP_OK) {
@@ -1393,6 +1408,14 @@ bool config_manager_periodic_save_all(uint32_t min_interval_sec)
     }
 
     return did_save;
+}
+
+void config_manager_save_all_dirty(void)
+{
+    // 同步FSM运行统计到config内存副本（sync_fsm_stats内部比较值，变化才标脏）
+    fsm_force_save_runtime();
+    // 0=立即保存；config/filter/history各模块内部均按脏标志门控，无脏零写入
+    config_manager_periodic_save_all(0);
 }
 
 // ==================== NVS维护 ====================

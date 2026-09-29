@@ -231,6 +231,9 @@ esp_err_t pm_manager_adjust_wifi_tx_power(int8_t rssi)
 
 esp_err_t pm_manager_check_heap(void)
 {
+    // 低内存告警边沿触发状态（防止内存持续低位时每30秒重复告警刷屏）
+    static bool heap_low_warned = false;
+
     size_t free_heap = esp_get_free_heap_size();
     size_t min_ever_heap = esp_get_minimum_free_heap_size();
 
@@ -245,11 +248,19 @@ esp_err_t pm_manager_check_heap(void)
         return ESP_ERR_NO_MEM;  // 不可达，保持函数完整性
     }
 
-    // 低于30KB告警
+    // 低于30KB告警（边沿触发：进入低位时告警一次，2KB滞回，恢复时重新武装）
     if (free_heap < 30720) {
-        ESP_LOGW(TAG, "堆内存不足! 可用=%u bytes, 历史最低=%u bytes",
-                 (unsigned)free_heap, (unsigned)min_ever_heap);
+        if (!heap_low_warned) {
+            heap_low_warned = true;
+            ESP_LOGW(TAG, "堆内存不足! 可用=%u bytes, 历史最低=%u bytes",
+                     (unsigned)free_heap, (unsigned)min_ever_heap);
+        }
         return ESP_ERR_NO_MEM;
+    }
+
+    if (heap_low_warned && free_heap >= 32768) {
+        heap_low_warned = false;
+        ESP_LOGI(TAG, "堆内存恢复: 可用=%u bytes", (unsigned)free_heap);
     }
 
     return ESP_OK;

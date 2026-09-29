@@ -113,6 +113,7 @@ static struct {
     // 漏水检测确认时间（防止凝露误报）
     uint64_t leak_detect_start_time;
     bool leak_detected;           // 漏水信号已触发，等待确认
+    bool leak_confirmed_logged;   // 确认日志已输出（边沿触发，防止报警状态下每轮询刷屏）
 
     // 压力桶开关确认（防止泵脉动/水锤导致开关抖动误判）
     uint64_t tank_full_detect_start_time;
@@ -918,10 +919,16 @@ static bool check_leak_confirmed(bool water_leak)
     if (water_leak) {
         if (!fsm_ctx.leak_detected) {
             fsm_ctx.leak_detected = true;
+            fsm_ctx.leak_confirmed_logged = false;
             fsm_ctx.leak_detect_start_time = now_ms;
             ESP_LOGW(TAG, "检测到漏水信号，开始确认计时(%lu秒)", fsm_ctx.leak_confirm_time_ms / 1000);
         } else if (now_ms - fsm_ctx.leak_detect_start_time >= fsm_ctx.leak_confirm_time_ms) {
-            ESP_LOGE(TAG, "漏水确认，持续%lu秒", fsm_ctx.leak_confirm_time_ms / 1000);
+            // 确认日志边沿触发：漏水信号持续期间（已进入报警状态）每100ms轮询都会命中此分支，
+            // 仅首次输出，防止刷屏（与TDS报警边沿触发原则一致）；返回值不受影响
+            if (!fsm_ctx.leak_confirmed_logged) {
+                fsm_ctx.leak_confirmed_logged = true;
+                ESP_LOGE(TAG, "漏水确认，持续%lu秒", fsm_ctx.leak_confirm_time_ms / 1000);
+            }
             return true;
         }
         return false;
@@ -929,6 +936,7 @@ static bool check_leak_confirmed(bool water_leak)
         if (fsm_ctx.leak_detected) {
             ESP_LOGI(TAG, "漏水信号消失，取消报警");
             fsm_ctx.leak_detected = false;
+            fsm_ctx.leak_confirmed_logged = false;
         }
         return false;
     }
@@ -1099,9 +1107,6 @@ static void check_inputs(void)
             break;
 
         case FSM_STATE_WATER_SHORTAGE:
-            ESP_LOGD(TAG, "缺水状态检测: low_pressure=%d, tank_pressure=%d, water_leak=%d",
-                     low_pressure, tank_pressure, water_leak);
-
             if (leak_confirmed) {
                 transition_to(FSM_STATE_LEAK_ALARM);
                 return;
@@ -1170,6 +1175,7 @@ static void fsm_task(void *arg)
                     ESP_LOGI(TAG, "停止复位");
                     fsm_ctx.runtime_data.low_pressure_occurred = false;
                     fsm_ctx.leak_detected = false;
+                    fsm_ctx.leak_confirmed_logged = false;
                     fsm_ctx.leak_detect_start_time = 0;
                     fsm_ctx.standby_manual = false;
                     gpio_driver_clear_emergency();  // 解除GPIO紧急锁定，允许输出操作
@@ -1222,6 +1228,7 @@ static void fsm_task(void *arg)
                 }
                 stop_all_outputs();
                 fsm_ctx.leak_detected = false;
+                fsm_ctx.leak_confirmed_logged = false;
                 fsm_ctx.leak_detect_start_time = 0;
                 fsm_ctx.standby_manual = true;  // 阻止自动进入制水
                 fsm_ctx.filter_flush_mode = false;  // 取消换芯冲洗
@@ -1257,6 +1264,8 @@ static void fsm_task(void *arg)
         check_inputs();
 
         // 周期性统一保存（运行数据、滤芯、历史记录）
+        // 间隔内各模块仅标记脏标志不写NVS；到点后按脏标志统一写入，
+        // 无脏标志则不产生任何写入，等待下一间隔点（最小化Flash磨损）。
         // 注意：NVS写入可能阻塞50-200ms，期间状态检查暂停。
         // 这在保存间隔（默认120分钟）下是可接受的——状态事件在队列中排队，
         // 保存完成后立即处理。看门狗在循环开始/结束均重置，不会因NVS阻塞超时。
@@ -1394,6 +1403,7 @@ esp_err_t fsm_init(void)
 
     fsm_ctx.current_state = FSM_STATE_STANDBY;
     fsm_ctx.leak_detected = false;
+    fsm_ctx.leak_confirmed_logged = false;
     fsm_ctx.leak_detect_start_time = 0;
     fsm_ctx.tank_full_detected = false;
     fsm_ctx.tank_full_detect_start_time = 0;
